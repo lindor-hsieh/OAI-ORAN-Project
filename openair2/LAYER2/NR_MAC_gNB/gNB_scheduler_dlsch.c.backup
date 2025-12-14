@@ -862,27 +862,6 @@ static void pf_dl(module_id_t module_id,
                   max_rbSize,
                   &TBS,
                   &rbSize);
-    // Heartbeat Test Modification Start
-    if (sched_ctrl->custom_prb_limit > 0 && rbSize > sched_ctrl->custom_prb_limit) {
-        
-        LOG_D(NR_MAC, "[Heartbeat] Limiting PRB for UE %04x: %d -> %d\n", 
-              iterator->UE->rnti, rbSize, sched_ctrl->custom_prb_limit);
-
-        // 1. 強制設定為 Limit 值
-        rbSize = sched_ctrl->custom_prb_limit;
-
-        // 2. 根據新的 rbSize 重新計算 TBS (Transport Block Size)
-        // 注意：nr_compute_tbs 回傳的是 bits，要除以 8 (>>3) 轉成 bytes
-        TBS = nr_compute_tbs(sched_pdsch->Qm,
-                             sched_pdsch->R,
-                             rbSize,             // 使用限制後的 RB 數
-                             tda_info->nrOfSymbols,
-                             sched_pdsch->dmrs_parms.N_PRB_DMRS * sched_pdsch->dmrs_parms.N_DMRS_SLOT,
-                             0,                  // N_PRB_oh
-                             0,                  // tb_scaling
-                             sched_pdsch->nrOfLayers) >> 3; 
-    }
-
     sched_pdsch->rbSize = rbSize;
     sched_pdsch->rbStart = rbStart;
     sched_pdsch->tb_size = TBS;

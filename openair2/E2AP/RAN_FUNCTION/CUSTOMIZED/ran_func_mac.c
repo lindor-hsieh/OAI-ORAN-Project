@@ -21,6 +21,8 @@
 
 #include "ran_func_mac.h"
 #include <assert.h>
+#include "common/ran_context.h"                      
+#include "openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h" 
 
 static
 const int mod_id = 0;
@@ -123,8 +125,52 @@ void read_mac_setup_sm(void* data)
 sm_ag_if_ans_t write_ctrl_mac_sm(void const* data)
 {
   assert(data != NULL);
-  printf("write_ctrl callback for MAC SM: operation not supported\n");
+
+  // 1. 強制轉型成 FlexRIC 定義的 Control Request 結構
+  mac_ctrl_req_data_t const* ctrl = (mac_ctrl_req_data_t const*)data;
+
+  // 直接回傳全 0 的結構通常代表默認狀態 (或忽略回傳值)
   sm_ag_if_ans_t ans = {0};
+
+  // 2. 讀取 xApp 傳來的參數
+  uint32_t raw_val = ctrl->msg.action;
+  uint32_t action = raw_val & 0xFFFF;
+  uint32_t limit = raw_val >> 16;
+  // uint32_t limit = ctrl->msg.prb_limit;
+  uint16_t rnti = ctrl->msg.rnti; // 0 代表全部 UE
+
+  if (limit == 0 && ctrl->msg.prb_limit > 0) {
+      limit = ctrl->msg.prb_limit;
+  }
+
+  LOG_I(NR_MAC, "[E2 Agent] Decoded: Raw=0x%x -> Action=%d, Limit=%d\n", raw_val, action, limit);
+
+  // 3. 執行控制邏輯 (Action 1 = Set Limit)
+  if (action == 1) {
+     // 取得 gNB MAC 實例 (通常是 index 0)
+     gNB_MAC_INST *nrmac = RC.nrmac[mod_id];
+
+     if (nrmac) {
+
+         // 4. 遍歷所有已連線的 UE
+         UE_iterator(nrmac->UE_info.connected_ue_list, UE) {
+             if (UE) {
+                 // 如果 RNTI 是 0 (廣播) 或者 RNTI 匹配
+                 if (rnti == 0 || UE->rnti == rnti) {
+
+                     // 修改排程限制 
+                     UE->UE_sched_ctrl.custom_prb_limit = limit;
+
+                     LOG_I(NR_MAC, "[E2 Agent] -> Applied PRB Limit %d to UE RNTI %04x\n", limit, UE->rnti);
+                 }
+             }
+         }
+     } else {
+         LOG_E(NR_MAC, "[E2 Agent] Error: RC.nrmac[0] is NULL!\n");
+     }
+  } else {
+      LOG_W(NR_MAC, "[E2 Agent] Unknown Action ID: %d\n", action);
+  }
+
   return ans;
 }
-

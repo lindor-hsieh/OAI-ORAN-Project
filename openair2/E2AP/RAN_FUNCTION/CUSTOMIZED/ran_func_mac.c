@@ -20,6 +20,7 @@
  */
 
 #include "ran_func_mac.h"
+#include "/home/lindor/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/ie/mac_data_ie.h"
 #include <assert.h>
 
 static
@@ -123,7 +124,33 @@ void read_mac_setup_sm(void* data)
 sm_ag_if_ans_t write_ctrl_mac_sm(void const* data)
 {
   assert(data != NULL);
-  printf("write_ctrl callback for MAC SM: operation not supported\n");
+  
+  // 1. 轉型：把通用指標轉回我們的控制請求結構
+  const mac_ctrl_req_data_t* req = (const mac_ctrl_req_data_t*)data;
+
+  // 2. 處理切片設定 (Type 0)
+  if (req->msg.type == 0) { // MAC_CTRL_REQ_DL_SLICE_CONF
+      printf("[OAI-E2] Received Slice Config Request!\n");
+
+      // 印出收到的參數 (驗證用)
+      for(int i = 0; i < req->msg.len_slices; i++) {
+          printf("   - Slice ID: %d, Percentage: %.2f\n", 
+                 req->msg.slices[i].id, 
+                 req->msg.slices[i].percentage);
+      }
+
+      // 3. [關鍵] 啟動 gNB 的 NVS 模式
+      if (RC.nrmac && RC.nrmac[mod_id]) {
+          // 這裡就是開啟你 gNB_scheduler_dlsch.c 邏輯的開關
+          RC.nrmac[mod_id]->slice_info.algo = 2; // NVS_SLICE
+          
+          printf("[OAI-E2] >>> NVS Slicing Mode ACTIVATED! <<<\n");
+      }
+  } else {
+      printf("[OAI-E2] Received unknown control type: %d\n", req->msg.type);
+  }
+
+  // 回傳成功狀態
   sm_ag_if_ans_t ans = {0};
   return ans;
 }

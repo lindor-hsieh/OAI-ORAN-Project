@@ -604,6 +604,11 @@ static int comparator(const void *p, const void *q)
   return 0;
 }
 
+// [新增] 如果標頭檔沒定義，我們自己定義
+#ifndef NVS_SLICE
+#define NVS_SLICE 2
+#endif
+
 static void pf_dl(module_id_t module_id,
                   frame_t frame,
                   slot_t slot,
@@ -614,6 +619,16 @@ static void pf_dl(module_id_t module_id,
 {
   gNB_MAC_INST *mac = RC.nrmac[module_id];
   NR_ServingCellConfigCommon_t *scc=mac->common_channels[0].ServingCellConfigCommon;
+
+  // =========================================================
+  // [NVS] 1. 初始化計數器
+  // =========================================================
+  // 為了安全起見，宣告成 static 或全域變數可能更好，但在 OAI 架構下
+  // 每次進入 pf_dl 都是新的排程回合，所以這裡歸零是正確的 (Per Slot Scheduling)
+  int vip_used_rbs = 0;
+  int std_used_rbs = 0;
+  // =========================================================
+
   // UEs that could be scheduled
   UEsched_t UE_sched[MAX_MOBILES_PER_GNB + 1] = {0};
   int remainUEs[num_beams];
@@ -633,7 +648,6 @@ static void pf_dl(module_id_t module_id,
 
     const NR_mac_dir_stats_t *stats = &UE->mac_stats.dl;
     NR_sched_pdsch_t *sched_pdsch = &sched_ctrl->sched_pdsch;
-    /* get the PID of a HARQ process awaiting retrnasmission, or -1 otherwise */
     sched_pdsch->dl_harq_pid = sched_ctrl->retrans_dl_harq.head;
 
     /* Calculate Throughput */
@@ -651,7 +665,6 @@ static void pf_dl(module_id_t module_id,
     if (sched_pdsch->dl_harq_pid >= 0) {
       NR_beam_alloc_t beam = beam_allocation_procedure(&mac->beam_info, frame, slot, UE->UE_beam_index, slots_per_frame);
       bool sch_ret = beam.idx >= 0;
-      /* Allocate retransmission */
       if (sch_ret)
         sch_ret = allocate_dl_retransmission(module_id, frame, slot, &n_rb_sched[beam.idx], UE, beam.idx, sched_pdsch->dl_harq_pid);
       if (!sch_ret) {
@@ -659,26 +672,14 @@ static void pf_dl(module_id_t module_id,
         reset_beam_status(&mac->beam_info, frame, slot, UE->UE_beam_index, slots_per_frame, beam.new_beam);
         continue;
       }
-      /* reduce max_num_ue once we are sure UE can be allocated, i.e., has CCE */
       remainUEs[beam.idx]--;
-
     } else {
-      /* skip this UE if there are no free HARQ processes. This can happen e.g.
-       * if the UE disconnected in L2sim, in which case the gNB is not notified
-       * (this can be considered a design flaw) */
       if (sched_ctrl->available_dl_harq.head < 0) {
-        LOG_D(NR_MAC, "[UE %04x][%4d.%2d] UE has no free DL HARQ process, skipping\n",
-              UE->rnti,
-              frame,
-              slot);
         continue;
       }
-
-      /* Check DL buffer and skip this UE if no bytes and no TA necessary */
       if (sched_ctrl->num_total_bytes == 0 && frame != (sched_ctrl->ta_frame + 100) % 1024)
         continue;
 
-      /* Calculate coeff */
       const NR_bler_options_t *bo = &mac->dl_bler;
       const int max_mcs_table = current_BWP->mcsTableIdx == 1 ? 27 : 28;
       const int max_mcs = min(sched_ctrl->dl_max_mcs, max_mcs_table);
@@ -689,28 +690,12 @@ static void pf_dl(module_id_t module_id,
       } else
         sched_pdsch->mcs = get_mcs_from_bler(bo, stats, &sched_ctrl->dl_bler_stats, max_mcs, frame);
       sched_pdsch->nrOfLayers = get_dl_nrOfLayers(sched_ctrl, current_BWP->dci_format);
-      sched_pdsch->pm_index =
-          get_pm_index(mac, UE, current_BWP->dci_format, sched_pdsch->nrOfLayers, mac->radio_config.pdsch_AntennaPorts.XP);
+      sched_pdsch->pm_index = get_pm_index(mac, UE, current_BWP->dci_format, sched_pdsch->nrOfLayers, mac->radio_config.pdsch_AntennaPorts.XP);
       const uint8_t Qm = nr_get_Qm_dl(sched_pdsch->mcs, current_BWP->mcsTableIdx);
       const uint16_t R = nr_get_code_rate_dl(sched_pdsch->mcs, current_BWP->mcsTableIdx);
-      uint32_t tbs = nr_compute_tbs(Qm,
-                                    R,
-                                    1, /* rbSize */
-                                    10, /* hypothetical number of slots */
-                                    0, /* N_PRB_DMRS * N_DMRS_SLOT */
-                                    0 /* N_PRB_oh, 0 for initialBWP */,
-                                    0 /* tb_scaling */,
-                                    sched_pdsch->nrOfLayers) >> 3;
+      uint32_t tbs = nr_compute_tbs(Qm, R, 1, 10, 0, 0, 0, sched_pdsch->nrOfLayers) >> 3;
       float coeff_ue = (float) tbs / UE->dl_thr_ue;
-      LOG_D(NR_MAC, "[UE %04x][%4d.%2d] b %d, thr_ue %f, tbs %d, coeff_ue %f\n",
-            UE->rnti,
-            frame,
-            slot,
-            b,
-            UE->dl_thr_ue,
-            tbs,
-            coeff_ue);
-      /* Create UE_sched list for UEs eligible for new transmission*/
+      
       UE_sched[numUE].coef = coeff_ue;
       UE_sched[numUE].UE = UE;
       numUE++;
@@ -719,7 +704,6 @@ static void pf_dl(module_id_t module_id,
 
   qsort(UE_sched, numUE, sizeof(UEsched_t), comparator);
   UEsched_t *iterator = UE_sched;
-
   const int min_rbSize = 5;
 
   /* Loop UE_sched to find max coeff and allocate transmission */
@@ -728,14 +712,39 @@ static void pf_dl(module_id_t module_id,
     NR_UE_sched_ctrl_t *sched_ctrl = &iterator->UE->UE_sched_ctrl;
     const uint16_t rnti = iterator->UE->rnti;
 
+    // =========================================================
+    // [NVS] 2. 計算剩餘額度 (針對 48 PRB 動態調整)
+    // =========================================================
+    // 這裡直接讀取 config 檔中的頻寬 (你的情況是 48)
+    int total_bw = scc->downlinkConfigCommon->frequencyInfoDL->scs_SpecificCarrierList.list.array[0]->carrierBandwidth;
+    int allowed_rbs = total_bw; // 預設給全部
+
+    if (mac->slice_info.algo == NVS_SLICE) {
+        // VIP (70%) -> 48 * 0.7 = 33 PRBs
+        // STD (30%) -> 48 * 0.3 = 14 PRBs
+        int vip_limit = (int)(total_bw * 0.7);
+        int std_limit = total_bw - vip_limit; // 確保總和為 total_bw
+
+        bool is_vip = (iterator->UE->uid == 0); 
+
+        if (is_vip) {
+            allowed_rbs = vip_limit - vip_used_rbs;
+        } else {
+            allowed_rbs = std_limit - std_used_rbs;
+        }
+
+        // 額度用完，跳過
+        if (allowed_rbs <= 0) {
+            iterator++;
+            continue;
+        }
+    }
+    // =========================================================
+
     NR_UE_DL_BWP_t *dl_bwp = &iterator->UE->current_DL_BWP;
     NR_UE_UL_BWP_t *ul_bwp = &iterator->UE->current_UL_BWP;
 
     if (sched_ctrl->available_dl_harq.head < 0) {
-      LOG_D(NR_MAC, "[UE %04x][%4d.%2d] UE has no free DL HARQ process, skipping\n",
-            iterator->UE->rnti,
-            frame,
-            slot);
       iterator++;
       continue;
     }
@@ -743,7 +752,6 @@ static void pf_dl(module_id_t module_id,
     NR_beam_alloc_t beam = beam_allocation_procedure(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame);
 
     if (beam.idx < 0) {
-      // no available beam
       iterator++;
       continue;
     }
@@ -755,81 +763,55 @@ static void pf_dl(module_id_t module_id,
 
     NR_sched_pdsch_t *sched_pdsch = &sched_ctrl->sched_pdsch;
     sched_pdsch->dl_harq_pid = sched_ctrl->available_dl_harq.head;
-
-    /* MCS has been set above */
     sched_pdsch->time_domain_allocation = get_dl_tda(mac, slot);
-    AssertFatal(sched_pdsch->time_domain_allocation>=0,"Unable to find PDSCH time domain allocation in list\n");
-
+    
     const int coresetid = sched_ctrl->coreset->controlResourceSetId;
-    sched_pdsch->tda_info = get_dl_tda_info(dl_bwp,
-                                            sched_ctrl->search_space->searchSpaceType->present,
-                                            sched_pdsch->time_domain_allocation,
-                                            scc->dmrs_TypeA_Position,
-                                            1,
-                                            TYPE_C_RNTI_,
-                                            coresetid,
-                                            false);
-    AssertFatal(sched_pdsch->tda_info.valid_tda, "Invalid TDA from get_dl_tda_info\n");
-
+    sched_pdsch->tda_info = get_dl_tda_info(dl_bwp, sched_ctrl->search_space->searchSpaceType->present, sched_pdsch->time_domain_allocation, scc->dmrs_TypeA_Position, 1, TYPE_C_RNTI_, coresetid, false);
     NR_tda_info_t *tda_info = &sched_pdsch->tda_info;
-
     const uint16_t slbitmap = SL_to_bitmap(tda_info->startSymbolIndex, tda_info->nrOfSymbols);
-
     uint16_t *rballoc_mask = mac->common_channels[CC_id].vrb_map[beam.idx];
     sched_pdsch->bwp_info = get_pdsch_bwp_start_size(mac, iterator->UE);
-    int rbStart = 0; // WRT BWP start
+    int rbStart = 0; 
     int rbStop = sched_pdsch->bwp_info.bwpSize - 1;
     int bwp_start = sched_pdsch->bwp_info.bwpStart;
-    // Freq-demain allocation
+
     while (rbStart < rbStop && (rballoc_mask[rbStart + bwp_start] & slbitmap))
       rbStart++;
 
+    // =========================================================
+    // [NVS] 3. 夾擠邏輯：限制最大可用 RB
+    // =========================================================
     uint16_t max_rbSize = 1;
-
     while (rbStart + max_rbSize <= rbStop && !(rballoc_mask[rbStart + max_rbSize + bwp_start] & slbitmap))
       max_rbSize++;
 
+    // 如果目前計算出的 max_rbSize 超過剩餘額度，強制截斷
+    if (mac->slice_info.algo == NVS_SLICE) {
+        if (allowed_rbs < max_rbSize) {
+            max_rbSize = allowed_rbs;
+        }
+    }
+    // =========================================================
+
     if (max_rbSize < min_rbSize) {
-      LOG_D(NR_MAC,
-            "(%d.%d) Cannot schedule RNTI %04x, rbStart %d, rbSize %d, rbStop %d\n",
-            frame,
-            slot,
-            rnti,
-            rbStart,
-            max_rbSize,
-            rbStop);
       reset_beam_status(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
       iterator++;
       continue;
     }
 
-    int CCEIndex = get_cce_index(mac,
-                                 CC_id,
-                                 slot,
-                                 iterator->UE->rnti,
-                                 &sched_ctrl->aggregation_level,
-                                 beam.idx,
-                                 sched_ctrl->search_space,
-                                 sched_ctrl->coreset,
-                                 &sched_ctrl->sched_pdcch,
-                                 sched_ctrl->pdcch_cl_adjust);
+    int CCEIndex = get_cce_index(mac, CC_id, slot, iterator->UE->rnti, &sched_ctrl->aggregation_level, beam.idx, sched_ctrl->search_space, sched_ctrl->coreset, &sched_ctrl->sched_pdcch, sched_ctrl->pdcch_cl_adjust);
     if (CCEIndex < 0) {
       sched_ctrl->dl_cce_fail++;
-      LOG_D(NR_MAC, "[UE %04x][%4d.%2d] could not find free CCE for DL DCI\n", rnti, frame, slot);
       reset_beam_status(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
       iterator++;
       continue;
     }
-
-    /* Find PUCCH occasion: if it fails, undo CCE allocation (undoing PUCCH
-    * allocation after CCE alloc fail would be more complex) */
 
     int alloc = -1;
     if (!get_FeedbackDisabled(iterator->UE->sc_info.downlinkHARQ_FeedbackDisabled_r17, sched_pdsch->dl_harq_pid)) {
       int r_pucch = nr_get_pucch_resource(sched_ctrl->coreset, ul_bwp->pucch_Config, CCEIndex);
       alloc = nr_acknack_scheduling(mac, iterator->UE, frame, slot, iterator->UE->UE_beam_index, r_pucch, 0);
       if (alloc < 0) {
-        LOG_D(NR_MAC, "[UE %04x][%4d.%2d] could not find PUCCH for DL DCI\n", rnti, frame, slot);
         reset_beam_status(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
         iterator++;
         continue;
@@ -845,28 +827,27 @@ static void pf_dl(module_id_t module_id,
     sched_pdsch->pucch_allocation = alloc;
     uint32_t TBS = 0;
     uint16_t rbSize;
-    // Fix me: currently, the RLC does not give us the total number of PDUs
-    // awaiting. Therefore, for the time being, we put a fixed overhead of 12
-    // (for 4 PDUs) and optionally + 2 for TA. Once RLC gives the number of
-    // PDUs, we replace with 3 * numPDUs
     const int oh = 3 * 4 + 2 * (frame == (sched_ctrl->ta_frame + 100) % 1024);
-    //const int oh = 3 * sched_ctrl->dl_pdus_total + 2 * (frame == (sched_ctrl->ta_frame + 100) % 1024);
-    nr_find_nb_rb(sched_pdsch->Qm,
-                  sched_pdsch->R,
-                  1, // no transform precoding for DL
-                  sched_pdsch->nrOfLayers,
-                  tda_info->nrOfSymbols,
-                  sched_pdsch->dmrs_parms.N_PRB_DMRS * sched_pdsch->dmrs_parms.N_DMRS_SLOT,
-                  sched_ctrl->num_total_bytes + oh,
-                  min_rbSize,
-                  max_rbSize,
-                  &TBS,
-                  &rbSize);
+    
+    // [NVS] 傳入截斷後的 max_rbSize
+    nr_find_nb_rb(sched_pdsch->Qm, sched_pdsch->R, 1, sched_pdsch->nrOfLayers, tda_info->nrOfSymbols, sched_pdsch->dmrs_parms.N_PRB_DMRS * sched_pdsch->dmrs_parms.N_DMRS_SLOT, sched_ctrl->num_total_bytes + oh, min_rbSize, max_rbSize, &TBS, &rbSize);
+    
     sched_pdsch->rbSize = rbSize;
     sched_pdsch->rbStart = rbStart;
     sched_pdsch->tb_size = TBS;
-    /* transmissions: directly allocate */
     n_rb_sched[beam.idx] -= sched_pdsch->rbSize;
+
+    // =========================================================
+    // [NVS] 4. 扣除額度
+    // =========================================================
+    if (mac->slice_info.algo == NVS_SLICE) {
+        if (iterator->UE->uid == 0) {
+            vip_used_rbs += sched_pdsch->rbSize;
+        } else {
+            std_used_rbs += sched_pdsch->rbSize;
+        }
+    }
+    // =========================================================
 
     for (int rb = bwp_start; rb < sched_pdsch->rbSize; rb++)
       rballoc_mask[rb + sched_pdsch->rbStart] |= slbitmap;

@@ -92,6 +92,19 @@
 #include "NR_TAG.h"
 
 /* Defs */
+// 植入FlexRIC Slicing Definitions
+typedef enum {
+  NONE_SLICE = 0,
+  STATIC_SLICE = 1,
+  NVS_SLICE = 2,
+  EDF_SLICE = 3,
+} oai_slice_algorithm_e;
+
+typedef struct {
+  oai_slice_algorithm_e algo;
+  // 這裡其實還有其他 NVS 參數，但為了讓編譯通過，我們先只加 algo
+} nr_slice_info_t;
+
 #define MAX_NUM_BWP 5
 #define MAX_NUM_CORESET 12
 #define MAX_NUM_CCE 90
@@ -951,6 +964,8 @@ typedef struct gNB_MAC_INST_s {
 
   nr_mac_config_t radio_config;
   nr_rlc_configuration_t rlc_config;
+  // 植入 讓 gNB 記住現在是用什麼切片
+  nr_slice_info_t slice_info;
 
   NR_UE_sched_ctrl_t *sched_ctrlCommon;
   NR_sched_pdcch_t *sched_pdcch_otherSI;

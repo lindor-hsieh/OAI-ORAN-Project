@@ -7,7 +7,7 @@
  * except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.openairinterface.org/?page_id=698
+ * http://www.openairinterface.org/?page_id=698
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,7 +16,7 @@
  * limitations under the License.
  *-------------------------------------------------------------------------------
  * For more information about the OpenAirInterface (OAI) Software Alliance:
- *      contact@openairinterface.org
+ * contact@openairinterface.org
  */
 
 /*! \file mac.h
@@ -47,15 +47,15 @@
 #include "common/utils/ds/byte_array.h"
 #include "openair2/LAYER2/nr_rlc/nr_rlc_configuration.h"
 
-#define NR_SCHED_LOCK(lock)                                        \
-  do {                                                             \
-    int rc = pthread_mutex_lock(lock);                             \
+#define NR_SCHED_LOCK(lock)                                                    \
+  do {                                                                         \
+    int rc = pthread_mutex_lock(lock);                                         \
     AssertFatal(rc == 0, "error while locking scheduler mutex, pthread_mutex_lock() returned %d\n", rc); \
   } while (0)
 
-#define NR_SCHED_UNLOCK(lock)                                      \
-  do {                                                             \
-    int rc = pthread_mutex_unlock(lock);                           \
+#define NR_SCHED_UNLOCK(lock)                                                  \
+  do {                                                                         \
+    int rc = pthread_mutex_unlock(lock);                                       \
     AssertFatal(rc == 0, "error while locking scheduler mutex, pthread_mutex_unlock() returned %d\n", rc); \
   } while (0)
 
@@ -92,19 +92,6 @@
 #include "NR_TAG.h"
 
 /* Defs */
-// 植入FlexRIC Slicing Definitions
-typedef enum {
-  NONE_SLICE = 0,
-  STATIC_SLICE = 1,
-  NVS_SLICE = 2,
-  EDF_SLICE = 3,
-} oai_slice_algorithm_e;
-
-typedef struct {
-  oai_slice_algorithm_e algo;
-  // 這裡其實還有其他 NVS 參數，但為了讓編譯通過，我們先只加 algo
-} nr_slice_info_t;
-
 #define MAX_NUM_BWP 5
 #define MAX_NUM_CORESET 12
 #define MAX_NUM_CCE 90
@@ -382,7 +369,7 @@ typedef struct SPCSIReportingpucch {
   bool s0tos3_actDeact[4];
 } SPCSIReportingpucch_t;
 
-#define MAX_APERIODIC_TRIGGER_STATES 128 //38.331                               
+#define MAX_APERIODIC_TRIGGER_STATES 128 //38.331                                
 typedef struct aperiodicCSI_triggerStateSelection {
   bool is_scheduled;
   uint8_t servingCellId;
@@ -391,7 +378,7 @@ typedef struct aperiodicCSI_triggerStateSelection {
   bool triggerStateSelection[MAX_APERIODIC_TRIGGER_STATES];
 } aperiodicCSI_triggerStateSelection_t;
 
-#define MAX_TCI_STATES 128 //38.331                                             
+#define MAX_TCI_STATES 128 //38.331                                            
 typedef struct pdschTciStatesActDeact {
   bool is_scheduled;
   uint8_t servingCellId;
@@ -877,6 +864,20 @@ typedef struct fsn {
   slot_t s;
 } fsn_t;
 
+// [NVS] 新增：切片演算法枚舉
+typedef enum {
+  STATIC_SLICE = 0,
+  NVS_SLICE = 2,
+  EDF_SLICE = 3,
+  // 其他演算法...
+} oai_slice_algorithm_e;
+
+// [NVS] 新增：切片資訊結構
+typedef struct {
+  oai_slice_algorithm_e algo; // 目前使用的演算法
+  float vip_share;            // VIP 用戶的配額 (e.g., 0.7 for 70%)
+} nr_slice_info_t;
+
 /*! \brief top level eNB MAC structure */
 typedef struct gNB_MAC_INST_s {
   /// Ethernet parameters for northbound midhaul interface
@@ -888,29 +889,29 @@ typedef struct gNB_MAC_INST_s {
   /// Nvipc parameters for FAPI interface with Aerial
   nvipc_params_t nvipc_params_s;
   /// Module
-  module_id_t                     Mod_id;
+  module_id_t                      Mod_id;
   /// timing advance group
   NR_TAG_t                        *tag;
   /// Pointer to IF module instance for PHY
   NR_IF_Module_t                  *if_inst;
-  pthread_t                       stats_thread;
+  pthread_t                        stats_thread;
   /// Pusch target SNR
-  int                             pusch_target_snrx10;
+  int                              pusch_target_snrx10;
   /// RSSI threshold for power control. Limits power control commands when RSSI reaches threshold.
-  int                             pusch_rssi_threshold;
+  int                              pusch_rssi_threshold;
   /// Pucch target SNR
-  int                             pucch_target_snrx10;
+  int                              pucch_target_snrx10;
   /// RSSI threshold for PUCCH power control. Limits power control commands when RSSI reaches threshold.
-  int                             pucch_rssi_threshold;
+  int                              pucch_rssi_threshold;
   /// SNR threshold needed to put or not a PRB in the black list
-  int                             ul_prbblack_SNR_threshold;
+  int                              ul_prbblack_SNR_threshold;
   /// PUCCH Failure threshold (compared to consecutive PUCCH DTX)
-  int                             pucch_failure_thres;
+  int                              pucch_failure_thres;
   /// PUSCH Failure threshold (compared to consecutive PUSCH DTX)
-  int                             pusch_failure_thres;
+  int                              pusch_failure_thres;
   /// Subcarrier Offset
-  int                             ssb_SubcarrierOffset;
-  int                             ssb_OffsetPointA;
+  int                              ssb_SubcarrierOffset;
+  int                              ssb_OffsetPointA;
 
   /// Common cell resources
   NR_COMMON_channels_t common_channels[NFAPI_CC_MAX];
@@ -964,8 +965,6 @@ typedef struct gNB_MAC_INST_s {
 
   nr_mac_config_t radio_config;
   nr_rlc_configuration_t rlc_config;
-  // 植入 讓 gNB 記住現在是用什麼切片
-  nr_slice_info_t slice_info;
 
   NR_UE_sched_ctrl_t *sched_ctrlCommon;
   NR_sched_pdcch_t *sched_pdcch_otherSI;
@@ -994,6 +993,10 @@ typedef struct gNB_MAC_INST_s {
 
   mac_stats_t mac_stats;
   uint64_t num_scheduled_prach_rx;
+  
+  // [NVS] 新增：切片資訊 (儲存 xApp 傳來的狀態)
+  nr_slice_info_t slice_info;
+
 } gNB_MAC_INST;
 
 #endif /*__LAYER2_NR_MAC_GNB_H__ */

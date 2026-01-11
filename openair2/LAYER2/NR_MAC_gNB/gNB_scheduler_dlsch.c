@@ -621,10 +621,8 @@ static void pf_dl(module_id_t module_id,
   NR_ServingCellConfigCommon_t *scc=mac->common_channels[0].ServingCellConfigCommon;
 
   // =========================================================
-  // [NVS] 1. 初始化計數器
+  // [NVS] 1. 初始化每個 Slot 的已使用資源計數器
   // =========================================================
-  // 為了安全起見，宣告成 static 或全域變數可能更好，但在 OAI 架構下
-  // 每次進入 pf_dl 都是新的排程回合，所以這裡歸零是正確的 (Per Slot Scheduling)
   int vip_used_rbs = 0;
   int std_used_rbs = 0;
   // =========================================================
@@ -650,7 +648,7 @@ static void pf_dl(module_id_t module_id,
     NR_sched_pdsch_t *sched_pdsch = &sched_ctrl->sched_pdsch;
     sched_pdsch->dl_harq_pid = sched_ctrl->retrans_dl_harq.head;
 
-    /* Calculate Throughput */
+    /* Calculate Throughput for PF algorithm */
     const float a = 0.01f;
     const uint32_t b = UE->mac_stats.dl.current_bytes;
     UE->dl_thr_ue = (1 - a) * UE->dl_thr_ue + a * b;
@@ -661,7 +659,7 @@ static void pf_dl(module_id_t module_id,
     if (total_rem_ues == 0)
       continue;
 
-    /* retransmission */
+    /* Handle retransmissions (Retransmissions prioritize over new data) */
     if (sched_pdsch->dl_harq_pid >= 0) {
       NR_beam_alloc_t beam = beam_allocation_procedure(&mac->beam_info, frame, slot, UE->UE_beam_index, slots_per_frame);
       bool sch_ret = beam.idx >= 0;
@@ -674,28 +672,29 @@ static void pf_dl(module_id_t module_id,
       }
       remainUEs[beam.idx]--;
     } else {
-      if (sched_ctrl->available_dl_harq.head < 0) {
-        continue;
-      }
-      if (sched_ctrl->num_total_bytes == 0 && frame != (sched_ctrl->ta_frame + 100) % 1024)
-        continue;
+      /* Prepare list of UEs for new data transmission */
+      if (sched_ctrl->available_dl_harq.head < 0) continue;
+      if (sched_ctrl->num_total_bytes == 0 && frame != (sched_ctrl->ta_frame + 100) % 1024) continue;
 
       const NR_bler_options_t *bo = &mac->dl_bler;
       const int max_mcs_table = current_BWP->mcsTableIdx == 1 ? 27 : 28;
       const int max_mcs = min(sched_ctrl->dl_max_mcs, max_mcs_table);
+      
       if (bo->harq_round_max == 1) {
         int new_mcs = min(bo->max_mcs, max_mcs);
         sched_pdsch->mcs = max(bo->min_mcs, new_mcs);
         sched_ctrl->dl_bler_stats.mcs = sched_pdsch->mcs;
       } else
         sched_pdsch->mcs = get_mcs_from_bler(bo, stats, &sched_ctrl->dl_bler_stats, max_mcs, frame);
+
       sched_pdsch->nrOfLayers = get_dl_nrOfLayers(sched_ctrl, current_BWP->dci_format);
       sched_pdsch->pm_index = get_pm_index(mac, UE, current_BWP->dci_format, sched_pdsch->nrOfLayers, mac->radio_config.pdsch_AntennaPorts.XP);
+      
       const uint8_t Qm = nr_get_Qm_dl(sched_pdsch->mcs, current_BWP->mcsTableIdx);
       const uint16_t R = nr_get_code_rate_dl(sched_pdsch->mcs, current_BWP->mcsTableIdx);
       uint32_t tbs = nr_compute_tbs(Qm, R, 1, 10, 0, 0, 0, sched_pdsch->nrOfLayers) >> 3;
-      float coeff_ue = (float) tbs / UE->dl_thr_ue;
       
+      float coeff_ue = (float) tbs / UE->dl_thr_ue;
       UE_sched[numUE].coef = coeff_ue;
       UE_sched[numUE].UE = UE;
       numUE++;
@@ -706,25 +705,26 @@ static void pf_dl(module_id_t module_id,
   UEsched_t *iterator = UE_sched;
   const int min_rbSize = 5;
 
-  /* Loop UE_sched to find max coeff and allocate transmission */
+  /* =========================================================
+   * [NVS Loop] 開始真正進行資源分配迴圈
+   * ========================================================= */
   while (iterator->UE != NULL) {
-
     NR_UE_sched_ctrl_t *sched_ctrl = &iterator->UE->UE_sched_ctrl;
     const uint16_t rnti = iterator->UE->rnti;
 
-    // =========================================================
-    // [NVS] 2. 計算剩餘額度 (針對 48 PRB 動態調整)
-    // =========================================================
-    // 這裡直接讀取 config 檔中的頻寬 (你的情況是 48)
+    // 2. 計算剩餘額度 (Quota) - 根據 xApp 動態比例
     int total_bw = scc->downlinkConfigCommon->frequencyInfoDL->scs_SpecificCarrierList.list.array[0]->carrierBandwidth;
     int allowed_rbs = total_bw; // 預設給全部
 
     if (mac->slice_info.algo == NVS_SLICE) {
-        // VIP (70%) -> 48 * 0.7 = 33 PRBs
-        // STD (30%) -> 48 * 0.3 = 14 PRBs
-        int vip_limit = (int)(total_bw * 0.7);
-        int std_limit = total_bw - vip_limit; // 確保總和為 total_bw
+        float vip_share = mac->slice_info.vip_share;
+        // 如果還沒收到設定，預設給 0.7
+        if (vip_share < 0.01) vip_share = 0.7;
 
+        int vip_limit = (int)(total_bw * vip_share);
+        int std_limit = total_bw - vip_limit;
+
+        // 判斷身分：第一個 UE 為 VIP
         bool is_vip = (iterator->UE->uid == 0); 
 
         if (is_vip) {
@@ -733,28 +733,20 @@ static void pf_dl(module_id_t module_id,
             allowed_rbs = std_limit - std_used_rbs;
         }
 
-        // 額度用完，跳過
+        // 額度用完則跳過
         if (allowed_rbs <= 0) {
             iterator++;
             continue;
         }
     }
-    // =========================================================
 
     NR_UE_DL_BWP_t *dl_bwp = &iterator->UE->current_DL_BWP;
     NR_UE_UL_BWP_t *ul_bwp = &iterator->UE->current_UL_BWP;
 
-    if (sched_ctrl->available_dl_harq.head < 0) {
-      iterator++;
-      continue;
-    }
+    if (sched_ctrl->available_dl_harq.head < 0) { iterator++; continue; }
 
     NR_beam_alloc_t beam = beam_allocation_procedure(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame);
-
-    if (beam.idx < 0) {
-      iterator++;
-      continue;
-    }
+    if (beam.idx < 0) { iterator++; continue; }
     if (remainUEs[beam.idx] == 0 || n_rb_sched[beam.idx] < min_rbSize) {
       reset_beam_status(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
       iterator++;
@@ -775,23 +767,18 @@ static void pf_dl(module_id_t module_id,
     int rbStop = sched_pdsch->bwp_info.bwpSize - 1;
     int bwp_start = sched_pdsch->bwp_info.bwpStart;
 
-    while (rbStart < rbStop && (rballoc_mask[rbStart + bwp_start] & slbitmap))
-      rbStart++;
+    while (rbStart < rbStop && (rballoc_mask[rbStart + bwp_start] & slbitmap)) rbStart++;
 
-    // =========================================================
-    // [NVS] 3. 夾擠邏輯：限制最大可用 RB
-    // =========================================================
+    // 3. [夾擠邏輯] 限制 max_rbSize
     uint16_t max_rbSize = 1;
     while (rbStart + max_rbSize <= rbStop && !(rballoc_mask[rbStart + max_rbSize + bwp_start] & slbitmap))
       max_rbSize++;
 
-    // 如果目前計算出的 max_rbSize 超過剩餘額度，強制截斷
     if (mac->slice_info.algo == NVS_SLICE) {
         if (allowed_rbs < max_rbSize) {
-            max_rbSize = allowed_rbs;
+            max_rbSize = allowed_rbs; // 強制截斷，保證不越權
         }
     }
-    // =========================================================
 
     if (max_rbSize < min_rbSize) {
       reset_beam_status(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
@@ -799,6 +786,7 @@ static void pf_dl(module_id_t module_id,
       continue;
     }
 
+    // (CCE 與 PUCCH 分配保持原樣)
     int CCEIndex = get_cce_index(mac, CC_id, slot, iterator->UE->rnti, &sched_ctrl->aggregation_level, beam.idx, sched_ctrl->search_space, sched_ctrl->coreset, &sched_ctrl->sched_pdcch, sched_ctrl->pdcch_cl_adjust);
     if (CCEIndex < 0) {
       sched_ctrl->dl_cce_fail++;
@@ -820,7 +808,6 @@ static void pf_dl(module_id_t module_id,
 
     sched_ctrl->cce_index = CCEIndex;
     fill_pdcch_vrb_map(mac, CC_id, &sched_ctrl->sched_pdcch, CCEIndex, sched_ctrl->aggregation_level, beam.idx);
-
     sched_pdsch->dmrs_parms = get_dl_dmrs_params(scc, dl_bwp, tda_info, sched_pdsch->nrOfLayers);
     sched_pdsch->Qm = nr_get_Qm_dl(sched_pdsch->mcs, dl_bwp->mcsTableIdx);
     sched_pdsch->R = nr_get_code_rate_dl(sched_pdsch->mcs, dl_bwp->mcsTableIdx);
@@ -829,7 +816,7 @@ static void pf_dl(module_id_t module_id,
     uint16_t rbSize;
     const int oh = 3 * 4 + 2 * (frame == (sched_ctrl->ta_frame + 100) % 1024);
     
-    // [NVS] 傳入截斷後的 max_rbSize
+    // 呼叫找寻 RB 的函式，傳入經過「夾擠」的 max_rbSize
     nr_find_nb_rb(sched_pdsch->Qm, sched_pdsch->R, 1, sched_pdsch->nrOfLayers, tda_info->nrOfSymbols, sched_pdsch->dmrs_parms.N_PRB_DMRS * sched_pdsch->dmrs_parms.N_DMRS_SLOT, sched_ctrl->num_total_bytes + oh, min_rbSize, max_rbSize, &TBS, &rbSize);
     
     sched_pdsch->rbSize = rbSize;
@@ -837,17 +824,11 @@ static void pf_dl(module_id_t module_id,
     sched_pdsch->tb_size = TBS;
     n_rb_sched[beam.idx] -= sched_pdsch->rbSize;
 
-    // =========================================================
-    // [NVS] 4. 扣除額度
-    // =========================================================
+    // 4. 更新已使用額度
     if (mac->slice_info.algo == NVS_SLICE) {
-        if (iterator->UE->uid == 0) {
-            vip_used_rbs += sched_pdsch->rbSize;
-        } else {
-            std_used_rbs += sched_pdsch->rbSize;
-        }
+        if (iterator->UE->uid == 0) vip_used_rbs += sched_pdsch->rbSize;
+        else std_used_rbs += sched_pdsch->rbSize;
     }
-    // =========================================================
 
     for (int rb = bwp_start; rb < sched_pdsch->rbSize; rb++)
       rballoc_mask[rb + sched_pdsch->rbStart] |= slbitmap;

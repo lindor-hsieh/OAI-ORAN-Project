@@ -833,6 +833,27 @@ typedef struct {
   nfapi_nr_dl_tti_pdcch_pdu_rel15_t *pdcch_pdu_coreset[MAX_NUM_CORESET];
 } post_process_pusch_t;
 
+/* -------------------------------------------------------------------------
+ * [NVS/MCS Experiment] 切片控制相關定義
+ * ------------------------------------------------------------------------- */
+#ifndef OAI_SLICE_DEFS
+#define OAI_SLICE_DEFS
+
+#define MAX_NR_SLICES 8
+
+// [NVS] 新增：切片演算法枚舉
+typedef enum {
+  STATIC_SLICE = 0,
+  NVS_SLICE = 2,
+  EDF_SLICE = 3,
+} oai_slice_algorithm_e;
+
+// [新增] 為了對接 xApp 的多切片控制，增加這個小結構
+typedef struct {
+  uint32_t id;
+  float percentage;
+} nr_slice_conf_local_t;
+
 /* forward declaration to use in nr_pp_impl_dl */
 struct gNB_MAC_INST_s;
 typedef struct gNB_MAC_INST_s gNB_MAC_INST;
@@ -864,20 +885,15 @@ typedef struct fsn {
   slot_t s;
 } fsn_t;
 
-// [NVS] 新增：切片演算法枚舉
-typedef enum {
-  STATIC_SLICE = 0,
-  NVS_SLICE = 2,
-  EDF_SLICE = 3,
-  // 其他演算法...
-} oai_slice_algorithm_e;
-
 // [NVS] 新增：切片資訊結構
 typedef struct {
-  oai_slice_algorithm_e algo; // 目前使用的演算法
-  float vip_share;            // VIP 用戶的配額 (e.g., 0.7 for 70%)
+  oai_slice_algorithm_e algo; 
+  uint32_t n_slices;                          // 目前切片數量
+  nr_slice_conf_local_t slices[MAX_NR_SLICES]; // 儲存多個切片比例
+  float vip_share;                            // 保留原本成員，防止其他檔案噴錯
 } nr_slice_info_t;
 
+#endif
 /*! \brief top level eNB MAC structure */
 typedef struct gNB_MAC_INST_s {
   /// Ethernet parameters for northbound midhaul interface

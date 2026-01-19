@@ -1,13 +1,11 @@
 version: '3.8'
 
 services:
-    # 0. O-RAN Near-RT RIC (FlexRIC & xApps)
+    # 0. O-RAN Near-RT RIC & xApps
     oai-flexric:
         image: oaisoftwarealliance/oai-flexric:develop
         privileged: true
-        cap_add:
-            - NET_ADMIN          # <--- 增加這行：允許管理網路介面
-            - NET_RAW            # <--- 增加這行：允許原始套接字操作
+        cap_add: [NET_ADMIN, NET_RAW]
         container_name: flexric
         networks:
             public_net:
@@ -24,10 +22,8 @@ services:
         command: "stdbuf -o0 /usr/local/flexric/xApp/c/monitor/xapp_kpm_moni"
         container_name: xapp-kpm-moni
         privileged: true
-        cap_add:
-            - NET_ADMIN
-        depends_on:
-            - oai-flexric
+        cap_add: [NET_ADMIN]
+        depends_on: [oai-flexric]
         networks:
             public_net:
                 ipv4_address: 192.168.71.142
@@ -40,8 +36,7 @@ services:
         image: oaisoftwarealliance/oai-flexric:develop
         command: "stdbuf -o0 /usr/local/flexric/xApp/c/monitor/xapp_gtp_mac_rlc_pdcp_moni"
         container_name: xapp-gtp-moni
-        depends_on:
-            - oai-flexric
+        depends_on: [oai-flexric]
         networks:
             public_net:
                 ipv4_address: 192.168.71.143
@@ -144,133 +139,85 @@ services:
             timeout: 5s
             retries: 5
 
-    # 2. IAB Donor (原 oai-gnb)
-    iab-donor: 
-        image: ${REGISTRY:-oaisoftwarealliance}/${GNB_IMG:-oai-gnb}:${TAG:-develop}
-        container_name: rfsim5g-iab-donor
+    # 2. IAB Donor (CU + DU)
+    rfsim5g-donor-cu:
+        image: oaisoftwarealliance/oai-gnb:develop
+        container_name: rfsim5g-donor-cu
         privileged: true
-        cap_add:
-            - SYS_NICE
-            - NET_ADMIN          # 必須具備
-            - NET_RAW            # 必須具備
-        # cap_drop:              # 暫時註解掉這行測試
-        #    - ALL
+        cap_add: [NET_ADMIN, NET_RAW]
         environment:
-            USE_ADDITIONAL_OPTIONS: -E --rfsim --log_config.global_log_options level,nocolor,time
-            ASAN_OPTIONS: detect_leaks=0
-        depends_on:
-            - oai-flexric
-            - oai-ext-dn
-        cpuset: "0-3"
+            USE_ADDITIONAL_OPTIONS: --log_config.global_log_options level,nocolor,time
+        depends_on: [oai-flexric, oai-upf]
         networks:
             public_net:
                 ipv4_address: 192.168.71.140
-        # 這裡沿用原本的 config,必須包含 e2_agent 設定指向 192.168.71.141
         volumes:
-            - ../../conf_files/gnb.sa.band78.106prb.rfsim.flexric.conf:/opt/oai-gnb/etc/gnb.conf
-        healthcheck:
-            test: /bin/bash -c "pgrep nr-softmodem"
-            start_period: 10s
-            start_interval: 500ms
-            interval: 10s
-            timeout: 5s
-            retries: 5
+            - ./conf/donor_cu.conf:/opt/oai-gnb/etc/gnb.conf
+            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
+
+    rfsim5g-donor-du:
+        image: oaisoftwarealliance/oai-gnb:develop
+        container_name: rfsim5g-donor-du
+        privileged: true
+        cap_add: [NET_ADMIN, NET_RAW]
+        environment:
+            USE_ADDITIONAL_OPTIONS: --rfsim --log_config.global_log_options level,nocolor,time
+        depends_on: [rfsim5g-donor-cu]
+        networks:
+            public_net:
+                ipv4_address: 192.168.71.144
+        volumes:
+            - ./conf/donor_du.conf:/opt/oai-gnb/etc/gnb.conf
 
     # 3. IAB Node (MT + DU)
-
-    # Part A: IAB-MT
-    iab-mt:
-        image: oaisoftwarealliance/oai-nr-ue:develop  # <--- 您指定的 develop
+    rfsim5g-iab-mt:
+        image: oaisoftwarealliance/oai-nr-ue:develop
         container_name: rfsim5g-iab-mt
         privileged: true
-        cap_drop:
-            - ALL
-        cap_add:
-            - NET_ADMIN
-            - NET_RAW
-            - SYS_NICE
-        depends_on:
-            - iab-donor
-        cpuset: "4-7"
+        cap_add: [NET_ADMIN, NET_RAW]
+        depends_on: [rfsim5g-donor-du]
         networks:
             public_net:
                 ipv4_address: 192.168.71.150
         devices:
              - /dev/net/tun:/dev/net/tun
         volumes:
-            - ../../conf_files/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
-            # 掛載我的腳本
-            - ./iab_conf/iab_router_init.sh:/opt/iab_router_init.sh
-        entrypoint: /bin/bash -c "chmod +x /opt/iab_router_init.sh && /opt/iab_router_init.sh"
-        
-    # Part B: IAB-DU - 負責服務 End UE
-    iab-du:
-        image: ${REGISTRY:-oaisoftwarealliance}/${GNB_IMG:-oai-gnb}:${TAG:-develop}
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
+        # 3.3GHz, 106 PRB
+        environment:
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+
+    rfsim5g-iab-du:
+        image: oaisoftwarealliance/oai-gnb:develop
         container_name: rfsim5g-iab-du
         privileged: true
-        depends_on: [iab-mt]
-        cpuset: "8-11"
-        network_mode: "service:iab-mt" # 關鍵：與 MT 共用 IP (192.168.71.150)
+        depends_on: [rfsim5g-iab-mt]
+        # 共享 MT 的網路，這樣 DU 出去的封包就會自動走 MT 的 IP
+        network_mode: "service:rfsim5g-iab-mt"
         volumes:
-            # 掛載 .conf 檔，並掛載到 gnb.conf
-            - ./iab_du.conf:/opt/oai-gnb/etc/gnb.conf
-        # 這裡不掛載外部 config，改用 ENV 變數自動生成，以避免跟 Donor 的參數衝突
+            - ./conf/iab_du.conf:/opt/oai-gnb/etc/gnb.conf
         environment:
-            USE_SA_TDD_MONO: "yes"
-            GNB_ID: "0xe01" # 必須不同於 Donor (0xe00)
-            GNB_NAME: "gNB-IAB-DU"
-            MCC: "208"
-            MNC: "99"
-            MNC_LENGTH: "2"
-            TAC: "1"
-            NSSAI_SST: "1"
-            AMF_IP_ADDRESS: "192.168.71.132"
-            # NGA/NGU 必須填 MT 的 IP，因為它們共用網路
-            GNB_NGA_IP_ADDRESS: "192.168.71.150"
-            GNB_NGU_IP_ADDRESS: "192.168.71.150"
-            GNB_NGA_IF_NAME: "eth0"
-            GNB_NGU_IF_NAME: "eth0"
-            USE_RFSIMULATOR: "yes"
-            RFSIMULATOR_SERVERADDR: "server"
-            # 監聽 4044 Port，與 MT 區隔
+            # -O 指定設定檔路徑
+            # --rfsimulator.serverport 4044 (避免與 MT 衝突)
             USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
 
-    # 4. End UE (原 oai-nr-ue2)
-    end-ue:
-        image: ${REGISTRY:-oaisoftwarealliance}/${NRUE_IMG:-oai-nr-ue}:${TAG:-develop}
+    # 4. End UE (一般用戶)
+    rfsim5g-end-ue:
+        image: oaisoftwarealliance/oai-nr-ue:develop
         container_name: rfsim5g-end-ue
         privileged: true
-        cap_drop:
-            - ALL
-        cap_add:
-            - NET_ADMIN
-            - NET_RAW
-            - SYS_NICE
+        cap_add: [NET_ADMIN, NET_RAW]
+        volumes:
+            - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
         environment:
-            # 使用 IMSI 208990100001101 (原UE2)
-            # serveraddr 指向 IAB Node (192.168.71.150)
-            # serverport 指向 4044 (DU 的 Port)
+            # 連線目標:serveraddr 設為 IAB IP (192.168.71.150)，port 設為 DU 的 4044
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.71.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
-        depends_on:
-            - iab-du
-        cpuset: "12-15"
+        depends_on: [rfsim5g-iab-du]
         networks:
             public_net:
-                ipv4_address: 192.168.71.151
+                ipv4_address: 192.168.71.160
         devices:
              - /dev/net/tun:/dev/net/tun
-        volumes:
-            - ../../conf_files/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
-        healthcheck:
-            test: /bin/bash -c "pgrep nr-uesoftmodem"
-            start_period: 10s
-            start_interval: 500ms
-            interval: 10s
-            timeout: 5s
-            retries: 5
-
-    # (可選) 保留其他 UE，但建議先註解掉以免資源不足
-    # oai-nr-ue3: ...
 
 networks:
     public_net:
@@ -279,13 +226,9 @@ networks:
         ipam:
             config:
                 - subnet: 192.168.71.128/26
-        driver_opts:
-            com.docker.network.bridge.name: "rfsim5g-public"
     traffic_net:
         driver: bridge
         name: rfsim5g-oai-traffic-net
         ipam:
             config:
                 - subnet: 192.168.72.128/26
-        driver_opts:
-            com.docker.network.bridge.name: "rfsim5g-traffic"

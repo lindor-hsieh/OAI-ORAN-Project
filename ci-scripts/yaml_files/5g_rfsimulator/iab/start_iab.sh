@@ -17,7 +17,7 @@ $DOCKER_COMPOSE -f $COMPOSE_FILE down
 sudo ip route del 12.1.1.0/24 2>/dev/null
 
 echo "[2/6] Run Core Network and Donor "
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d mysql oai-amf oai-smf oai-upf rfsim5g-donor-cu rfsim5g-donor-du oai-flexric
+$DOCKER_COMPOSE -f $COMPOSE_FILE up -d mysql oai-amf oai-smf oai-upf oai-ext-dn rfsim5g-donor-cu rfsim5g-donor-du oai-flexric
 
 echo "System Initialization"
 sleep 25
@@ -85,11 +85,26 @@ echo "Configure Donor-CU: Add return route..."
 docker exec -u 0 rfsim5g-donor-cu ip route del 12.1.1.0/24 2>/dev/null
 docker exec -u 0 rfsim5g-donor-cu ip route add 12.1.1.0/24 via 192.168.71.134 dev eth0 2>/dev/null || true
 
+# C. UPF 側設定 (負責 Internet NAT)
+echo "Configure UPF: Enable Internet NAT..."
+
+# 1. 確保 UPF 開啟轉發
+docker exec -u 0 rfsim5g-oai-upf sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# 2. 設定 NAT (關鍵！沒有這行出不去 8.8.8.8)
+# 意義：凡是來自 12.1.1.0/24 (UE網段) 的封包，要從 eth0 (Docker 網橋) 出去時,把它偽裝成 UPF 的 Docker IP，這樣 Google 才知道回信給誰
+docker exec -u 0 rfsim5g-oai-upf iptables -t nat -A POSTROUTING -s 12.1.1.0/24 -o eth0 -j MASQUERADE
+
 echo "[6/6] Run End-UE and Test..."
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-end-ue
-echo "Waiting for 15s for End-UE Connection..."
-sleep 15
+echo "Waiting for 45s for End-UE Connection..."
+sleep 45
 
-echo "Start Ping Test (End-UE -> Donor-CU) "
+
+echo "Test 1: Ping Donor-CU (Check IAB Internal Link)"
 # 測試這條路徑：End-UE -> IAB-DU -> IAB-MT -> Donor-DU -> Donor-CU
 docker exec -it rfsim5g-end-ue ping -I oaitun_ue1 -c 4 192.168.71.140
+
+echo "=== Test 2: Ping Internet (Check UPF NAT) ==="
+# 測試 8.8.8.8
+docker exec -it rfsim5g-end-ue ping -I oaitun_ue1 -c 4 8.8.8.8

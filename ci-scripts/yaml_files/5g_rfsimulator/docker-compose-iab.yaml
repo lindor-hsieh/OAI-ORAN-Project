@@ -171,7 +171,11 @@ services:
 
     # 3. IAB Node (MT + DU)
     rfsim5g-iab-mt:
-        image: oaisoftwarealliance/oai-nr-ue:develop
+        # image: oaisoftwarealliance/oai-nr-ue:develop
+        build:
+            context: .
+            dockerfile: Dockerfile.ue
+
         container_name: rfsim5g-iab-mt
         privileged: true
         cap_add: [NET_ADMIN, NET_RAW]
@@ -203,7 +207,11 @@ services:
 
     # 4. End UE (一般用戶)
     rfsim5g-end-ue:
-        image: oaisoftwarealliance/oai-nr-ue:develop
+        # image: oaisoftwarealliance/oai-nr-ue:develop
+        build:
+            context: .
+            dockerfile: Dockerfile.ue
+
         container_name: rfsim5g-end-ue
         privileged: true
         cap_add: [NET_ADMIN, NET_RAW]

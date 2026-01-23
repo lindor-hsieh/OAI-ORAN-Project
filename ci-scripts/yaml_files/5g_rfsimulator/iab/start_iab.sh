@@ -96,15 +96,119 @@ docker exec -u 0 rfsim5g-oai-upf sysctl -w net.ipv4.ip_forward=1 >/dev/null
 docker exec -u 0 rfsim5g-oai-upf iptables -t nat -A POSTROUTING -s 12.1.1.0/24 -o eth0 -j MASQUERADE
 
 echo "[6/6] Run End-UE and Test..."
+
+# 1. 啟動 UE
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-end-ue
-echo "Waiting for 45s for End-UE Connection..."
-sleep 45
 
+echo "Waiting for End-UE to attach..."
 
-echo "Test 1: Ping Donor-CU (Check IAB Internal Link)"
-# 測試這條路徑：End-UE -> IAB-DU -> IAB-MT -> Donor-DU -> Donor-CU
-docker exec -it rfsim5g-end-ue ping -I oaitun_ue1 -c 4 192.168.71.140
+# 定義檢查連線函數
+check_ue_ip() {
+    UE_NAME=$1
+    echo -n "Checking $UE_NAME... "
+    UE_IP=""
+    MAX_RETRIES=60
+    COUNT=0
+    while [ -z "$UE_IP" ]; do
+        UE_IP=$(docker exec $UE_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [ ! -z "$UE_IP" ]; then
+            echo " Attached! IP: $UE_IP"
+            break
+        fi
+        sleep 2
+        COUNT=$((COUNT+1))
+        if [ $COUNT -ge $MAX_RETRIES ]; then
+            echo "Timeout: $UE_NAME failed to attach."
+            return 1
+        fi
+    done
+}
 
-echo "=== Test 2: Ping Internet (Check UPF NAT) ==="
-# 測試 8.8.8.8
-docker exec -it rfsim5g-end-ue ping -I oaitun_ue1 -c 4 8.8.8.8
+# 2. 檢查 UE 是否連上 (這時網卡才會建立)
+check_ue_ip "rfsim5g-end-ue"
+
+# 3. 設定測速路由 (必須在連上後執行)
+echo "Configuring Static Routes for Throughput Test..."
+# 告訴 UE 去找 Ext-DN (192.168.72.x) 必須走 oaitun_ue1
+docker exec -u 0 rfsim5g-end-ue ip route add 192.168.72.128/26 dev oaitun_ue1 2>/dev/null || true
+
+echo "Wait 5s for routing stability..."
+sleep 5
+
+echo "[7/7] Connectivity & Performance Test (Latency + Throughput)"
+
+# 1. 定義測試參數
+# 定義固定節點 IP
+DONOR_CU_IP="192.168.71.140"
+DONOR_DU_IP="192.168.71.144"
+GOOGLE_DNS="8.8.8.8"
+TRAFFIC_SERVER_IP="192.168.72.135"
+
+# 確保 Traffic Server (Ext-DN) 已經在背景開啟 iperf3 Server 模式
+docker exec -d rfsim5g-oai-ext-dn iperf3 -s > /dev/null 2>&1
+
+# 2. 定義測試函數
+# 函數 A: Ping 測試 (含 Latency)
+ping_hop() {
+    SRC_CONTAINER=$1
+    TARGET_NAME=$2
+    TARGET_IP=$3
+    
+    echo -n "   -> Ping $TARGET_NAME ($TARGET_IP): "
+    
+    # 執行 Ping，並抓取結果
+    OUTPUT=$(docker exec $SRC_CONTAINER ping -I oaitun_ue1 -c 3 -W 2 $TARGET_IP 2>&1)
+    EXIT_CODE=$?
+    
+    if [ $EXIT_CODE -eq 0 ]; then
+        # 抓取平均延遲 (avg)
+        AVG_LATENCY=$(echo "$OUTPUT" | grep -E "^rtt|^round-trip" | awk -F '/' '{print $5}')
+        echo -e "\033[32mPASS\033[0m \033[36m(Avg: ${AVG_LATENCY} ms)\033[0m"
+    else
+        echo -e "\033[31mFAIL\033[0m"
+    fi
+}
+
+# 函數 B: Throughput 測試 (含 Speed)
+measure_throughput() {
+    SRC_CONTAINER=$1
+    TARGET_IP=$2
+    
+    echo -n "   -> Throughput Test (Downlink): "
+    
+    # 執行 iperf3 
+    OUTPUT=$(docker exec $SRC_CONTAINER iperf3 -c $TARGET_IP -t 3 -f m -R 2>&1)
+    EXIT_CODE=$?
+
+    if [ $EXIT_CODE -eq 0 ]; then
+        # 抓取最後的 Receiver Bitrate
+        THROUGHPUT=$(echo "$OUTPUT" | grep "receiver" | grep "SUM" | awk '{print $6, $7}')
+        if [ -z "$THROUGHPUT" ]; then
+             THROUGHPUT=$(echo "$OUTPUT" | grep "receiver" | tail -n 1 | awk '{print $7, $8}')
+        fi
+        echo -e "\033[32mPASS\033[0m \033[35m(Speed: ${THROUGHPUT})\033[0m"
+    else
+        echo -e "\033[31mFAIL (Check iperf3 installed?)\033[0m"
+    fi
+}
+
+# 3. 開始執行診斷
+echo -e "\n1. Hop-by-Hop Diagnostics (逐跳診斷 + 測速)"
+echo "PATH: UE -> IAB Node (Gateway) -> Donor -> Internet"
+
+# 使用腳本前面抓到的 $MT_IP
+if [ -z "$MT_IP" ]; then 
+    echo "Warning: MT_IP variable is empty, using default."
+    MT_IP="192.168.71.150"
+fi
+
+# 1. 逐跳測試
+ping_hop "rfsim5g-end-ue" "IAB Node (Gateway)" "$MT_IP"
+ping_hop "rfsim5g-end-ue" "Donor DU (Backhaul)" "$DONOR_DU_IP"
+ping_hop "rfsim5g-end-ue" "Donor CU (Core Edge)" "$DONOR_CU_IP"
+ping_hop "rfsim5g-end-ue" "Internet (Google)" "$GOOGLE_DNS"
+
+# 2. 端對端測速
+measure_throughput "rfsim5g-end-ue" $TRAFFIC_SERVER_IP
+
+echo -e "\n Diagnostics Completed."

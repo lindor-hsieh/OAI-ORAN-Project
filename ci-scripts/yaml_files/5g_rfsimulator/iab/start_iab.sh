@@ -149,53 +149,110 @@ check_ue_ip "rfsim5g-end-ue"
 check_ue_ip "rfsim5g-end-ue-2"
 check_ue_ip "rfsim5g-end-ue-3"
 
+echo "Configuring Static Routes for Throughput Test..."
+
+# 幫每一台 UE 加入去往 Ext-DN (測速伺服器) 的路由
+# 告訴 UE 去找 192.168.72.x 要走 oaitun_ue1 介面
+for UE_NAME in rfsim5g-end-ue rfsim5g-end-ue-2 rfsim5g-end-ue-3; do
+    docker exec -u 0 $UE_NAME ip route add 192.168.72.128/26 dev oaitun_ue1 2>/dev/null || true
+done
+
 # 給一點緩衝時間讓路由穩定
 echo "Wait 5s for routing stability..."
 sleep 5
 
-echo "[7/7] Connectivity & Topology Test with Hop-by-Hop Diagnostics"
+echo "[7/7] Connectivity & Performance Test (Latency + Throughput)"
 
-# 定義固定節點 IP 
+# 1. 定義測試參數
 DONOR_CU_IP="192.168.71.140"
 DONOR_DU_IP="192.168.71.144"
 GOOGLE_DNS="8.8.8.8"
+TRAFFIC_SERVER_IP="192.168.72.135"  # Ext-DN (測速伺服器) 的 IP
 
-# 定義測試函數 (自動判定 PASS/FAIL)
+# 確保 Traffic Server (Ext-DN) 已經在背景開啟 iperf3 Server 模式
+# 如果沒開，這裡會自動幫忙開
+docker exec -d rfsim5g-oai-ext-dn iperf3 -s > /dev/null 2>&1
+
+# 2. 定義測試函數
+# 函數 A: Ping 測試 (含latency)
 ping_hop() {
     SRC_CONTAINER=$1
     TARGET_NAME=$2
     TARGET_IP=$3
-
+    
     echo -n "   -> Ping $TARGET_NAME ($TARGET_IP): "
-    # -c 3: ping 3次
-    # -W 2: 等待超時 2秒 (避免卡死)
-    docker exec -it $SRC_CONTAINER ping -I oaitun_ue1 -c 3 -W 2 $TARGET_IP > /dev/null 2>&1
-
-    if [ $? -eq 0 ]; then
-        echo -e "\033[32mPASS\033[0m" # 綠色 PASS
+    
+    # 執行 Ping (移除 -it 以避免腳本執行時的 TTY 錯誤)
+    # 擷取標準輸出與錯誤輸出 (2>&1)
+    OUTPUT=$(docker exec $SRC_CONTAINER ping -I oaitun_ue1 -c 3 -W 2 $TARGET_IP 2>&1)
+    EXIT_CODE=$?
+    
+    if [ $EXIT_CODE -eq 0 ]; then
+        # 使用 awk 抓取 rtt 的平均值 (第 4 行通常是統計，格式為 min/avg/max/mdev)
+        AVG_LATENCY=$(echo "$OUTPUT" | grep -E "^rtt|^round-trip" | awk -F '/' '{print $5}')
+        
+        # 顯示綠色 PASS 與 青色延遲數據
+        echo -e "\033[32mPASS\033[0m \033[36m(Avg: ${AVG_LATENCY} ms)\033[0m"
     else
-        echo -e "\033[31mFAIL\033[0m" # 紅色 FAIL
+        echo -e "\033[31mFAIL\033[0m"
     fi
 }
 
-echo -e "\n 1. Hop-by-Hop Diagnostics (逐跳診斷) "
+# 函數 B: Throughput 測試 (含throughput)
+measure_throughput() {
+    SRC_CONTAINER=$1
+    TARGET_IP=$2
+    
+    echo -n "   -> Throughput Test (Downlink): "
+    
+    # 執行 iperf3 測試
+    # -c: Client模式
+    # -t 3: 只測 3 秒 (避免卡太久)
+    # -R: Reverse mode (測試下行下載速度)
+    # -f m: 輸出單位為 Mbps
+    OUTPUT=$(docker exec $SRC_CONTAINER iperf3 -c $TARGET_IP -t 3 -f m -R 2>&1)
+    EXIT_CODE=$?
 
+    if [ $EXIT_CODE -eq 0 ]; then
+        # 抓取最後的 Receiver Bitrate
+        THROUGHPUT=$(echo "$OUTPUT" | grep "receiver" | grep "SUM" | awk '{print $6, $7}')
+        
+        # 如果 SUM 抓不到 (單執行緒情況)，抓最後一行
+        if [ -z "$THROUGHPUT" ]; then
+             THROUGHPUT=$(echo "$OUTPUT" | grep "receiver" | tail -n 1 | awk '{print $7, $8}')
+        fi
+
+        # 顯示綠色 PASS 與 紫色速率數據
+        echo -e "\033[32mPASS\033[0m \033[35m(Speed: ${THROUGHPUT})\033[0m"
+    else
+        echo -e "\033[31mFAIL (Check iperf3 installed?)\033[0m"
+    fi
+}
+
+# 3. 開始執行診斷
+echo -e "\n1. Hop-by-Hop Diagnostics (逐跳診斷 + 測速)"
 echo "PATH A: UE 1 -> IAB Node 2 -> Donor -> Internet"
-# 使用腳本前面抓到的 $MT2_IP 變數
-if [ -z "$MT2_IP" ]; then MT2_IP="192.168.71.152"; fi # 防呆預設值
+# 使用腳本前面抓到的 $MT2_IP 變數 (防呆預設值)
+if [ -z "$MT2_IP" ]; then MT2_IP="192.168.71.152"; fi 
 
 ping_hop "rfsim5g-end-ue" "IAB Node 2 (Gateway)" "$MT2_IP"
 ping_hop "rfsim5g-end-ue" "Donor DU (Backhaul)" "$DONOR_DU_IP"
 ping_hop "rfsim5g-end-ue" "Donor CU (Core Edge)" "$DONOR_CU_IP"
 ping_hop "rfsim5g-end-ue" "Internet (Google)" "$GOOGLE_DNS"
 
+# 在這條路徑的最後，測試端對端速度
+measure_throughput "rfsim5g-end-ue" $TRAFFIC_SERVER_IP
+
 echo "PATH B: UE 3 -> IAB Node 1 -> Donor -> Internet"
-# 使用腳本前面抓到的 $MT1_IP 變數
-if [ -z "$MT1_IP" ]; then MT1_IP="192.168.71.150"; fi # 防呆預設值
+# 使用腳本前面抓到的 $MT1_IP 變數 (防呆預設值)
+if [ -z "$MT1_IP" ]; then MT1_IP="192.168.71.150"; fi 
 
 ping_hop "rfsim5g-end-ue-3" "IAB Node 1 (Gateway)" "$MT1_IP"
 ping_hop "rfsim5g-end-ue-3" "Donor DU (Backhaul)" "$DONOR_DU_IP"
 ping_hop "rfsim5g-end-ue-3" "Donor CU (Core Edge)" "$DONOR_CU_IP"
 ping_hop "rfsim5g-end-ue-3" "Internet (Google)" "$GOOGLE_DNS"
+
+# 在這條路徑的最後，測試端對端速度
+measure_throughput "rfsim5g-end-ue-3" $TRAFFIC_SERVER_IP
 
 echo -e "\n Diagnostics Completed."

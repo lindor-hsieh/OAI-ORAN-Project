@@ -4,9 +4,9 @@ FROM oaisoftwarealliance/oai-nr-ue:develop
 # 切換到 root 權限進行安裝
 USER root
 
-# 一次性更新並安裝路由工具，然後清除暫存檔以縮小體積
+# 一次性更新 install 路由工具 and iperf3，然後清除暫存檔以縮小體積
 RUN apt-get update && \
-    apt-get install -y iptables iproute2 iputils-ping && \
+    apt-get install -y iptables iproute2 iputils-ping iperf3 && \
     rm -rf /var/lib/apt/lists/*
 
 # 切換回原本的使用者 

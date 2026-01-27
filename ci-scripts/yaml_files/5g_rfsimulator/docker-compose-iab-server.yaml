@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
     # 0. O-RAN Near-RT RIC & xApps
-    oai-flexric: 
+    oai-flexric:
         image: oaisoftwarealliance/oai-flexric:develop
         privileged: true
         cap_add: [NET_ADMIN, NET_RAW]
@@ -29,17 +29,6 @@ services:
                 ipv4_address: 192.168.71.142
         environment:
             - NEAR_RT_RIC_IP=192.168.71.141
-        volumes:
-            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
-
-    xapp-gtp-moni:
-        image: oaisoftwarealliance/oai-flexric:develop
-        command: "stdbuf -o0 /usr/local/flexric/xApp/c/monitor/xapp_gtp_mac_rlc_pdcp_moni"
-        container_name: xapp-gtp-moni
-        depends_on: [oai-flexric]
-        networks:
-            public_net:
-                ipv4_address: 192.168.71.143
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
 
@@ -139,7 +128,7 @@ services:
             timeout: 5s
             retries: 5
 
-    # 2. IAB Donor (CU + DU)
+    # 2. IAB Donor (Root Node)
     rfsim5g-donor-cu:
         image: oaisoftwarealliance/oai-gnb:develop
         container_name: rfsim5g-donor-cu
@@ -168,14 +157,13 @@ services:
                 ipv4_address: 192.168.71.144
         volumes:
             - ./conf/donor_du.conf:/opt/oai-gnb/etc/gnb.conf
+        ports:
+            - "4043:4043/udp" # Donor Port
+            - "4043:4043/tcp"
 
-    # 3. IAB Node 1 (Relay Node)
+    # 3. Layer 1: IAB Node 1 (Aggregator Left)
     rfsim5g-iab-mt:
-        # image: oaisoftwarealliance/oai-nr-ue:develop
-        build:
-            context: .
-            dockerfile: Dockerfile.ue
-
+        build: { context: ., dockerfile: Dockerfile.ue }
         container_name: rfsim5g-iab-mt
         privileged: true
         cap_add: [NET_ADMIN, NET_RAW]
@@ -188,8 +176,11 @@ services:
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
         environment:
-            # IAB 1 始終直連 Donor (.144)
+            # 連接 Donor (.144)
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+        ports:
+            - "4044:4044/udp" # Node 1 Port
+            - "4044:4044/tcp"
 
     rfsim5g-iab-du:
         image: oaisoftwarealliance/oai-gnb:develop
@@ -200,111 +191,137 @@ services:
         volumes:
             - ./conf/iab_du.conf:/opt/oai-gnb/etc/gnb.conf
         environment:
-            # Port 4044 
             USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
 
-    # 4. IAB Node 2 (Access Node)
+    # 4. Layer 1: IAB Node 2 (Aggregator Right)
     rfsim5g-iab-mt-2:
-        # image: oaisoftwarealliance/oai-nr-ue:develop
-        build:
-            context: .
-            dockerfile: Dockerfile.ue
+        build: { context: ., dockerfile: Dockerfile.ue }
         container_name: rfsim5g-iab-mt-2
         privileged: true
         cap_add: [NET_ADMIN, NET_RAW]
-        # 這裡不寫死 depends_on IAB-1，因為它可能直連 Donor
         networks:
             public_net:
-                ipv4_address: 192.168.71.152 # 新 IP
+                ipv4_address: 192.168.71.152
         devices:
              - /dev/net/tun:/dev/net/tun
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
         environment:
-            # IMSI 改為 ...1102 (避免衝突)
-            # !!三角拓撲切換關鍵
-            # mode A (直連 Donor - Link B): serveraddr 192.168.71.144
-            # mode B (走 Relay - Link C): serveraddr 192.168.71.150
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001102 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+            # 連接 Donor (.144)
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+        ports:
+            - "4045:4045/udp" # Node 2 Port
+            - "4045:4045/tcp"
 
     rfsim5g-iab-du-2:
         image: oaisoftwarealliance/oai-gnb:develop
         container_name: rfsim5g-iab-du-2
         privileged: true
         depends_on: [rfsim5g-iab-mt-2]
-        network_mode: "service:rfsim5g-iab-mt-2" # 寄生在 MT-2
+        network_mode: "service:rfsim5g-iab-mt-2"
         volumes:
             - ./conf/iab_du_2.conf:/opt/oai-gnb/etc/gnb.conf
         environment:
-            # Port 改為 4045 (給 End-UE 連)
             USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
 
-    # 5. End UE (接在 Node 2 下面)
-    rfsim5g-end-ue:
-        # image: oaisoftwarealliance/oai-nr-ue:develop
-        build:
-            context: .
-            dockerfile: Dockerfile.ue
-
-        container_name: rfsim5g-end-ue
+    # ==========================================
+    # 5. Layer 2: IAB Node 3 (Left Leaf)
+    # ==========================================
+    rfsim5g-iab-mt-3:
+        build: { context: ., dockerfile: Dockerfile.ue }
+        container_name: rfsim5g-iab-mt-3
         privileged: true
         cap_add: [NET_ADMIN, NET_RAW]
-        volumes:
-            - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
-        environment:
-            # IMSI ...1103
-            # serveraddr: 指向 IAB Node 2 (192.168.71.152)
-            # serverport: 指向 4045
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001103 --rfsimulator.serveraddr 192.168.71.152 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
-        depends_on: [rfsim5g-iab-du-2]
         networks:
             public_net:
-                ipv4_address: 192.168.71.160
+                ipv4_address: 192.168.71.154
         devices:
              - /dev/net/tun:/dev/net/tun
-    
-    # UE 2 (連接 Node 2)
-    rfsim5g-end-ue-2:
-        # image: oaisoftwarealliance/oai-nr-ue:develop
-        build:
-            context: .
-            dockerfile: Dockerfile.ue
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
+        environment:
+            # 連接 Node 1 (.150)
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001102 --rfsimulator.serveraddr 192.168.71.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+        ports:
+            - "4046:4046/udp" # Node 3 Port
+            - "4046:4046/tcp"
 
-        container_name: rfsim5g-end-ue-2
+    rfsim5g-iab-du-3:
+        image: oaisoftwarealliance/oai-gnb:develop
+        container_name: rfsim5g-iab-du-3
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-3]
+        network_mode: "service:rfsim5g-iab-mt-3"
+        volumes:
+            - ./conf/iab_du_3.conf:/opt/oai-gnb/etc/gnb.conf # 記得建立新設定檔
+        environment:
+            USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+
+    # ==========================================
+    # 6. Layer 2: IAB Node 4 (Middle - Switchable)
+    # ==========================================
+    rfsim5g-iab-mt-4:
+        build: { context: ., dockerfile: Dockerfile.ue }
+        container_name: rfsim5g-iab-mt-4
         privileged: true
         cap_add: [NET_ADMIN, NET_RAW]
+        networks:
+            public_net:
+                ipv4_address: 192.168.71.156
+        devices:
+             - /dev/net/tun:/dev/net/tun
         volumes:
-            - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
         environment:
-            # IMSI: ...1104
-            # serverport: 4045 (連 IAB-Node-2)
+            # 初始連接 Node 1 (.150) -> xApp 實驗可切換至 Node 2
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001103 --rfsimulator.serveraddr 192.168.71.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+        ports:
+            - "4047:4047/udp" # Node 4 Port
+            - "4047:4047/tcp"
+
+    rfsim5g-iab-du-4:
+        image: oaisoftwarealliance/oai-gnb:develop
+        container_name: rfsim5g-iab-du-4
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-4]
+        network_mode: "service:rfsim5g-iab-mt-4"
+        volumes:
+            - ./conf/iab_du_4.conf:/opt/oai-gnb/etc/gnb.conf # 記得建立新設定檔
+        environment:
+            USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+
+    # ==========================================
+    # 7. Layer 2: IAB Node 5 (Right Leaf)
+    # ==========================================
+    rfsim5g-iab-mt-5:
+        build: { context: ., dockerfile: Dockerfile.ue }
+        container_name: rfsim5g-iab-mt-5
+        privileged: true
+        cap_add: [NET_ADMIN, NET_RAW]
+        networks:
+            public_net:
+                ipv4_address: 192.168.71.158
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
+        environment:
+            # 連接 Node 2 (.152)
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001104 --rfsimulator.serveraddr 192.168.71.152 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
-        depends_on: [rfsim5g-iab-du-2]
-        networks:
-            public_net:
-                ipv4_address: 192.168.71.161 # 新 IP
+        ports:
+            - "4048:4048/udp" # Node 5 Port
+            - "4048:4048/tcp"
 
-    # UE 3 (連接 Node 1 - 讓兩邊都有負載)
-    rfsim5g-end-ue-3:
-        # image: oaisoftwarealliance/oai-nr-ue:develop
-        build:
-            context: .
-            dockerfile: Dockerfile.ue
-
-        container_name: rfsim5g-end-ue-3
+    rfsim5g-iab-du-5:
+        image: oaisoftwarealliance/oai-gnb:develop
+        container_name: rfsim5g-iab-du-5
         privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
+        depends_on: [rfsim5g-iab-mt-5]
+        network_mode: "service:rfsim5g-iab-mt-5"
         volumes:
-            - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+            - ./conf/iab_du_5.conf:/opt/oai-gnb/etc/gnb.conf # 記得建立新設定檔
         environment:
-            # IMSI: ...1105
-            # serverport: 4044 (連 IAB-Node-1)
-            # serveraddr: 192.168.71.150 (Node 1 IP)
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001105 --rfsimulator.serveraddr 192.168.71.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
-        depends_on: [rfsim5g-iab-du]
-        networks:
-            public_net:
-                ipv4_address: 192.168.71.162 # 新 IP
+            USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
 
 networks:
     public_net:

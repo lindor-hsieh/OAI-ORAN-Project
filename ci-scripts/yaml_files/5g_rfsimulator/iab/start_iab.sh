@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# IAB 5G 網路啟動腳本 - 1-2-1 Triangle Topology
+# IAB 5G 網路啟動腳本 - 1-2-3 Triangle Topology
 # 架構: Donor -> IAB Node 1 & IAB Node 2 -> End UE*3
 
 COMPOSE_FILE="docker-compose-iab.yaml"

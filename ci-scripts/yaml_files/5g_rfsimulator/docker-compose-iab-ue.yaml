@@ -2,9 +2,7 @@ version: '3.8'
 
 services:
     # ==========================================
-    # Group A: Attached to IAB Node 3 (Left Leaf)
-    # Target IP: 192.168.71.154
-    # Target Port: 4046
+    # Group A: 連接 Node 3 (Port 4046)
     # ==========================================
     rfsim5g-end-ue-1:
         build: { context: ., dockerfile: Dockerfile.ue }
@@ -16,8 +14,8 @@ services:
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # IMSI: ...1111
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001111 --rfsimulator.serveraddr 192.168.71.154 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+            # 這裡改成 PC 1 實體 IP，Port 改為 4046
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001111 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-end-ue-2:
         build: { context: ., dockerfile: Dockerfile.ue }
@@ -29,13 +27,11 @@ services:
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # IMSI: ...1112
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001112 --rfsimulator.serveraddr 192.168.71.154 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+            # 這裡改成 PC 1 實體 IP，Port 改為 4046
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001112 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
 
     # ==========================================
-    # Group B: Attached to IAB Node 4 (Middle)
-    # Target IP: 192.168.71.156
-    # Target Port: 4047
+    # Group B: 連接 Node 4 (Port 4047)
     # ==========================================
     rfsim5g-end-ue-3:
         build: { context: ., dockerfile: Dockerfile.ue }
@@ -47,8 +43,8 @@ services:
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # IMSI: ...1113
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001113 --rfsimulator.serveraddr 192.168.71.156 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+            # Port 改為 4047
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001113 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-end-ue-4:
         build: { context: ., dockerfile: Dockerfile.ue }
@@ -60,13 +56,11 @@ services:
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # IMSI: ...1114
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001114 --rfsimulator.serveraddr 192.168.71.156 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+            # Port 改為 4047
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001114 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
 
     # ==========================================
-    # Group C: Attached to IAB Node 5 (Right Leaf)
-    # Target IP: 192.168.71.158
-    # Target Port: 4048
+    # Group C: 連接 Node 5 (Port 4048)
     # ==========================================
     rfsim5g-end-ue-5:
         build: { context: ., dockerfile: Dockerfile.ue }
@@ -78,8 +72,8 @@ services:
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # IMSI: ...1115
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001115 --rfsimulator.serveraddr 192.168.71.158 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+            # Port 改為 4048
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001115 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-end-ue-6:
         build: { context: ., dockerfile: Dockerfile.ue }
@@ -91,8 +85,8 @@ services:
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # IMSI: ...1116
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001116 --rfsimulator.serveraddr 192.168.71.158 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+            # Port 改為 4048
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001116 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
 
 networks:
     default:

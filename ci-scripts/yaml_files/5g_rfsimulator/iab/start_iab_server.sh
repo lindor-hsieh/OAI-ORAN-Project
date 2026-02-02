@@ -1,21 +1,16 @@
 #!/bin/bash
-# ==========================================
-# PC 1: IAB Server - Fixed Timing & ARP Version
+# PC 1: IAB Server
 # Updates: 
 #   1. Auto-fix UPF Forwarding (iptables)
 #   2. Auto-fix Routing (via tunnel)
-#   3. Auto-fix RFSim Config (server mode)
-# ==========================================
 
 COMPOSE_FILE="docker-compose-iab-server.yaml"
-IFACE_NAME="enp6s0" # [請確認您的網卡名稱]
+IFACE_NAME="enp6s0" # PC 1 的網卡名稱
 
 # 自動判斷 docker compose
 if command -v docker-compose &> /dev/null; then DOCKER_COMPOSE="docker-compose"; else DOCKER_COMPOSE="docker compose"; fi
 
-# ---------------------------------------------------------
-# [核心修正] 設定路由 (含 via 解決 ARP 問題)
-# ---------------------------------------------------------
+# 設定路由
 setup_nat_immediate() {
     NODE_NAME=$1
     echo "   -> [Fix] Configuring Route for $NODE_NAME..."
@@ -24,17 +19,15 @@ setup_nat_immediate() {
     docker exec -u 0 $NODE_NAME sysctl -w net.ipv4.ip_forward=1 >/dev/null
     
     # 2. 設定路由 (加上 via 12.1.1.1 騙過 ARP)
-    #    這告訴 Node: 去 CU (.140) 和 外網 (.72.0) 都要丟進隧道，下一跳隨便指個 IP (12.1.1.1 是 UPF)
+    # 告訴 Node: 去 CU (.140) 和 外網 (.72.0) 都要丟進隧道,下一跳隨便指個 IP
     docker exec -u 0 $NODE_NAME ip route replace 192.168.71.140 via 12.1.1.1 dev oaitun_ue1 2>/dev/null || true
     docker exec -u 0 $NODE_NAME ip route replace 192.168.72.0/24 via 12.1.1.1 dev oaitun_ue1 2>/dev/null || true
     
-    # 3. NAT (MT 端也做一次 NAT，確保封包乾淨)
+    # 3. NAT 設定
     docker exec -u 0 $NODE_NAME iptables -t nat -A POSTROUTING -o oaitun_ue1 -j MASQUERADE 2>/dev/null || true
 }
 
-# ---------------------------------------------------------
-# [等待函數] 拿到 IP 後立刻設路由 (修復時序問題)
-# ---------------------------------------------------------
+# 拿到 IP 後立刻設路由 
 wait_for_ip() {
     CONTAINER=$1
     VAR_NAME=$2
@@ -46,25 +39,15 @@ wait_for_ip() {
         sleep 2
         IP=$(docker exec $CONTAINER ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
         COUNT=$((COUNT+1))
-        if [ $COUNT -ge 40 ]; then echo "❌ Timeout!"; exit 1; fi
+        if [ $COUNT -ge 40 ]; then echo " Timeout!"; exit 1; fi
         echo -n "."
     done
-    echo " ✅ IP: $IP"
+    echo "  IP: $IP"
     eval "$VAR_NAME='$IP'"
     
-    # [關鍵修正] 在啟動 DU 之前，先確保 MT 知道怎麼走 5G 隧道
+    # 在啟動 DU 之前，先確保 MT 知道怎麼走 5G 隧道
     setup_nat_immediate $CONTAINER
 }
-
-# ---------------------------------------------------------
-# [主流程]
-# ---------------------------------------------------------
-
-# 0. 自動修正設定檔 (避免 Connection Refused)
-echo "[0/6] Fixing Config Files..."
-# 確保所有 DU 設定檔都設為 serveraddr = "server"
-sed -i 's/serveraddr *= *".*";/serveraddr = "server";/' ./conf/iab_du*.conf
-echo "   -> All iab_du configs set to server mode."
 
 # 1. 清理與網路設定
 echo "[1/6] Preparing Network..."
@@ -77,7 +60,7 @@ sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
 $DOCKER_COMPOSE -f $COMPOSE_FILE down
 sudo ip route flush 12.1.1.0/24 2>/dev/null
 
-# [SCTP 修正] 這是連線成功的關鍵
+# SCTP 修正
 sudo ethtool -K rfsim5g-oai-public-net tx off rx off 2>/dev/null || true
 
 # 2. 啟動 Core & Donor
@@ -92,7 +75,7 @@ echo "   -> Configuring CU & UPF Routing..."
 docker exec -u 0 rfsim5g-donor-cu ip route replace 12.1.1.0/24 via 192.168.71.134 dev eth0 2>/dev/null || true
 docker exec -u 0 rfsim5g-oai-ext-dn ip route replace 12.1.1.0/24 via 192.168.72.134 dev eth0 2>/dev/null || true
 
-# [關鍵新增] 強制開啟 UPF 轉發權限 (解決封包被丟棄問題)
+# 強制開啟 UPF 轉發權限 (解決封包被丟棄問題)
 echo "   -> [Fix] Applying UPF Forwarding Rules (The Magic Command)..."
 docker exec -u 0 rfsim5g-oai-upf bash -c "iptables -P FORWARD ACCEPT && iptables -F FORWARD && iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
 
@@ -121,7 +104,6 @@ sleep 25
 echo "[5/6] Starting Layer 2 Nodes..."
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-3 rfsim5g-iab-mt-4 rfsim5g-iab-mt-5
 
-# 這裡不使用 retry，使用標準等待並設路由
 wait_for_ip "rfsim5g-iab-mt-3" MT3_IP
 wait_for_ip "rfsim5g-iab-mt-4" MT4_IP
 wait_for_ip "rfsim5g-iab-mt-5" MT5_IP
@@ -134,7 +116,7 @@ sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT5_IP\";/" ./conf/ia
 
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du-3 rfsim5g-iab-du-4 rfsim5g-iab-du-5
 
-# 6. 最後修補 (再次確保 UPF 規則存在)
+# 6. 再次確保 UPF 規則存在
 echo "[6/6] Finalizing..."
 docker exec -u 0 rfsim5g-oai-upf iptables -t nat -A POSTROUTING -s 12.1.1.0/24 -o eth0 -j MASQUERADE 2>/dev/null || true
 docker exec -d rfsim5g-oai-ext-dn iperf3 -s

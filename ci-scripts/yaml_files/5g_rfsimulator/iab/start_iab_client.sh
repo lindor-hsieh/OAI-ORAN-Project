@@ -44,10 +44,10 @@ fi
 # 2. 測試連線
 echo "   -> Pinging Server Physical IP ($SERVER_IP)..."
 if ! ping -c 1 -W 1 $SERVER_IP &> /dev/null; then
-    echo -e "${RED}❌ Cannot reach PC 1 ($SERVER_IP)! Check cable or firewall.${NC}"
+    echo -e "${RED} Cannot reach PC 1 ($SERVER_IP)! Check cable or firewall.${NC}"
     exit 1
 fi
-echo -e "${GREEN}✅ Physical Connection OK.${NC}"
+echo -e "${GREEN} Physical Connection OK.${NC}"
 
 # ==========================================
 # 1. 啟動 UE
@@ -79,7 +79,7 @@ wait_for_ue_and_install() {
              docker restart $UE_NAME > /dev/null
         fi
 
-        if [ $COUNT -ge 45 ]; then echo -e "${RED}❌ Timeout${NC}"; return 1; fi
+        if [ $COUNT -ge 45 ]; then echo -e "${RED} Timeout${NC}"; return 1; fi
         echo -n "."
     done
     echo -e "${GREEN} Attached! (IP: $IP)${NC}"
@@ -142,12 +142,12 @@ run_advanced_test() {
     echo -e "${CYAN}--- [Throughput Analysis] ---${NC}"
     
     # 下行 (Downlink)
-    echo -n "   ⬇️  Downlink (Server->UE): "
+    echo -n "  Downlink (Server->UE): "
     DL_SPEED=$(docker exec $UE iperf3 -c $IP_EXT_DN -I oaitun_ue1 -R -t 3 -f m --connect-timeout 2000 2>/dev/null | grep "receiver" | awk '{print $(NF-2)}')
     if [ -z "$DL_SPEED" ]; then echo "FAIL"; else echo "${DL_SPEED} Mbps"; fi
 
     # 上行 (Uplink)
-    echo -n "   ⬆️  Uplink   (UE->Server): "
+    echo -n "  Uplink   (UE->Server): "
     UL_SPEED=$(docker exec $UE iperf3 -c $IP_EXT_DN -I oaitun_ue1 -t 3 -f m --connect-timeout 2000 2>/dev/null | grep "receiver" | awk '{print $(NF-2)}')
     if [ -z "$UL_SPEED" ]; then echo "FAIL"; else echo "${UL_SPEED} Mbps"; fi
 }

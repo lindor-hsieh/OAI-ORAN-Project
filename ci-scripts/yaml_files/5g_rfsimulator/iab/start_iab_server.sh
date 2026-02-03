@@ -5,7 +5,7 @@
 #   2. Auto-fix Routing (via tunnel)
 
 COMPOSE_FILE="docker-compose-iab-server.yaml"
-IFACE_NAME="enp6s0" # PC 1 的網卡名稱
+IFACE_NAME="enxc84d44350030" # PC 1 的網卡名稱
 
 # 自動判斷 docker compose
 if command -v docker-compose &> /dev/null; then DOCKER_COMPOSE="docker-compose"; else DOCKER_COMPOSE="docker compose"; fi

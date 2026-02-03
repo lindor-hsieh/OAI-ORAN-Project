@@ -9,7 +9,7 @@
 # ==========================================
 
 COMPOSE_FILE="docker-compose-iab-ue.yaml"
-IFACE_NAME="eno1"        # [請確認] 您 PC 2 連接 PC 1 的實體網卡名稱
+IFACE_NAME="enxc84d44350008"        # [請確認] 您 PC 2 連接 PC 1 的實體網卡名稱
 CLIENT_IP="192.168.88.2" # PC 2 自己的 IP
 SERVER_IP="192.168.88.1" # PC 1 的 IP
 

@@ -97,28 +97,26 @@ sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT2_IP\";/" ./conf/ia
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du-2
 
 echo "Layer 1 IPs: Node1=$MT1_IP, Node2=$MT2_IP"
-echo "Waiting 25s for Layer 1 to stabilize..."
-sleep 25
 
-# 5. 啟動 Node 3, 4, 5
-echo "[5/6] Starting Layer 2 Nodes..."
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-3 rfsim5g-iab-mt-4 rfsim5g-iab-mt-5
+# # 5. 啟動 Node 3, 4, 5
+# echo "[5/6] Starting Layer 2 Nodes..."
+# $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-3 rfsim5g-iab-mt-4 rfsim5g-iab-mt-5
 
-wait_for_ip "rfsim5g-iab-mt-3" MT3_IP
-wait_for_ip "rfsim5g-iab-mt-4" MT4_IP
-wait_for_ip "rfsim5g-iab-mt-5" MT5_IP
+# wait_for_ip "rfsim5g-iab-mt-3" MT3_IP
+# wait_for_ip "rfsim5g-iab-mt-4" MT4_IP
+# wait_for_ip "rfsim5g-iab-mt-5" MT5_IP
 
-echo "Layer 2 IPs: Node3=$MT3_IP, Node4=$MT4_IP, Node5=$MT5_IP"
+# echo "Layer 2 IPs: Node3=$MT3_IP, Node4=$MT4_IP, Node5=$MT5_IP"
 
-sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT3_IP\";/" ./conf/iab_du_3.conf
-sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT4_IP\";/" ./conf/iab_du_4.conf
-sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT5_IP\";/" ./conf/iab_du_5.conf
+# sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT3_IP\";/" ./conf/iab_du_3.conf
+# sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT4_IP\";/" ./conf/iab_du_4.conf
+# sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT5_IP\";/" ./conf/iab_du_5.conf
 
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du-3 rfsim5g-iab-du-4 rfsim5g-iab-du-5
+# $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du-3 rfsim5g-iab-du-4 rfsim5g-iab-du-5
 
 # 6. 再次確保 UPF 規則存在
 echo "[6/6] Finalizing..."
 docker exec -u 0 rfsim5g-oai-upf iptables -t nat -A POSTROUTING -s 12.1.1.0/24 -o eth0 -j MASQUERADE 2>/dev/null || true
 docker exec -d rfsim5g-oai-ext-dn iperf3 -s
 
-echo "Done! Check rfsim5g-iab-du logs for 'Cell is in service'."
+echo "[5/5] Server setup complete!"

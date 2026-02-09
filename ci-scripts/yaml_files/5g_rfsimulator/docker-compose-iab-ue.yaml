@@ -2,98 +2,178 @@ version: '3.8'
 
 services:
     # ==========================================
+    # IAB Node 3 (Left Leaf)
+    # Parent: Node 1 on PC 1 (Port 4044)
+    # Serving: UE 1, 2 (Port 4046)
+    # ==========================================
+    rfsim5g-iab-mt-3:
+        build: { context: ., dockerfile: Dockerfile.ue }
+        container_name: rfsim5g-iab-mt-3
+        privileged: true
+        network_mode: host
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+        environment:
+            # 連接 PC 1 (192.168.88.1) 的 Node 1 (Port 4044)
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001102 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+
+    rfsim5g-iab-du-3:
+        image: oaisoftwarealliance/oai-gnb:develop
+        container_name: rfsim5g-iab-du-3
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-3]
+        network_mode: host
+        volumes:
+            - ./conf/iab_du_3.conf:/opt/oai-gnb/etc/gnb.conf
+        environment:
+            # 服務本機 UE，監聽 Port 4046
+            USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+
+    # ==========================================
+    # IAB Node 4 (Middle)
+    # Parent: Node 1 on PC 1 (Port 4044)
+    # Serving: UE 3, 4 (Port 4047)
+    # ==========================================
+    rfsim5g-iab-mt-4:
+        build: { context: ., dockerfile: Dockerfile.ue }
+        container_name: rfsim5g-iab-mt-4
+        privileged: true
+        network_mode: host
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+        environment:
+            # 連接 PC 1 (192.168.88.1) 的 Node 1 (Port 4044)
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001103 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+
+    rfsim5g-iab-du-4:
+        image: oaisoftwarealliance/oai-gnb:develop
+        container_name: rfsim5g-iab-du-4
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-4]
+        network_mode: host
+        volumes:
+            - ./conf/iab_du_4.conf:/opt/oai-gnb/etc/gnb.conf
+        environment:
+            # 服務本機 UE，監聽 Port 4047
+            USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+
+    # ==========================================
+    # IAB Node 5 (Right Leaf)
+    # Parent: Node 2 on PC 1 (Port 4045)
+    # Serving: UE 5, 6 (Port 4048)
+    # ==========================================
+    rfsim5g-iab-mt-5:
+        build: { context: ., dockerfile: Dockerfile.ue }
+        container_name: rfsim5g-iab-mt-5
+        privileged: true
+        network_mode: host
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+        environment:
+            # 連接 PC 1 (192.168.88.1) 的 Node 2 (Port 4045)
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001104 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
+
+    rfsim5g-iab-du-5:
+        image: oaisoftwarealliance/oai-gnb:develop
+        container_name: rfsim5g-iab-du-5
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-5]
+        network_mode: host
+        volumes:
+            - ./conf/iab_du_5.conf:/opt/oai-gnb/etc/gnb.conf
+        environment:
+            # 服務本機 UE，監聽 Port 4048
+            USE_ADDITIONAL_OPTIONS: --rfsim --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+
+    # ==========================================
     # Group A: 連接 Node 3 (Port 4046)
     # ==========================================
     rfsim5g-end-ue-1:
-        # build: { context: ., dockerfile: Dockerfile.ue }
         image: oaisoftwarealliance/oai-nr-ue:develop
         container_name: rfsim5g-end-ue-1
         privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
+        network_mode: host
         volumes:
             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # 這裡改成 PC 1 實體 IP，Port 改為 4046
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001111 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+            # [修正] 連接本機 (127.0.0.1) 的 Node 3
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001111 --rfsimulator.serveraddr 127.0.0.1 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-end-ue-2:
-        # build: { context: ., dockerfile: Dockerfile.ue }
         image: oaisoftwarealliance/oai-nr-ue:develop
         container_name: rfsim5g-end-ue-2
         privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
+        network_mode: host
         volumes:
             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # 這裡改成 PC 1 實體 IP，Port 改為 4046
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001112 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+            # [修正] 連接本機 (127.0.0.1) 的 Node 3
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001112 --rfsimulator.serveraddr 127.0.0.1 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
 
     # ==========================================
     # Group B: 連接 Node 4 (Port 4047)
     # ==========================================
     rfsim5g-end-ue-3:
-        # build: { context: ., dockerfile: Dockerfile.ue }
         image: oaisoftwarealliance/oai-nr-ue:develop
         container_name: rfsim5g-end-ue-3
         privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
+        network_mode: host
         volumes:
             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # Port 改為 4047
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001113 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+            # [修正] 連接本機 (127.0.0.1) 的 Node 4
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001113 --rfsimulator.serveraddr 127.0.0.1 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-end-ue-4:
-        # build: { context: ., dockerfile: Dockerfile.ue }
         image: oaisoftwarealliance/oai-nr-ue:develop
         container_name: rfsim5g-end-ue-4
         privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
+        network_mode: host
         volumes:
             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # Port 改為 4047
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001114 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+            # [修正] 連接本機 (127.0.0.1) 的 Node 4
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001114 --rfsimulator.serveraddr 127.0.0.1 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
 
     # ==========================================
     # Group C: 連接 Node 5 (Port 4048)
     # ==========================================
     rfsim5g-end-ue-5:
-        # build: { context: ., dockerfile: Dockerfile.ue }
         image: oaisoftwarealliance/oai-nr-ue:develop
         container_name: rfsim5g-end-ue-5
         privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
+        network_mode: host
         volumes:
             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # Port 改為 4048
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001115 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+            # [修正] 連接本機 (127.0.0.1) 的 Node 5
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001115 --rfsimulator.serveraddr 127.0.0.1 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-end-ue-6:
-        # build: { context: ., dockerfile: Dockerfile.ue }
         image: oaisoftwarealliance/oai-nr-ue:develop
         container_name: rfsim5g-end-ue-6
         privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
+        network_mode: host
         volumes:
             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
-            # Port 改為 4048
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001116 --rfsimulator.serveraddr 192.168.88.1 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
-
-networks:
-    default:
-        driver: bridge
+            # [修正] 連接本機 (127.0.0.1) 的 Node 5
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001116 --rfsimulator.serveraddr 127.0.0.1 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time

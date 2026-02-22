@@ -137,16 +137,10 @@ services:
         environment:
             USE_ADDITIONAL_OPTIONS: --log_config.global_log_options level,nocolor,time
         depends_on: [oai-flexric, oai-upf]
-        networks:
-            public_net:
-                ipv4_address: 192.168.71.140
+        network_mode: "host"
         volumes:
             - ./conf/donor_cu.conf:/opt/oai-gnb/etc/gnb.conf
             - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
-        ports:
-            # 暴露 F1 (SCTP) 讓 PC2 的 DU 連線
-            - "38472:38472/sctp" 
-            - "38472:38472/udp"
 
     rfsim5g-donor-du:
         image: oaisoftwarealliance/oai-gnb:develop
@@ -212,7 +206,7 @@ services:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
         environment:
             # 連接 Donor (.144)
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516  --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
         ports:
             - "4045:4045/udp" # Node 2 Port
             - "4045:4045/tcp"

@@ -1,122 +1,104 @@
 #!/bin/bash
-# PC 1: IAB Server
-# Updates: 
-#   1. Auto-fix UPF Forwarding (iptables)
-#   2. Auto-fix Routing (via tunnel)
+# PC 1: IAB Server Script (5G Core, Donor, Node 1, Node 2, iperf3 Server)
 
-COMPOSE_FILE="docker-compose-iab-server.yaml"
-IFACE_NAME="enxc84d44350030" # PC 1 的網卡名稱
+COMPOSE_FILE="docker-compose-iab-server.yaml" 
+IFACE_NAME="enxc84d44350030" 
 
-# 自動判斷 docker compose
+# PC 2 
+PC2_PHYSICAL_IP="192.168.88.2"
+PC2_DOCKER_SUBNET="192.168.74.0/24" 
+
+# 核心網 IP 與網段
+UPF_IP="192.168.71.134"
+UE_TUNNEL_SUBNET="12.1.1.0/24" # End-UE 與 MT 的隧道網段
+
 if command -v docker-compose &> /dev/null; then DOCKER_COMPOSE="docker-compose"; else DOCKER_COMPOSE="docker compose"; fi
 
-# 設定路由
-setup_nat_immediate() {
-    NODE_NAME=$1
-    echo "   -> [Fix] Configuring Route for $NODE_NAME..."
-    
-    # 1. 啟用轉發
-    docker exec -u 0 $NODE_NAME sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    
-    # 2. 設定路由 (加上 via 12.1.1.1 騙過 ARP)
-    # 告訴 Node: 去 CU (.140) 和 外網 (.72.0) 都要丟進隧道,下一跳隨便指個 IP
-    docker exec -u 0 $NODE_NAME ip route replace 192.168.71.140 via 12.1.1.1 dev oaitun_ue1 2>/dev/null || true
-    docker exec -u 0 $NODE_NAME ip route replace 192.168.72.0/24 via 12.1.1.1 dev oaitun_ue1 2>/dev/null || true
-    
-    # 3. NAT 設定
-    docker exec -u 0 $NODE_NAME iptables -t nat -A POSTROUTING -o oaitun_ue1 -j MASQUERADE 2>/dev/null || true
-}
+GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
-# 拿到 IP 後立刻設路由 
-wait_for_ip() {
-    CONTAINER=$1
-    VAR_NAME=$2
-    echo -n "Waiting IP for $CONTAINER... "
-    local IP=""
-    local COUNT=0
-    
-    while [ -z "$IP" ]; do
-        sleep 2
-        IP=$(docker exec $CONTAINER ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-        COUNT=$((COUNT+1))
-        if [ $COUNT -ge 40 ]; then echo " Timeout!"; exit 1; fi
-        echo -n "."
-    done
-    echo "  IP: $IP"
-    eval "$VAR_NAME='$IP'"
-    
-    # 在啟動 DU 之前，先確保 MT 知道怎麼走 5G 隧道
-    setup_nat_immediate $CONTAINER
-}
+echo -e "${CYAN}[0/6] Loading Kernel Modules...${NC}"
+sudo modprobe sctp
+sudo modprobe nf_conntrack_sctp 2>/dev/null || sudo modprobe nf_conntrack_proto_sctp 2>/dev/null
 
-# 1. 清理與網路設定
-echo "[1/6] Preparing Network..."
-# 確保 Host IP 存在
-if ! ip addr show $IFACE_NAME | grep -q "192.168.88.1"; then
-    sudo ip addr add 192.168.88.1/24 dev $IFACE_NAME 2>/dev/null
-    sudo ip link set $IFACE_NAME up
-fi
+echo -e "${CYAN}[1/6] Configuring Host Network...${NC}"
+# 穩定 USB 網卡傳輸
+sudo ethtool -K $IFACE_NAME tx off rx off 2>/dev/null
+sudo nmcli dev set $IFACE_NAME managed no 2>/dev/null || true
+
+# 固定 IP 設定
+sudo ip link set $IFACE_NAME up
+sleep 1
+sudo ip addr flush dev $IFACE_NAME 2>/dev/null || true
+sudo ip addr add 192.168.88.1/24 dev $IFACE_NAME 2>/dev/null || true
+
+# 強迫流量走 5G 核心網與無線隧道，而非乙太網捷徑
+sudo ip route del $PC2_DOCKER_SUBNET 2>/dev/null || true
+
 sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
+sudo iptables -P FORWARD ACCEPT
+sudo iptables -I DOCKER-USER -j ACCEPT
+sudo iptables -I INPUT -p sctp -j ACCEPT
+
 $DOCKER_COMPOSE -f $COMPOSE_FILE down
-sudo ip route flush 12.1.1.0/24 2>/dev/null
 
-# SCTP 修正
-sudo ethtool -K rfsim5g-oai-public-net tx off rx off 2>/dev/null || true
-
-# 2. 啟動 Core & Donor
-echo "[2/6] Starting Core & Donor..."
+# 2. 啟動服務與核心
+echo -e "${CYAN}[2/6] Starting Core & Donor...${NC}"
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d mysql oai-amf oai-smf oai-upf oai-ext-dn rfsim5g-donor-cu rfsim5g-donor-du oai-flexric
 
-echo "Waiting 30s for Core..."
-sleep 30
+echo -e "${YELLOW}Waiting 25s for stabilization...${NC}"
+sleep 25
 
-# 設定 Donor CU 回程路由 (指向 UPF)
-echo "   -> Configuring CU & UPF Routing..."
-docker exec -u 0 rfsim5g-donor-cu ip route replace 12.1.1.0/24 via 192.168.71.134 dev eth0 2>/dev/null || true
-docker exec -u 0 rfsim5g-oai-ext-dn ip route replace 12.1.1.0/24 via 192.168.72.134 dev eth0 2>/dev/null || true
+# 為 CU 安裝工具並設定 5G 隧道出口
+docker exec -u 0 rfsim5g-donor-cu apt-get update >/dev/null 2>&1
+docker exec -u 0 rfsim5g-donor-cu apt-get install -y iptables >/dev/null 2>&1
+docker exec -u 0 rfsim5g-donor-cu ip route replace $UE_TUNNEL_SUBNET via $UPF_IP dev eth0 2>/dev/null || true
 
-# 強制開啟 UPF 轉發權限 (解決封包被丟棄問題)
-echo "   -> [Fix] Applying UPF Forwarding Rules (The Magic Command)..."
-docker exec -u 0 rfsim5g-oai-upf bash -c "iptables -P FORWARD ACCEPT && iptables -F FORWARD && iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+# 3. 啟動 Ext-DN 伺服器測速模式
+echo -e "${CYAN}[3/6] Initializing DN Benchmark Server Mode...${NC}"
+# 關鍵：告訴 Ext-DN 回應封包要送回 UPF (72.134)
+docker exec -u 0 rfsim5g-oai-ext-dn ip route replace $UE_TUNNEL_SUBNET via 192.168.72.134 dev eth0 2>/dev/null || true
 
-# 3. 啟動 Node 1
-echo "[3/6] Starting Node 1..."
+# 清理舊進程並啟動伺服器
+docker exec -u 0 rfsim5g-oai-ext-dn pkill iperf3 2>/dev/null || true
+docker exec -d rfsim5g-oai-ext-dn iperf3 -s
+echo -e "${GREEN}   -> iperf3 server ready on Ext-DN (192.168.72.135)${NC}"
+
+# 4. 啟動 Node 1 (Local)
+echo -e "${CYAN}[4/6] Starting Node 1...${NC}"
+
+wait_for_ip() {
+    local CONTAINER=$1; local VAR_NAME=$2; local IP=""
+    echo -n "Waiting for $CONTAINER..."
+    while [ -z "$IP" ]; do
+        sleep 2; echo -n "."
+        IP=$(docker exec $CONTAINER ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+    done
+    echo " IP: $IP"
+    eval "$VAR_NAME='$IP'"
+    docker exec -u 0 $CONTAINER sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    docker exec -u 0 $CONTAINER iptables -t nat -A POSTROUTING -o oaitun_ue1 -j MASQUERADE
+}
+
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt
 wait_for_ip "rfsim5g-iab-mt" MT1_IP
-
-# 更新設定並啟動 DU (此時路由已在 wait_for_ip 中設好)
 sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT1_IP\";/" ./conf/iab_du.conf
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du
 
-# 4. 啟動 Node 2
-echo "[4/6] Starting Node 2..."
+# 5. 啟動 Node 2 (Local)
+echo -e "${CYAN}[5/6] Starting Node 2...${NC}"
 sleep 5
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-2
 wait_for_ip "rfsim5g-iab-mt-2" MT2_IP
 sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT2_IP\";/" ./conf/iab_du_2.conf
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du-2
 
-echo "Layer 1 IPs: Node1=$MT1_IP, Node2=$MT2_IP"
+# 6. 最終檢查
+echo -e "${CYAN}[6/6] Finalizing Routing...${NC}"
+# 確保 UPF 開啟 NAT 轉發
+docker exec -u 0 rfsim5g-oai-upf bash -c "sysctl -w net.ipv4.ip_forward=1 && iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+# 確保宿主機可以找得到 UE 隧道網段
+sudo ip route replace $UE_TUNNEL_SUBNET via $UPF_IP 2>/dev/null || true
 
-# # 5. 啟動 Node 3, 4, 5
-# echo "[5/6] Starting Layer 2 Nodes..."
-# $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-3 rfsim5g-iab-mt-4 rfsim5g-iab-mt-5
-
-# wait_for_ip "rfsim5g-iab-mt-3" MT3_IP
-# wait_for_ip "rfsim5g-iab-mt-4" MT4_IP
-# wait_for_ip "rfsim5g-iab-mt-5" MT5_IP
-
-# echo "Layer 2 IPs: Node3=$MT3_IP, Node4=$MT4_IP, Node5=$MT5_IP"
-
-# sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT3_IP\";/" ./conf/iab_du_3.conf
-# sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT4_IP\";/" ./conf/iab_du_4.conf
-# sed -i "s/local_n_address *= *\".*\";/local_n_address = \"$MT5_IP\";/" ./conf/iab_du_5.conf
-
-# $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du-3 rfsim5g-iab-du-4 rfsim5g-iab-du-5
-
-# 6. 再次確保 UPF 規則存在
-echo "[6/6] Finalizing..."
-docker exec -u 0 rfsim5g-oai-upf iptables -t nat -A POSTROUTING -s 12.1.1.0/24 -o eth0 -j MASQUERADE 2>/dev/null || true
-docker exec -d rfsim5g-oai-ext-dn iperf3 -s
-
-echo "[5/5] Server setup complete!"
+echo -e "${GREEN}Server Setup Complete !${NC}"
+echo -e "Layer 1 IPs: Node1=$MT1_IP, Node2=$MT2_IP"
+echo -e "Benchmark Target: ${YELLOW}192.168.72.135${NC}"

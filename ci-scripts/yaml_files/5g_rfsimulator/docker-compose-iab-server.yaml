@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
     # 0. O-RAN Near-RT RIC & xApps
+    # 0. O-RAN Near-RT RIC & xApps
     oai-flexric:
         image: oaisoftwarealliance/oai-flexric:develop
         privileged: true
@@ -10,6 +11,9 @@ services:
         networks:
             public_net:
                 ipv4_address: 192.168.71.141
+        ports:
+            - "36421:36421/sctp"
+            - "36422:36422/sctp"
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
         healthcheck:

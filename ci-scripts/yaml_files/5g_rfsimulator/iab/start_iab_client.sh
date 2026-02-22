@@ -73,7 +73,7 @@ configure_and_start_du() {
 
     # 確保指向 PC 1 (192.168.88.x) 的 E2/F1 控制面流量走實體網線，不要進 5G 隧道
     # 確保 Node 3, 4, 5 能穩定連上 FlexRIC 
-    docker exec -u 0 $DU_NAME ip route add 192.168.88.0/24 via 192.168.74.1 2>/dev/null
+    # docker exec -u 0 $DU_NAME ip route add 192.168.88.0/24 via 192.168.74.1 2>/dev/null
     echo -e "${YELLOW} Waiting 10s for CU F1AP stability...${NC}"
     sleep 10
 }

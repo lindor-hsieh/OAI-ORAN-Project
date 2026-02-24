@@ -7,7 +7,7 @@
  * except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.openairinterface.org/?page_id=698
+ *      http://www.openairinterface.org/?page_id=698
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,7 +16,7 @@
  * limitations under the License.
  *-------------------------------------------------------------------------------
  * For more information about the OpenAirInterface (OAI) Software Alliance:
- * contact@openairinterface.org
+ *      contact@openairinterface.org
  */
 
 /*! \file mac.h
@@ -47,15 +47,28 @@
 #include "common/utils/ds/byte_array.h"
 #include "openair2/LAYER2/nr_rlc/nr_rlc_configuration.h"
 
-#define NR_SCHED_LOCK(lock)                                                    \
-  do {                                                                         \
-    int rc = pthread_mutex_lock(lock);                                         \
+// ====================================================================
+// [OAI-E2-AGENT] Global Variables for Local xApp Control
+// 這些變數由 ran_func_mac.c 定義與寫入，由 gNB_scheduler_dlsch.c 讀取與執行
+// ====================================================================
+extern uint16_t target_rnti_1;
+extern float target_ue1_prb_ratio;
+extern uint16_t target_ue1_slot_mask; // [時域控制] UE1 的 Slot 遮罩
+
+extern uint16_t target_rnti_2;
+extern float target_ue2_prb_ratio;
+extern uint16_t target_ue2_slot_mask; // [時域控制] UE2 的 Slot 遮罩
+// ====================================================================
+
+#define NR_SCHED_LOCK(lock)                                        \
+  do {                                                             \
+    int rc = pthread_mutex_lock(lock);                             \
     AssertFatal(rc == 0, "error while locking scheduler mutex, pthread_mutex_lock() returned %d\n", rc); \
   } while (0)
 
-#define NR_SCHED_UNLOCK(lock)                                                  \
-  do {                                                                         \
-    int rc = pthread_mutex_unlock(lock);                                       \
+#define NR_SCHED_UNLOCK(lock)                                      \
+  do {                                                             \
+    int rc = pthread_mutex_unlock(lock);                           \
     AssertFatal(rc == 0, "error while locking scheduler mutex, pthread_mutex_unlock() returned %d\n", rc); \
   } while (0)
 
@@ -369,7 +382,7 @@ typedef struct SPCSIReportingpucch {
   bool s0tos3_actDeact[4];
 } SPCSIReportingpucch_t;
 
-#define MAX_APERIODIC_TRIGGER_STATES 128 //38.331                                
+#define MAX_APERIODIC_TRIGGER_STATES 128 //38.331                               
 typedef struct aperiodicCSI_triggerStateSelection {
   bool is_scheduled;
   uint8_t servingCellId;
@@ -378,7 +391,7 @@ typedef struct aperiodicCSI_triggerStateSelection {
   bool triggerStateSelection[MAX_APERIODIC_TRIGGER_STATES];
 } aperiodicCSI_triggerStateSelection_t;
 
-#define MAX_TCI_STATES 128 //38.331                                            
+#define MAX_TCI_STATES 128 //38.331                                             
 typedef struct pdschTciStatesActDeact {
   bool is_scheduled;
   uint8_t servingCellId;
@@ -833,27 +846,6 @@ typedef struct {
   nfapi_nr_dl_tti_pdcch_pdu_rel15_t *pdcch_pdu_coreset[MAX_NUM_CORESET];
 } post_process_pusch_t;
 
-/* -------------------------------------------------------------------------
- * [NVS/MCS Experiment] 切片控制相關定義
- * ------------------------------------------------------------------------- */
-#ifndef OAI_SLICE_DEFS
-#define OAI_SLICE_DEFS
-
-#define MAX_NR_SLICES 8
-
-// [NVS] 新增：切片演算法枚舉
-typedef enum {
-  STATIC_SLICE = 0,
-  NVS_SLICE = 2,
-  EDF_SLICE = 3,
-} oai_slice_algorithm_e;
-
-// [新增] 為了對接 xApp 的多切片控制，增加這個小結構
-typedef struct {
-  uint32_t id;
-  float percentage;
-} nr_slice_conf_local_t;
-
 /* forward declaration to use in nr_pp_impl_dl */
 struct gNB_MAC_INST_s;
 typedef struct gNB_MAC_INST_s gNB_MAC_INST;
@@ -885,15 +877,6 @@ typedef struct fsn {
   slot_t s;
 } fsn_t;
 
-// [NVS] 新增：切片資訊結構
-typedef struct {
-  oai_slice_algorithm_e algo; 
-  uint32_t n_slices;                          // 目前切片數量
-  nr_slice_conf_local_t slices[MAX_NR_SLICES]; // 儲存多個切片比例
-  float vip_share;                            // 保留原本成員，防止其他檔案噴錯
-} nr_slice_info_t;
-
-#endif
 /*! \brief top level eNB MAC structure */
 typedef struct gNB_MAC_INST_s {
   /// Ethernet parameters for northbound midhaul interface
@@ -905,29 +888,29 @@ typedef struct gNB_MAC_INST_s {
   /// Nvipc parameters for FAPI interface with Aerial
   nvipc_params_t nvipc_params_s;
   /// Module
-  module_id_t                      Mod_id;
+  module_id_t                     Mod_id;
   /// timing advance group
   NR_TAG_t                        *tag;
   /// Pointer to IF module instance for PHY
   NR_IF_Module_t                  *if_inst;
-  pthread_t                        stats_thread;
+  pthread_t                       stats_thread;
   /// Pusch target SNR
-  int                              pusch_target_snrx10;
+  int                             pusch_target_snrx10;
   /// RSSI threshold for power control. Limits power control commands when RSSI reaches threshold.
-  int                              pusch_rssi_threshold;
+  int                             pusch_rssi_threshold;
   /// Pucch target SNR
-  int                              pucch_target_snrx10;
+  int                             pucch_target_snrx10;
   /// RSSI threshold for PUCCH power control. Limits power control commands when RSSI reaches threshold.
-  int                              pucch_rssi_threshold;
+  int                             pucch_rssi_threshold;
   /// SNR threshold needed to put or not a PRB in the black list
-  int                              ul_prbblack_SNR_threshold;
+  int                             ul_prbblack_SNR_threshold;
   /// PUCCH Failure threshold (compared to consecutive PUCCH DTX)
-  int                              pucch_failure_thres;
+  int                             pucch_failure_thres;
   /// PUSCH Failure threshold (compared to consecutive PUSCH DTX)
-  int                              pusch_failure_thres;
+  int                             pusch_failure_thres;
   /// Subcarrier Offset
-  int                              ssb_SubcarrierOffset;
-  int                              ssb_OffsetPointA;
+  int                             ssb_SubcarrierOffset;
+  int                             ssb_OffsetPointA;
 
   /// Common cell resources
   NR_COMMON_channels_t common_channels[NFAPI_CC_MAX];
@@ -1009,10 +992,6 @@ typedef struct gNB_MAC_INST_s {
 
   mac_stats_t mac_stats;
   uint64_t num_scheduled_prach_rx;
-  
-  // [NVS] 新增：切片資訊 (儲存 xApp 傳來的狀態)
-  nr_slice_info_t slice_info;
-
 } gNB_MAC_INST;
 
 #endif /*__LAYER2_NR_MAC_GNB_H__ */

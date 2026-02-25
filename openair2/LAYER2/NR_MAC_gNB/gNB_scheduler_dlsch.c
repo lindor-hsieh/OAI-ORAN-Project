@@ -613,6 +613,14 @@ static void pf_dl(module_id_t module_id,
                   int n_rb_sched[num_beams])
 {
   gNB_MAC_INST *mac = RC.nrmac[module_id];
+  // === 2D Control 全域變數檢查 ===
+    static int debug_cnt = 0;
+    if (debug_cnt++ % 1000 == 0) { // 每 1000 次排程印一次，避免日誌刷太快
+        printf("[DEBUG-GLOBAL] xApp_RNTI: %04x | Ratio: %.2f | Mask: %04x\n", 
+               mac->xapp_2d_ctrl.rnti1, 
+               mac->xapp_2d_ctrl.prb_ratio1, 
+               mac->xapp_2d_ctrl.slot_mask1);
+    }
   NR_ServingCellConfigCommon_t *scc=mac->common_channels[0].ServingCellConfigCommon;
   // UEs that could be scheduled
   UEsched_t UE_sched[MAX_MOBILES_PER_GNB + 1] = {0};
@@ -789,55 +797,67 @@ static void pf_dl(module_id_t module_id,
     while (rbStart + max_rbSize <= rbStop && !(rballoc_mask[rbStart + max_rbSize + bwp_start] & slbitmap))
       max_rbSize++;
 
-    // =======================================================
-    // [OAI-E2-AGENT] xApp 2D Resource Allocation Interception
-    // 讀取全域變數，若有來自 xApp 的指令，則強制覆蓋 max_rbSize 與 Slot
-    // =======================================================
+    // ===========================================================================
+    // [OAI-E2-AGENT] 論文實作：2D 資源控制攔截點 (Interception Point)
+    // ===========================================================================
     
-    // 1. 時域攔截 (Time Domain Interception)
-    // 檢查該 UE 是否被 Slot Mask 禁止在當前 Slot 傳輸
-    uint16_t current_slot_mask = 0xFFFF; // 預設全開
-    if (target_rnti_1 != 0 && rnti == target_rnti_1) {
-        current_slot_mask = target_ue1_slot_mask;
-    } else if (target_rnti_2 != 0 && rnti == target_rnti_2) {
-        current_slot_mask = target_ue2_slot_mask;
+    // 1. 取得 xApp 下發的控制參數 (從 gNB_MAC_INST 結構讀取)
+    uint16_t current_rnti = iterator->UE->rnti;
+    uint16_t target_mask = 0xFFFF; // 預設: 全開 (1111...)
+    float target_ratio = 1.0f;     // 預設: 100% (不限制)
+    bool is_controlled_ue = false;
+
+    // 判斷是否為 xApp 指定的目標 UE
+    if (mac->xapp_2d_ctrl.rnti1 != 0 && current_rnti == mac->xapp_2d_ctrl.rnti1) {
+        target_mask = mac->xapp_2d_ctrl.slot_mask1;
+        target_ratio = mac->xapp_2d_ctrl.prb_ratio1;
+        is_controlled_ue = true;
+    } else if (mac->xapp_2d_ctrl.rnti2 != 0 && current_rnti == mac->xapp_2d_ctrl.rnti2) {
+        target_mask = mac->xapp_2d_ctrl.slot_mask2;
+        target_ratio = mac->xapp_2d_ctrl.prb_ratio2;
+        is_controlled_ue = true;
     }
 
-    // 利用位元運算檢查：如果 mask 對應的 bit 是 0，代表此 slot 被禁言
-    // slot % 16 用來循環對應 16-bit mask
-    if ((current_slot_mask & (1 << (slot % 16))) == 0) {
-        // [強制退讓] xApp 禁止此 UE 在此 Slot 傳輸 -> 跳過排程
-        reset_beam_status(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
-        iterator++;
-        continue; 
-    }
+    if (is_controlled_ue) {
+        // [Debug Log] 證明排程器有讀到參數 (這行非常重要，用來確認 xApp 指令有生效)
+        // LOG_I(NR_MAC, "[SCHEDULER-CHECK] UE %04x | Ratio: %.2f | Mask: %04x | Slot: %d\n", 
+        //       current_rnti, target_ratio, target_mask, slot);
 
-    // 2. 頻域攔截 (Frequency Domain Interception)
-    // 根據 PRB Quota 限制最大可用頻寬
-    int total_bwp_prbs = sched_pdsch->bwp_info.bwpSize;
-    uint16_t xapp_prb_limit = max_rbSize; // 預設為物理極限
+        // -------------------------------------------------------------
+        // A. 時域控制 (Time Domain): Slot Masking
+        // -------------------------------------------------------------
+        // 原理: 檢查 Mask 的第 (slot % 16) 個位元。如果是 0，代表此 Slot 禁止傳輸。
+        int slot_idx = slot % 16;
+        if ((target_mask & (1 << slot_idx)) == 0) {
+            // 如果 Mask 對應位元為 0，強制跳過此 UE (不排程)
+            // LOG_D(NR_MAC, "[2D-Control] RNTI %04x Muted in Slot %d (Mask: 0x%x)\n", current_rnti, slot, target_mask);
+            
+            reset_beam_status(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
+            iterator++;
+            continue; // <--- 關鍵：直接進入下一個 UE 迴圈，完全不給資源
+        }
 
-    if (target_rnti_1 != 0 && rnti == target_rnti_1) { 
-        xapp_prb_limit = (uint16_t)(total_bwp_prbs * target_ue1_prb_ratio);
-    } else if (target_rnti_2 != 0 && rnti == target_rnti_2) { 
-        xapp_prb_limit = (uint16_t)(total_bwp_prbs * target_ue2_prb_ratio);
-    }
+        // -------------------------------------------------------------
+        // B. 頻域控制 (Freq Domain): PRB Quota
+        // -------------------------------------------------------------
+        // 原理: 如果 xApp 設定 Ratio < 1.0，我們就強制縮小 max_rbSize
+        if (target_ratio < 1.0f) {
+            // 計算配額: BWP 總頻寬 * 比例
+            uint16_t xapp_limit = (uint16_t)(sched_pdsch->bwp_info.bwpSize * target_ratio);
+            
+            // 防呆: 至少給 1 個 RB，避免 nr_find_nb_rb 崩潰
+            if (xapp_limit < 1) xapp_limit = 1;
 
-    // [強制截斷] 如果 xApp 給的 Quota 小於物理可用空間，就砍掉
-    if (xapp_prb_limit > 0 && max_rbSize > xapp_prb_limit) {
-        max_rbSize = xapp_prb_limit;
+            // 執行截斷 (Clamping): 只有當物理可用量 > 限制量時才砍
+            if (max_rbSize > xapp_limit) {
+                // LOG_D(NR_MAC, "[2D-Control] RNTI %04x PRB Clamped: %d -> %d\n", current_rnti, max_rbSize, xapp_limit);
+                max_rbSize = xapp_limit;
+            }
+        }
     }
-    // =======================================================
+    // ===========================================================================
 
     if (max_rbSize < min_rbSize) {
-      LOG_D(NR_MAC,
-            "(%d.%d) Cannot schedule RNTI %04x, rbStart %d, rbSize %d, rbStop %d\n",
-            frame,
-            slot,
-            rnti,
-            rbStart,
-            max_rbSize,
-            rbStop);
       reset_beam_status(&mac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
       iterator++;
       continue;
@@ -899,7 +919,7 @@ static void pf_dl(module_id_t module_id,
                   sched_pdsch->dmrs_parms.N_PRB_DMRS * sched_pdsch->dmrs_parms.N_DMRS_SLOT,
                   sched_ctrl->num_total_bytes + oh,
                   min_rbSize,
-                  max_rbSize,
+                  max_rbSize, // <--- 這裡傳入的 max_rbSize 已經是被我們 "砍過" 的數值了
                   &TBS,
                   &rbSize);
     sched_pdsch->rbSize = rbSize;

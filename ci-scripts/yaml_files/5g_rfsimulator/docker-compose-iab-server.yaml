@@ -2,7 +2,6 @@ version: '3.8'
 
 services:
     # 0. O-RAN Near-RT RIC & xApps
-    # 0. O-RAN Near-RT RIC & xApps
     oai-flexric:
         image: oaisoftwarealliance/oai-flexric:develop
         privileged: true
@@ -16,6 +15,8 @@ services:
             - "36422:36422/sctp"
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            # 掛載修改過的 MAC 服務模型庫
+            - ~/openairinterface5g/openair2/E2AP/flexric/build/src/sm/mac_sm/libmac_sm.so:/usr/local/lib/libmac_sm.so
         healthcheck:
             test: /bin/bash -c "pgrep nearRT-RIC"
             interval: 10s
@@ -35,6 +36,20 @@ services:
             - NEAR_RT_RIC_IP=192.168.71.141
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+    
+    # [新增] 自定義 Local xApp 服務
+    node3-l-xapp:
+        image: oaisoftwarealliance/oai-flexric:develop
+        container_name: node3-l-xapp
+        privileged: true
+        depends_on: [oai-flexric]
+        network_mode: "host" # 為了方便連線，直接用 host 模式
+        volumes:
+        # 必須加上冒號與容器內路徑
+            - ~/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_mac_ctrl:/usr/local/bin/xapp_mac_ctrl
+            - ~/openairinterface5g/openair2/E2AP/flexric/build/src/sm/mac_sm/libmac_sm.so:/usr/local/lib/libmac_sm.so
+        # 確保指令指向正確的掛載位置
+        command: /usr/local/bin/xapp_mac_ctrl -r 192.168.71.141
 
     # 1. 5G Core Network
     mysql:
@@ -145,6 +160,9 @@ services:
         volumes:
             - ./conf/donor_cu.conf:/opt/oai-gnb/etc/gnb.conf
             - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
+            # [新增] 掛載修改過的 gNB 執行檔與 SM 庫
+            - ~/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - ~/openairinterface5g/openair2/E2AP/flexric/build/src/sm/mac_sm/libmac_sm.so:/usr/local/lib/libmac_sm.so
 
     rfsim5g-donor-du:
         image: oaisoftwarealliance/oai-gnb:develop

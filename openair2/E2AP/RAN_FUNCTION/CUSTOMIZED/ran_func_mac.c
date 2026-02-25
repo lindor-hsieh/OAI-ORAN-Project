@@ -21,29 +21,16 @@
 
 #include "ran_func_mac.h"
 #include "openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h"
-#include "openair2/LAYER2/nr_rlc/nr_rlc_oai_api.h" // 關鍵：用於讀取 RLC Buffer
-#include "openair2/E2AP/flexric/src/sm/mac_sm/ie/mac_data_ie.h" // 引用我們修改過的 IE 定義
+#include "openair2/LAYER2/nr_rlc/nr_rlc_oai_api.h"
+#include "openair2/E2AP/flexric/src/sm/mac_sm/ie/mac_data_ie.h" 
 
 #include <assert.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 static const int mod_id = 0;
-
-// ====================================================================
-// [Global Control Variables]
-// 這些變數是用來連接 E2 Agent (這裡) 與 MAC Scheduler (gNB_scheduler_dlsch.c) 的橋樑。
-// 未來無論是 Node 3, 4, 5，只要編譯這份 code，它們都會具備接收指令的能力。
-// ====================================================================
-uint16_t target_rnti_1 = 0;
-float target_ue1_prb_ratio = 1.0;
-uint16_t target_ue1_slot_mask = 0xFFFF;
-
-uint16_t target_rnti_2 = 0;
-float target_ue2_prb_ratio = 1.0;
-uint16_t target_ue2_slot_mask = 0xFFFF;
-// ====================================================================
 
 // ==========================================
 // 1. 感知層：讀取 MAC/RLC 統計數據 (Indication)
@@ -53,67 +40,83 @@ bool read_mac_sm(void* data)
   assert(data != NULL);
   mac_ind_data_t* mac = (mac_ind_data_t*)data;
   
-  // 使用標準時間戳計 (us)
+  // [Fix 1] 確保時間戳記被正確寫入
   struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
+  clock_gettime(CLOCK_REALTIME, &ts); // 改用 REALTIME 確保與系統時間一致
   mac->msg.tstamp = (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 
-  if (RC.nrmac == NULL || RC.nrmac[mod_id] == NULL) return false;
+  if (RC.nrmac == NULL || RC.nrmac[mod_id] == NULL) {
+      printf("[E2-AGENT] Error: RC.nrmac is NULL!\n");
+      return false;
+  }
 
-  NR_UEs_t *UE_info = &RC.nrmac[mod_id]->UE_info;
+  gNB_MAC_INST *nrmac = RC.nrmac[mod_id];
+  NR_UEs_t *UE_info = &nrmac->UE_info;
+
+  // -------------------------------------------------------------
+  // [Fix 2] 放棄 UE_iterator 巨集，改用暴力陣列遍歷
+  // -------------------------------------------------------------
   
-  // A. 統計當前連線的 UE 數量
+  // A. 第一次遍歷：計算 UE 數量
   size_t num_ues = 0;
-  UE_iterator(UE_info->connected_ue_list, ue) {
-    if (ue) num_ues += 1;
+  for (int i = 0; i < MAX_MOBILES_PER_GNB; i++) {
+      if (UE_info->connected_ue_list[i] != NULL) {
+          num_ues++;
+      }
+  }
+
+  // [Debug] 在 gNB 終端機印出偵測到的數量，確認 Agent 是否活著
+  if (num_ues > 0) {
+      // printf("[E2-AGENT] read_mac_sm detected %zu UEs.\n", num_ues);
   }
 
   mac->msg.len_ue_stats = num_ues;
-  if(mac->msg.len_ue_stats > 0){
-    mac->msg.ue_stats = calloc(mac->msg.len_ue_stats, sizeof(mac_ue_stats_impl_t));
-    assert(mac->msg.ue_stats != NULL && "Memory exhausted" );
-  } else {
-    return true; // 無連線 UE 則回報空訊息
+  
+  // 如果沒有 UE，直接返回，不要分配記憶體 (避免 malloc(0) 行為不一致)
+  if (num_ues == 0) {
+      mac->msg.ue_stats = NULL;
+      return true;
   }
 
-  // B. 填入每個 UE 的即時數據
-  size_t ue_idx = 0; 
-  UE_iterator(UE_info->connected_ue_list, UE) {
-    const NR_UE_sched_ctrl_t* sched_ctrl = &UE->UE_sched_ctrl;
-    mac_ue_stats_impl_t* rd = &mac->msg.ue_stats[ue_idx];
+  // 分配記憶體
+  mac->msg.ue_stats = calloc(num_ues, sizeof(mac_ue_stats_impl_t));
+  assert(mac->msg.ue_stats != NULL && "Memory exhausted");
 
-    // --- 基礎欄位 ---
-    rd->frame = RC.nrmac[mod_id]->frame;
-    rd->slot = 0; 
-    rd->rnti = UE->rnti;
-    
-    // --- [論文核心數據]：即時 Buffer 狀態與延遲 ---
-    // 透過 RLC API 抓取特定 UE 的下行緩衝區大小 (bytes)
-    // 這裡假設我們要抓取 DRB (Data Radio Bearer)，通常 LCID 從 4 開始
-    // 簡單起見，我們加總所有 LCID 的 buffer
-    rd->dl_buffer_info = 0;
-    for (int lcid = 1; lcid < 8; lcid++) {
-        rd->dl_buffer_info += (uint32_t)nr_rlc_get_available_transmit_buffer_size(UE->rnti, lcid, 1);
-    }
-    
-    rd->ul_buffer_info = (uint32_t)UE->mac_stats.ul.bsr; // 上行參考 BSR
-    
-    // 抓取 RLC 層觀測到的平均延遲 (若 OAI 有統計的話，或是用 buffer 推估)
-    rd->rlc_delay_ms = (float)UE->mac_stats.dl.lc_bytes[3] > 0 ? 
-                       (float)UE->mac_stats.dl.lc_bytes[3] / 1000.0 : 0.0;
+  // B. 第二次遍歷：填入數據
+  size_t idx = 0;
+  for (int i = 0; i < MAX_MOBILES_PER_GNB; i++) {
+      NR_UE_info_t* UE = UE_info->connected_ue_list[i];
+      
+      if (UE != NULL) {
+          // 確保不越界
+          if (idx >= num_ues) break;
 
-    // --- 實驗判斷核心 (MCS, CQI, BLER) ---
-    rd->wb_cqi = (uint8_t)sched_ctrl->CSI_report.cri_ri_li_pmi_cqi_report.wb_cqi_1tb;
-    rd->dl_mcs1 = (uint8_t)sched_ctrl->dl_bler_stats.mcs; 
-    rd->dl_bler = (float)sched_ctrl->dl_bler_stats.bler;
-    
-    // --- 累積流量統計 ---
-    rd->dl_aggr_tbs = UE->mac_stats.dl.total_bytes;
-    rd->ul_aggr_tbs = UE->mac_stats.ul.total_bytes;
-    rd->dl_aggr_prb = UE->mac_stats.dl.total_rbs;
-    rd->ul_aggr_prb = UE->mac_stats.ul.total_rbs;
+          mac_ue_stats_impl_t* rd = &mac->msg.ue_stats[idx];
+          NR_UE_sched_ctrl_t* sched_ctrl = &UE->UE_sched_ctrl;
 
-    ue_idx++;
+          // 基礎資訊
+          rd->frame = nrmac->frame;
+          rd->slot = 0;
+          rd->rnti = UE->rnti;
+
+          // 論文關鍵指標
+          rd->dl_buffer_info = (uint32_t)sched_ctrl->num_total_bytes;
+          rd->ul_buffer_info = (uint32_t)sched_ctrl->estimated_ul_buffer;
+          rd->rlc_delay_ms = 0.0; // 暫無計算
+
+          // 品質指標
+          rd->wb_cqi = (uint8_t)sched_ctrl->CSI_report.cri_ri_li_pmi_cqi_report.wb_cqi_1tb;
+          rd->dl_mcs1 = (uint8_t)sched_ctrl->dl_bler_stats.mcs;
+          rd->dl_bler = (float)sched_ctrl->dl_bler_stats.bler;
+
+          // 流量統計
+          rd->dl_aggr_tbs = UE->mac_stats.dl.total_bytes;
+          rd->ul_aggr_tbs = UE->mac_stats.ul.total_bytes;
+          rd->dl_aggr_prb = UE->mac_stats.dl.total_rbs;
+          rd->ul_aggr_prb = UE->mac_stats.ul.total_rbs;
+
+          idx++;
+      }
   }
 
   return true;
@@ -130,34 +133,36 @@ sm_ag_if_ans_t write_ctrl_mac_sm(void const* data)
 {
   assert(data != NULL);
   const mac_ctrl_req_data_t* req = (const mac_ctrl_req_data_t*)data;
-
-  // 檢查指令類型 (Type 0 為資源分配) 與切片數量
-  if (req->msg.type == 0 && req->msg.len_slices >= 2) { 
-      
-      // [通用設計] 
-      // 這裡我們假設 xApp 總是送來兩個切片的設定 (VIP vs Standard)
-      // 如果你要支援更多 UE，可以用迴圈動態更新陣列，但目前 2 個變數最快最穩。
-
-      // --- 提取 UE 1 (VIP) 的設定 ---
-      target_rnti_1 = (uint16_t)req->msg.slices[0].id;
-      target_ue1_prb_ratio = req->msg.slices[0].prb_quota;
-      target_ue1_slot_mask = req->msg.slices[0].slot_mask; // [新增] 更新 Slot Mask
-      
-      // --- 提取 UE 2 (Standard) 的設定 ---
-      target_rnti_2 = (uint16_t)req->msg.slices[1].id;
-      target_ue2_prb_ratio = req->msg.slices[1].prb_quota;
-      target_ue2_slot_mask = req->msg.slices[1].slot_mask; // [新增] 更新 Slot Mask
-
-      printf("[OAI-E2-AGENT] >> 收到 2D 控制指令!\n");
-      printf("   UE1(%04x) -> PRB: %.2f | SlotMask: %04X\n", 
-             target_rnti_1, target_ue1_prb_ratio, target_ue1_slot_mask);
-      printf("   UE2(%04x) -> PRB: %.2f | SlotMask: %04X\n", 
-             target_rnti_2, target_ue2_prb_ratio, target_ue2_slot_mask);
-
-  } else {
-      printf("[OAI-E2-AGENT] 收到未知的控制類型或切片數量不足 (Expected 2, got %d)\n", req->msg.len_slices);
-  }
-  
   sm_ag_if_ans_t ans = {0};
+
+  // [Debug]
+  printf("[OAI-E2-AGENT] Recv Control: Type=%d, Slices=%d\n", 
+         req->msg.type, req->msg.len_slices);
+
+  if (req->msg.len_slices > 0) {
+      if (RC.nrmac && RC.nrmac[mod_id]) {
+          gNB_MAC_INST *nrmac = RC.nrmac[mod_id];
+
+          for (size_t i = 0; i < req->msg.len_slices; i++) {
+              uint16_t rnti = (uint16_t)req->msg.slices[i].id;
+              float prb_quota = req->msg.slices[i].prb_quota;
+              uint16_t slot_mask = req->msg.slices[i].slot_mask;
+
+              // 存入 gNB 結構體，供排程器使用
+              if (i == 0) {
+                  nrmac->xapp_2d_ctrl.rnti1 = rnti;
+                  nrmac->xapp_2d_ctrl.prb_ratio1 = prb_quota;
+                  nrmac->xapp_2d_ctrl.slot_mask1 = slot_mask;
+              } else if (i == 1) {
+                  nrmac->xapp_2d_ctrl.rnti2 = rnti;
+                  nrmac->xapp_2d_ctrl.prb_ratio2 = prb_quota;
+                  nrmac->xapp_2d_ctrl.slot_mask2 = slot_mask;
+              }
+          }
+          printf("[OAI-E2-AGENT] >>> Applied: UE1(%04x) Ratio:%.2f Mask:%04x <<<\n", 
+                 nrmac->xapp_2d_ctrl.rnti1, nrmac->xapp_2d_ctrl.prb_ratio1, nrmac->xapp_2d_ctrl.slot_mask1);
+      }
+  } 
+  
   return ans;
 }

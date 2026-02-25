@@ -38,6 +38,9 @@ services:
                 ipv4_address: 192.168.74.20
         volumes:
             - ./conf/iab_du_3.conf:/opt/oai-gnb/etc/gnb.conf
+            # [關鍵] 替換成 PC 2 本地存放的修改版檔案
+            - ~/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - ~/openairinterface5g/openair2/E2AP/flexric/build/src/sm/mac_sm/libmac_sm.so:/usr/local/lib/libmac_sm.so
         entrypoint: /opt/oai-gnb/bin/nr-softmodem
         command: -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.[0].serveraddr server --rfsimulator.[0].serverport 4046
         environment:
@@ -77,6 +80,8 @@ services:
                 ipv4_address: 192.168.74.21
         volumes:
             - ./conf/iab_du_4.conf:/opt/oai-gnb/etc/gnb.conf
+            - ~/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - ~/openairinterface5g/openair2/E2AP/flexric/build/src/sm/mac_sm/libmac_sm.so:/usr/local/lib/libmac_sm.so
         entrypoint: /opt/oai-gnb/bin/nr-softmodem
         command: -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.[0].serveraddr server --rfsimulator.[0].serverport 4047
         environment:
@@ -115,6 +120,8 @@ services:
                 ipv4_address: 192.168.74.22
         volumes:
             - ./conf/iab_du_5.conf:/opt/oai-gnb/etc/gnb.conf
+            - ~/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - ~/openairinterface5g/openair2/E2AP/flexric/build/src/sm/mac_sm/libmac_sm.so:/usr/local/lib/libmac_sm.so
         entrypoint: /opt/oai-gnb/bin/nr-softmodem
         command: -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.[0].serveraddr server --rfsimulator.[0].serverport 4048
         environment:

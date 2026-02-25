@@ -47,19 +47,6 @@
 #include "common/utils/ds/byte_array.h"
 #include "openair2/LAYER2/nr_rlc/nr_rlc_configuration.h"
 
-// ====================================================================
-// [OAI-E2-AGENT] Global Variables for Local xApp Control
-// 這些變數由 ran_func_mac.c 定義與寫入，由 gNB_scheduler_dlsch.c 讀取與執行
-// ====================================================================
-extern uint16_t target_rnti_1;
-extern float target_ue1_prb_ratio;
-extern uint16_t target_ue1_slot_mask; // [時域控制] UE1 的 Slot 遮罩
-
-extern uint16_t target_rnti_2;
-extern float target_ue2_prb_ratio;
-extern uint16_t target_ue2_slot_mask; // [時域控制] UE2 的 Slot 遮罩
-// ====================================================================
-
 #define NR_SCHED_LOCK(lock)                                        \
   do {                                                             \
     int rc = pthread_mutex_lock(lock);                             \
@@ -992,6 +979,17 @@ typedef struct gNB_MAC_INST_s {
 
   mac_stats_t mac_stats;
   uint64_t num_scheduled_prach_rx;
+  // [Local xApp Control] 用於存放來自 E2 介面的 2D 資源控制指令
+  struct {
+    uint16_t rnti1;      // 目標 UE1 的 RNTI
+    float prb_ratio1;    // UE1 頻域 PRB 比例 (0.0~1.0)
+    uint16_t slot_mask1; // UE1 時域 Slot 遮罩
+
+    uint16_t rnti2;      // 目標 UE2 的 RNTI
+    float prb_ratio2;    // UE2 頻域 PRB 比例
+    uint16_t slot_mask2; // UE2 時域 Slot 遮罩
+  } xapp_2d_ctrl;
+  // -------------------------------------------
 } gNB_MAC_INST;
 
 #endif /*__LAYER2_NR_MAC_GNB_H__ */

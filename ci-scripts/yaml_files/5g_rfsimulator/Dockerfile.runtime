@@ -1,0 +1,30 @@
+# 使用與宿主機一致的 Ubuntu 24.04
+FROM ubuntu:24.04
+
+# 設定時區與非互動模式
+ENV TZ=Europe/Paris
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 一次性安裝 基地台 與 UE 執行所需的所有依賴與工具
+RUN apt-get update && apt-get install -y \
+    # --- OAI 核心執行庫 ---
+    libconfig9 \
+    libconfig++9v5 \
+    libsctp1 \
+    libssl3 \
+    libblas3 \
+    liblapack3 \
+    libz1 \
+    libyaml-cpp0.8 \
+    # --- 網路與除錯工具 (基地台與 UE 都會用到) ---
+    iproute2 \
+    iputils-ping \
+    iperf3 \
+    tcpdump \
+    net-tools \
+    iptables \
+    gdb \
+    && rm -rf /var/lib/apt/lists/*
+
+# 設定一個中性的工作目錄
+WORKDIR /opt/oai

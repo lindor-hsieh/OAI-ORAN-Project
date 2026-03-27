@@ -22,6 +22,8 @@ services:
             test: /bin/bash -c "pgrep nearRT-RIC"
             interval: 10s
             timeout: 5s
+            retries: 12
+            start_period: 15s
 
     xapp-kpm-moni:
         image: oaisoftwarealliance/oai-flexric:develop
@@ -39,20 +41,31 @@ services:
 
     node3-l-xapp:
         image: custom-oai-runtime:24.04
-        container_name: xapp-mac-ctrl
+        container_name: xapp-node3
         privileged: true
         tty: true
-        depends_on: [oai-flexric]
-        # [修改] 改用 Host 模式
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
         network_mode: "host"
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            # -1 = 永久運行，不因 XAPP_DURATION timeout 退出
+            XAPP_DURATION: -1
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
-            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_mac_ctrl:/node3_brain
+            # xApp 執行檔 (編譯自 xapp_node3.c)
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node3:/node3_brain
+            # FlexRIC MAC SM 插件
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
-        # 直接執行這個特定路徑的檔案
-        command: /node3_brain -c /usr/local/etc/flexric/flexric.conf -p /usr/local/lib/flexric/
+            # 啟動腳本 (安裝 zmq/cjson + 等待 RIC 就緒)
+            - ./iab/start_xapp_node3.sh:/start_xapp_node3.sh
+            # /tmp 與宿主機共享，用於 ZMQ IPC socket:
+            #   C xApp     → ipc:///tmp/zmq_node3_inference.ipc (REQ)
+            #   Python 推論伺服器 → 同路徑 (REP)，需掛載同一個 /tmp
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node3.sh
         
     # ==========================================================
     # 1. 5G Core Network (AMF, SMF, UPF, MySQL)

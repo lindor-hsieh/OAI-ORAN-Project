@@ -143,24 +143,21 @@ sm_ag_if_ans_t write_ctrl_mac_sm(void const* data)
       if (RC.nrmac && RC.nrmac[mod_id]) {
           gNB_MAC_INST *nrmac = RC.nrmac[mod_id];
 
-          for (size_t i = 0; i < req->msg.len_slices; i++) {
-              uint16_t rnti = (uint16_t)req->msg.slices[i].id;
-              float prb_quota = req->msg.slices[i].prb_quota;
-              uint16_t slot_mask = req->msg.slices[i].slot_mask;
+          // 計算實際寫入的條目數 (不超過 XAPP_MAX_UE 上限)
+          uint8_t n = (uint8_t)(req->msg.len_slices < XAPP_MAX_UE
+                                ? req->msg.len_slices : XAPP_MAX_UE);
 
-              // 存入 gNB 結構體，供排程器使用
-              if (i == 0) {
-                  nrmac->xapp_2d_ctrl.rnti1 = rnti;
-                  nrmac->xapp_2d_ctrl.prb_ratio1 = prb_quota;
-                  nrmac->xapp_2d_ctrl.slot_mask1 = slot_mask;
-              } else if (i == 1) {
-                  nrmac->xapp_2d_ctrl.rnti2 = rnti;
-                  nrmac->xapp_2d_ctrl.prb_ratio2 = prb_quota;
-                  nrmac->xapp_2d_ctrl.slot_mask2 = slot_mask;
-              }
+          // 將 AI 決策陣列寫入 gNB 結構體，供 DL Scheduler 逐 UE 查詢
+          for (uint8_t i = 0; i < n; i++) {
+              nrmac->xapp_2d_ctrl.rnti[i]      = (uint16_t)req->msg.slices[i].id;
+              nrmac->xapp_2d_ctrl.prb_ratio[i]  = req->msg.slices[i].prb_quota;
+              nrmac->xapp_2d_ctrl.slot_mask[i]  = req->msg.slices[i].slot_mask;
           }
-          printf("[OAI-E2-AGENT] >>> Applied: UE1(%04x) Ratio:%.2f Mask:%04x <<<\n", 
-                 nrmac->xapp_2d_ctrl.rnti1, nrmac->xapp_2d_ctrl.prb_ratio1, nrmac->xapp_2d_ctrl.slot_mask1);
+
+          // 更新有效條目數 (Scheduler 只查詢 [0, num_entries) 範圍)
+          nrmac->xapp_2d_ctrl.num_entries = n;
+
+          printf("[OAI-E2-AGENT] >>> Applied %d UE entries from xApp <<<\n", n);
       }
   } 
   

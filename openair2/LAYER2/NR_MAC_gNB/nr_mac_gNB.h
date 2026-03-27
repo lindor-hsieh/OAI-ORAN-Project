@@ -980,14 +980,13 @@ typedef struct gNB_MAC_INST_s {
   mac_stats_t mac_stats;
   uint64_t num_scheduled_prach_rx;
   // [Local xApp Control] 用於存放來自 E2 介面的 2D 資源控制指令
+  // 支援最多 XAPP_MAX_UE 個 UE 同時受控 (由 Local xApp AI 推論結果填入)
+#define XAPP_MAX_UE 16
   struct {
-    uint16_t rnti1;      // 目標 UE1 的 RNTI
-    float prb_ratio1;    // UE1 頻域 PRB 比例 (0.0~1.0)
-    uint16_t slot_mask1; // UE1 時域 Slot 遮罩
-
-    uint16_t rnti2;      // 目標 UE2 的 RNTI
-    float prb_ratio2;    // UE2 頻域 PRB 比例
-    uint16_t slot_mask2; // UE2 時域 Slot 遮罩
+    uint8_t  num_entries;              // 目前有效條目數量 (0 表示 xApp 尚未連線)
+    uint16_t rnti[XAPP_MAX_UE];        // 各 UE 的 RNTI
+    float    prb_ratio[XAPP_MAX_UE];   // 各 UE 頻域 PRB 比例 (0.0~1.0)
+    uint16_t slot_mask[XAPP_MAX_UE];   // 各 UE 時域 Slot 遮罩 (0xFFFF=全開)
   } xapp_2d_ctrl;
   // -------------------------------------------
 } gNB_MAC_INST;

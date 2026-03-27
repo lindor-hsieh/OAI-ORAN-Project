@@ -613,14 +613,7 @@ static void pf_dl(module_id_t module_id,
                   int n_rb_sched[num_beams])
 {
   gNB_MAC_INST *mac = RC.nrmac[module_id];
-  // === 2D Control 全域變數檢查 ===
-    static int debug_cnt = 0;
-    if (debug_cnt++ % 1000 == 0) { // 每 1000 次排程印一次，避免日誌刷太快
-        printf("[DEBUG-GLOBAL] xApp_RNTI: %04x | Ratio: %.2f | Mask: %04x\n", 
-               mac->xapp_2d_ctrl.rnti1, 
-               mac->xapp_2d_ctrl.prb_ratio1, 
-               mac->xapp_2d_ctrl.slot_mask1);
-    }
+
   NR_ServingCellConfigCommon_t *scc=mac->common_channels[0].ServingCellConfigCommon;
   // UEs that could be scheduled
   UEsched_t UE_sched[MAX_MOBILES_PER_GNB + 1] = {0};
@@ -807,15 +800,16 @@ static void pf_dl(module_id_t module_id,
     float target_ratio = 1.0f;     // 預設: 100% (不限制)
     bool is_controlled_ue = false;
 
-    // 判斷是否為 xApp 指定的目標 UE
-    if (mac->xapp_2d_ctrl.rnti1 != 0 && current_rnti == mac->xapp_2d_ctrl.rnti1) {
-        target_mask = mac->xapp_2d_ctrl.slot_mask1;
-        target_ratio = mac->xapp_2d_ctrl.prb_ratio1;
-        is_controlled_ue = true;
-    } else if (mac->xapp_2d_ctrl.rnti2 != 0 && current_rnti == mac->xapp_2d_ctrl.rnti2) {
-        target_mask = mac->xapp_2d_ctrl.slot_mask2;
-        target_ratio = mac->xapp_2d_ctrl.prb_ratio2;
-        is_controlled_ue = true;
+    // 線性搜尋：在 xApp 下發的控制表中尋找匹配的 RNTI
+    // num_entries == 0 表示 xApp 尚未連線，直接跳過以保持 OAI 預設排程
+    for (uint8_t ci = 0; ci < mac->xapp_2d_ctrl.num_entries; ci++) {
+        if (mac->xapp_2d_ctrl.rnti[ci] != 0 &&
+            current_rnti == mac->xapp_2d_ctrl.rnti[ci]) {
+            target_mask     = mac->xapp_2d_ctrl.slot_mask[ci];
+            target_ratio    = mac->xapp_2d_ctrl.prb_ratio[ci];
+            is_controlled_ue = true;
+            break;
+        }
     }
 
     if (is_controlled_ue) {

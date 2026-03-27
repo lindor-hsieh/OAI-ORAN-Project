@@ -17,10 +17,10 @@ services:
             - "36422:36422/sctp"
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
-            # 掛載本地編譯的 nearRT-RIC，確保與 xapp_node3 使用相同版本的 MAC SM wire format
+            # 掛載本地編譯的 nearRT-RIC，確保與 xapp_node3 使用相同 MAC SM wire format
             - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/ric/nearRT-RIC:/usr/local/bin/nearRT-RIC
-            # 掛載修改後的 MAC SM 插件 (prb_quota, slot_mask 自定義欄位)
-            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            # 掛載所有本地編譯的 SM 插件，與 nearRT-RIC 及 xApp 保持 ABI 一致
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
         healthcheck:
             test: /bin/bash -c "pgrep nearRT-RIC"
             interval: 10s
@@ -60,8 +60,9 @@ services:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
             # xApp 執行檔 (編譯自 xapp_node3.c)
             - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node3:/node3_brain
-            # FlexRIC MAC SM 插件
-            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            # 掛載所有本地編譯的 SM 插件，取代 Docker 版本以確保 ABI 一致
+            # (Docker 的 libkpm_sm.so 等與本地靜態連結的 xApp ABI 不符會導致 SIGSEGV)
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
             # 啟動腳本 (安裝 zmq/cjson + 等待 RIC 就緒)
             - ./iab/start_xapp_node3.sh:/start_xapp_node3.sh
             # /tmp 與宿主機共享，用於 ZMQ IPC socket:

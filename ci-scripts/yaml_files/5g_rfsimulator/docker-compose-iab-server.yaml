@@ -11,7 +11,7 @@ services:
         container_name: flexric
         networks:
             public_net:
-                ipv4_address: 192.168.71.141
+                ipv4_address: 192.168.88.141
         ports:
             - "36421:36421/sctp"
             - "36422:36422/sctp"
@@ -24,42 +24,35 @@ services:
             timeout: 5s
 
     xapp-kpm-moni:
-        image: custom-oai-runtime:24.04
+        image: oaisoftwarealliance/oai-flexric:develop
+        command: "stdbuf -o0 /usr/local/flexric/xApp/c/monitor/xapp_kpm_moni"
         container_name: xapp-kpm-moni
         privileged: true
         cap_add: [NET_ADMIN]
         depends_on: [oai-flexric]
-        networks:
-            public_net:
-                ipv4_address: 192.168.71.142
+        # [修改] 改用 Host 模式，這樣它就能透過宿主機的 macvlan-br 看到 FlexRIC
+        network_mode: "host" 
         environment:
-            - LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/flexric
+            - NEAR_RT_RIC_IP=192.168.88.141
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
-            # xApp 執行檔維持原本的 build 路徑 (因為它沒有被 install 到系統裡)
-            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/monitor/xapp_kpm_moni:/usr/local/bin/xapp_kpm_moni
-            # [修正] 插件從宿主機安裝目錄掛載
-            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
-            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: /usr/local/bin/xapp_kpm_moni -c /usr/local/etc/flexric/flexric.conf -p /usr/local/lib/flexric/
 
     node3-l-xapp:
         image: custom-oai-runtime:24.04
         container_name: xapp-mac-ctrl
         privileged: true
+        tty: true
         depends_on: [oai-flexric]
-        networks:
-            public_net:
-                ipv4_address: 192.168.71.143
+        # [修改] 改用 Host 模式
+        network_mode: "host"
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
-            # xApp 執行檔維持原本的 build 路徑
-            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_mac_ctrl:/usr/local/bin/xapp_mac_ctrl
-            # [修正] 插件從宿主機安裝目錄掛載
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_mac_ctrl:/node3_brain
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
-        command: /usr/local/bin/xapp_mac_ctrl -c /usr/local/etc/flexric/flexric.conf -p /usr/local/lib/flexric/
+        # 直接執行這個特定路徑的檔案
+        command: /node3_brain -c /usr/local/etc/flexric/flexric.conf -p /usr/local/lib/flexric/
         
     # ==========================================================
     # 1. 5G Core Network (AMF, SMF, UPF, MySQL)
@@ -84,7 +77,7 @@ services:
             retries: 30
         networks:
             public_net:
-                ipv4_address: 192.168.71.131
+                ipv4_address: 192.168.88.131
 
     oai-amf:
         container_name: "rfsim5g-oai-amf"
@@ -94,7 +87,7 @@ services:
         depends_on: [mysql]
         networks:
             public_net:
-                ipv4_address: 192.168.71.132
+                ipv4_address: 192.168.88.132
 
     oai-smf:
         container_name: "rfsim5g-oai-smf"
@@ -104,7 +97,7 @@ services:
         depends_on: [oai-amf]
         networks:
             public_net:
-                ipv4_address: 192.168.71.133
+                ipv4_address: 192.168.88.133
 
     oai-upf:
         container_name: "rfsim5g-oai-upf"
@@ -117,7 +110,7 @@ services:
         privileged: true
         networks:
             public_net:
-                ipv4_address: 192.168.71.134
+                ipv4_address: 192.168.88.134
                 interface_name: eth0
             traffic_net:
                 ipv4_address: 192.168.72.134
@@ -169,7 +162,7 @@ services:
         depends_on: [rfsim5g-donor-cu]
         networks:
             public_net:
-                ipv4_address: 192.168.71.144
+                ipv4_address: 192.168.88.144
         volumes:
             - ./conf/donor_du.conf:/opt/oai-gnb/etc/gnb.conf
             - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
@@ -194,12 +187,12 @@ services:
         depends_on: [rfsim5g-donor-du]
         networks:
             public_net:
-                ipv4_address: 192.168.71.150
+                ipv4_address: 192.168.88.150
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
              - ~/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
@@ -207,7 +200,7 @@ services:
         ports:
             - "4044:4044/udp"
             - "4044:4044/tcp"
-        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-iab-du:
         image: custom-oai-runtime:24.04
@@ -237,12 +230,12 @@ services:
         cap_add: [NET_ADMIN, NET_RAW]
         networks:
             public_net:
-                ipv4_address: 192.168.71.152
+                ipv4_address: 192.168.88.152
         devices:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
              - ~/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
@@ -250,7 +243,7 @@ services:
         ports:
             - "4045:4045/udp"
             - "4045:4045/tcp"
-        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.71.144 --log_config.global_log_options level,nocolor,time
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-iab-du-2:
         image: custom-oai-runtime:24.04
@@ -272,11 +265,13 @@ services:
 
 networks:
     public_net:
-        driver: bridge
-        name: rfsim5g-oai-public-net
+        driver: macvlan
+        driver_opts:
+            parent: enxc84d44350030
         ipam:
             config:
-                - subnet: 192.168.71.128/26
+                - subnet: 192.168.88.0/24
+                  gateway: 192.168.88.1
     traffic_net:
         driver: bridge
         name: rfsim5g-oai-traffic-net

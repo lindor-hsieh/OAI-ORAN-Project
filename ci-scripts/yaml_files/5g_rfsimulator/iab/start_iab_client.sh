@@ -1,5 +1,5 @@
 #!/bin/bash
-# PC 2: IAB Client Script (Node 3, Node 4, Node 5, 6x End-UEs)
+# PC 2: IAB Client Script (Based on User's Successful Logic + Macvlan Prep)
 
 COMPOSE_FILE="docker-compose-iab-client.yaml"
 IFACE_NAME="enxc84d44350008" 
@@ -16,6 +16,9 @@ DU3_IP="192.168.74.20"
 DU4_IP="192.168.74.21"
 DU5_IP="192.168.74.22"
 
+RIC_IP="192.168.88.141"
+DN_SUBNET="192.168.72.0/24" # UPF 所在的資料網段
+
 if docker compose version &> /dev/null; then DOCKER_COMPOSE="docker compose"; else DOCKER_COMPOSE="docker-compose"; fi
 
 RED='\033[0;31m'
@@ -25,12 +28,28 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 DONE_NODE3=0; DONE_NODE4=0; DONE_NODE5=0
-# [修正] 初始化即包含清空指令，確保魔法指令執行時先歸零
+# 初始化即包含清空指令，確保魔法指令執行時先歸零
 CU_MAGIC_COMMANDS="docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT"
 
-echo -e "${CYAN}[0/5] Loading Kernel Modules...${NC}"
+echo -e "${CYAN}[0/5] Loading Kernel Modules & Macvlan Prep...${NC}"
 sudo modprobe sctp
 sudo modprobe nf_conntrack_sctp 2>/dev/null || sudo modprobe nf_conntrack_proto_sctp 2>/dev/null
+
+# 加入 PC 2 Macvlan 與實體網卡調優 (防 IQ 封包掉包)
+sudo ethtool -K $IFACE_NAME rx off tx off gso off tso off gro off lro off 2>/dev/null
+sudo ip link set $IFACE_NAME promisc on
+sudo ip link set $IFACE_NAME mtu 1350
+
+# 清除實體網卡上的 IP，避免雙網卡衝突 (rp_filter 丟包元兇)
+sudo ip link set $IFACE_NAME up
+sudo ip addr flush dev $IFACE_NAME 2>/dev/null || true
+
+# 建立 macvlan-br，並將 IP「唯一」綁定在虛擬網卡上
+sudo ip link add macvlan-br link $IFACE_NAME type macvlan mode bridge 2>/dev/null || true
+sudo ip addr add 192.168.88.2/24 dev macvlan-br 2>/dev/null || true
+sudo ip link set macvlan-br mtu 1350
+sudo ip link set macvlan-br up
+sudo ip route replace 192.168.88.128/25 dev macvlan-br
 
 # 函式：設定網路與啟動 DU 
 configure_and_start_du() {
@@ -41,6 +60,8 @@ configure_and_start_du() {
     echo -e "\n${GREEN}[Action] Setting up network for $DU_NAME ($DU_DOCKER_IP)${NC}"
     
     local MT_TUNNEL_IP=$(docker exec $MT_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+    
+    # 這裡的魔法指令是給 PC 1 執行的，腳本結尾會印出來
     CU_MAGIC_COMMANDS+="\ndocker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP"
 
     docker exec -u 0 $MT_NAME sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -50,30 +71,31 @@ configure_and_start_du() {
     docker exec -u 0 $MT_NAME iptables -t nat -A PREROUTING -i oaitun_ue1 -p sctp -j DNAT --to-destination $DU_DOCKER_IP
     docker exec -u 0 $MT_NAME iptables -t nat -A PREROUTING -i oaitun_ue1 -p udp --dport 2152 -j DNAT --to-destination $DU_DOCKER_IP
     
-    docker exec -u 0 $MT_NAME ip route del $CN_SUBNET 2>/dev/null || true
-    docker exec -u 0 $MT_NAME ip route add $CN_SUBNET via 12.1.1.1 dev oaitun_ue1
+    # 讓 MT 知道核心網網段與資料網段怎麼走
+    docker exec -u 0 $MT_NAME ip route replace $CN_SUBNET via 12.1.1.1 dev oaitun_ue1
+    docker exec -u 0 $MT_NAME ip route replace $DN_SUBNET via 12.1.1.1 dev oaitun_ue1
+    
     docker exec -u 0 $MT_NAME ethtool -K oaitun_ue1 tx off 2>/dev/null || true
     docker exec -u 0 $MT_NAME ip link set oaitun_ue1 mtu 1300 2>/dev/null
-    echo "   -> [Network] MTU optimized for IAB Tunnel (1300)"
 
-    # IAB 模式路徑設定
     docker exec -u 0 $MT_NAME ip route del default 2>/dev/null || true
     docker exec -u 0 $MT_NAME ip route add default via 12.1.1.1 dev oaitun_ue1
-    echo "   -> [Network] MT forced to use 5G Tunnel for all traffic."
 
     echo "   -> [Docker] Starting DU: $DU_NAME"
     $DOCKER_COMPOSE -f $COMPOSE_FILE up -d --force-recreate $DU_NAME
     
-    local MT_INTERNAL_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $MT_NAME | grep 192.168.74)
+    local MT_INTERNAL_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' $MT_NAME | grep '192.168.74' | head -n 1 | xargs)
     sleep 2
-    # 使用 replace 避免重複啟動報錯
+
+    # [核心修正] 解決所有控制面非對稱路由問題 (CU & FlexRIC)
+    docker exec -u 0 $DU_NAME ip route replace $SERVER_IP via 192.168.74.1 2>/dev/null
+    docker exec -u 0 $DU_NAME ip route replace $RIC_IP via 192.168.74.1 2>/dev/null
+
+    # [核心修正] 讓 DU 知道資料面流量要丟給 MT (包含核心網與 UPF 網段)
     docker exec -u 0 $DU_NAME ip route replace $CN_SUBNET via $MT_INTERNAL_IP 2>/dev/null
-    # 讓 DU 知道如何把 End-UE 流量傳回 MT
+    docker exec -u 0 $DU_NAME ip route replace $DN_SUBNET via $MT_INTERNAL_IP 2>/dev/null
     docker exec -u 0 $DU_NAME ip route replace $UE_SUBNET via $MT_INTERNAL_IP 2>/dev/null
 
-    # 確保指向 PC 1 (192.168.88.x) 的 E2/F1 控制面流量走實體網線，不要進 5G 隧道
-    # 確保 Node 3, 4, 5 能穩定連上 FlexRIC 
-    # docker exec -u 0 $DU_NAME ip route add 192.168.88.0/24 via 192.168.74.1 2>/dev/null
     echo -e "${YELLOW} Waiting 10s for CU F1AP stability...${NC}"
     sleep 10
 }
@@ -254,7 +276,7 @@ echo -e "\n${YELLOW}====================================================${NC}"
 echo -e "${YELLOW}           全網 IAB Performance Benchmarks       ${NC}"
 echo -e "${YELLOW}====================================================${NC}"
 
-if [ $NET_UE_COUNT -gt 0 ]; then
+if [ "$NET_UE_COUNT" -gt 0 ]; then
     final_lat=$(echo "scale=2; $G_LAT_SUM / $NET_UE_COUNT" | bc)
     final_tdl=$(echo "scale=2; $G_TCP_DL_SUM / $NET_UE_COUNT" | bc)
     final_tul=$(echo "scale=2; $G_TCP_UL_SUM / $NET_UE_COUNT" | bc)
@@ -268,7 +290,7 @@ if [ $NET_UE_COUNT -gt 0 ]; then
     echo -e "全網 Avg.Throughput(UDP-DL): ${CYAN}$final_udl Mbps${NC}"
     echo -e "全網 Avg.Throughput(UDP-UL): ${CYAN}$final_uul Mbps${NC}"
 else
-    echo -e "${RED}Failed${NC}"
+    echo -e "${RED}Failed: No UE connected.${NC}"
 fi
 echo -e "${YELLOW}====================================================${NC}"
 

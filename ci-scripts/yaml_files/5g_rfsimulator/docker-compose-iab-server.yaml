@@ -16,8 +16,11 @@ services:
             - "36421:36421/sctp"
             - "36422:36422/sctp"
         volumes:
-            # 只保留設定檔，刪除底下那兩行 .so 檔案掛載
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            # 掛載本地編譯的 nearRT-RIC，確保與 xapp_node3 使用相同版本的 MAC SM wire format
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/ric/nearRT-RIC:/usr/local/bin/nearRT-RIC
+            # 掛載修改後的 MAC SM 插件 (prb_quota, slot_mask 自定義欄位)
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
         healthcheck:
             test: /bin/bash -c "pgrep nearRT-RIC"
             interval: 10s

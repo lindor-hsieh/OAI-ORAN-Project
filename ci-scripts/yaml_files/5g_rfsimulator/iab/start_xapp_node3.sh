@@ -52,16 +52,9 @@ echo "[start_xapp_node3] 等待 FlexRIC Server (${RIC_IP}:36421) 就緒..."
 MAX_WAIT=120
 ELAPSED=0
 
-check_port() {
-    if command -v nc >/dev/null 2>&1; then
-        nc -z "$1" "$2" 2>/dev/null
-    else
-        # bash 純內建 TCP 探測，不依賴任何外部工具
-        (echo >/dev/tcp/"$1"/"$2") 2>/dev/null
-    fi
-}
-
-while ! check_port "${RIC_IP}" 36421; do
+# FlexRIC 使用 SCTP，無法用 TCP/bash-devtcp 探測；改用 ping 確認主機可達即可
+# E2AP 連線重試由 xApp 框架自行處理
+while ! ping -c 1 -W 2 "${RIC_IP}" >/dev/null 2>&1; do
     if [ ${ELAPSED} -ge ${MAX_WAIT} ]; then
         echo "[start_xapp_node3] WARNING: FlexRIC Server ${MAX_WAIT}s 內未就緒，仍嘗試啟動 xApp"
         break

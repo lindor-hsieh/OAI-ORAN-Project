@@ -92,7 +92,7 @@ services:
             - ~/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
             - ~/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
             # [修正] 直接從宿主機的安裝目錄掛載
-            #- /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
         command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
 
@@ -140,7 +140,7 @@ services:
             - ~/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
             - ~/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
             # [修正] 直接從宿主機的安裝目錄掛載
-            #- /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
         command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
 

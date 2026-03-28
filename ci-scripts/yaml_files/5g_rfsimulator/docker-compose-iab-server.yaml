@@ -30,17 +30,64 @@ services:
 
     xapp-kpm-moni:
         image: oaisoftwarealliance/oai-flexric:develop
-        command: "stdbuf -o0 /usr/local/flexric/xApp/c/monitor/xapp_kpm_moni"
+        # 掛載本地編譯的 xapp_kpm_moni，與本地 nearRT-RIC E42 ABI 一致
+        command: "stdbuf -o0 /xapp_kpm_moni"
         container_name: xapp-kpm-moni
         privileged: true
         cap_add: [NET_ADMIN]
-        depends_on: [oai-flexric]
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
         # [修改] 改用 Host 模式，這樣它就能透過宿主機的 macvlan-br 看到 FlexRIC
-        network_mode: "host" 
+        network_mode: "host"
         environment:
             - NEAR_RT_RIC_IP=192.168.88.141
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/monitor/xapp_kpm_moni:/xapp_kpm_moni
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+
+    node1-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node1
+        privileged: true
+        tty: true
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node1:/node1_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node1.sh:/start_xapp_node1.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node1.sh
+
+    node2-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node2
+        privileged: true
+        tty: true
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node2:/node2_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node2.sh:/start_xapp_node2.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node2.sh
 
     node3-l-xapp:
         image: custom-oai-runtime:24.04
@@ -70,7 +117,49 @@ services:
             #   Python 推論伺服器 → 同路徑 (REP)，需掛載同一個 /tmp
             - /tmp:/tmp
         command: /bin/bash /start_xapp_node3.sh
-        
+
+    node4-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node4
+        privileged: true
+        tty: true
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node4:/node4_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node4.sh:/start_xapp_node4.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node4.sh
+
+    node5-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node5
+        privileged: true
+        tty: true
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node5:/node5_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node5.sh:/start_xapp_node5.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node5.sh
+
     # ==========================================================
     # 1. 5G Core Network (AMF, SMF, UPF, MySQL)
     # ==========================================================

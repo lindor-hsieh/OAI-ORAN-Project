@@ -18,7 +18,7 @@ GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC
 # ==========================================
 # 1. 核心清理與 Docker 網路環境修復
 # ==========================================
-echo -e "${CYAN}[1/6] Clean Up...${NC}"
+echo -e "${CYAN}[1/8] Clean Up...${NC}"
 
 # 先停止所有容器，避免網路介面被佔用
 $DOCKER_COMPOSE -f $COMPOSE_FILE down 2>/dev/null
@@ -49,7 +49,7 @@ sudo ip link set $IFACE_NAME mtu 1350
 # ==========================================
 # 2. 設定 Macvlan 與魔法路由 (解決跨機連線問題)
 # ==========================================
-echo -e "${CYAN}[2/6] Configuring Macvlan Bridge & Magic Route...${NC}"
+echo -e "${CYAN}[2/8] Configuring Macvlan Bridge & Magic Route...${NC}"
 sudo ip link set $IFACE_NAME up
 
 # 清除實體網卡上的 IP，避免雙網卡衝突
@@ -68,13 +68,40 @@ sudo ip route replace 192.168.88.128/25 dev macvlan-br
 # ==========================================
 # 3. 啟動 O-RAN 核心網與 Donor-CU
 # ==========================================
-echo -e "${CYAN}[3/6] Starting OAI Core & Donor-CU...${NC}"
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d mysql oai-amf oai-smf oai-upf oai-ext-dn oai-flexric
+echo -e "${CYAN}[3/8] Starting OAI Core, FlexRIC & MongoDB...${NC}"
+$DOCKER_COMPOSE -f $COMPOSE_FILE up -d mysql oai-amf oai-smf oai-upf oai-ext-dn oai-flexric mongodb
+
+# 等待 MongoDB healthy 再繼續
+echo -e "${YELLOW}Waiting for MongoDB to be ready...${NC}"
+until [ "$($DOCKER_COMPOSE -f $COMPOSE_FILE ps -q mongodb | xargs docker inspect -f '{{.State.Health.Status}}' 2>/dev/null)" = "healthy" ]; do
+    echo -n "."; sleep 3
+done
+echo -e " ${GREEN}MongoDB ready${NC}"
+
 sleep 5
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-donor-cu
 echo -e "${YELLOW}Waiting for CU initialization (15s)...${NC}"
 sleep 15
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-donor-du
+
+# ==========================================
+# 4. 啟動 Python 推論伺服器 (Node 1~5)
+# ==========================================
+echo -e "${CYAN}[4/8] Starting Inference Servers (Node 1~5)...${NC}"
+$DOCKER_COMPOSE -f $COMPOSE_FILE up -d \
+    inference-node1 inference-node2 inference-node3 \
+    inference-node4 inference-node5
+sleep 3
+
+# 確認全部 ZMQ socket 已綁定
+for i in 1 2 3 4 5; do
+    STATUS=$(docker logs inference-node${i} 2>&1 | grep "已綁定" | tail -1)
+    if [ -n "$STATUS" ]; then
+        echo -e "  Node${i}: ${GREEN}ZMQ OK${NC}"
+    else
+        echo -e "  Node${i}: ${YELLOW}waiting...${NC}"
+    fi
+done
 
 # ==========================================
 # 函式：等待隧道 IP
@@ -93,7 +120,7 @@ wait_for_ip() {
 # ==========================================
 # 4. 啟動本地 Node 1 (ID: 3585)
 # ==========================================
-echo -e "${CYAN}[4/6] Launching Local Node 1...${NC}"
+echo -e "${CYAN}[5/8] Launching Local Node 1...${NC}"
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt
 wait_for_ip "rfsim5g-iab-mt" MT1_TUNNEL_IP
 
@@ -111,7 +138,7 @@ docker exec -d rfsim5g-iab-du /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/
 # ==========================================
 # 5. 啟動本地 Node 2 (ID: 3586)
 # ==========================================
-echo -e "${CYAN}[5/6] Launching Local Node 2...${NC}"
+echo -e "${CYAN}[6/8] Launching Local Node 2...${NC}"
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-2
 wait_for_ip "rfsim5g-iab-mt-2" MT2_TUNNEL_IP
 
@@ -129,7 +156,7 @@ docker exec -d rfsim5g-iab-du-2 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/et
 # ==========================================
 # 6. 最後路由與 UPF/FlexRIC 修正
 # ==========================================
-echo -e "${CYAN}[6/6] Finalizing Network & UPF/FlexRIC Routing...${NC}"
+echo -e "${CYAN}[7/8] Finalizing Network & UPF/FlexRIC Routing...${NC}"
 
 # UPF 轉發設定
 docker exec -u 0 oai-upf bash -c "sysctl -w net.ipv4.ip_forward=1 && iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
@@ -154,3 +181,38 @@ sudo iptables -A FORWARD -p sctp --dport 36421 -j ACCEPT
 sudo iptables -A FORWARD -p sctp --dport 38472 -j ACCEPT
 
 echo -e "${GREEN}PC 1 Server Setup Complete!${NC}"
+
+# ==========================================
+# 8. 啟動 xApp 容器 (等 PC 2 的 E2 node 連上後再執行)
+# ==========================================
+echo ""
+echo -e "${YELLOW}====================================================${NC}"
+echo -e "${YELLOW} [8/8] 等待 PC 2 啟動完成後，按 Enter 啟動 xApps${NC}"
+echo -e "${YELLOW} 請確認 FlexRIC log 已出現 Node 3/4/5 的 E2 Setup${NC}"
+echo -e "${CYAN}   docker logs flexric 2>&1 | grep -c 'E2 Setup'${NC}"
+echo -e "${YELLOW} (應看到 6 筆，含 Donor + Node1~5 的 DU)${NC}"
+echo -e "${YELLOW}====================================================${NC}"
+read -p "Press [Enter] to launch xApps..."
+
+$DOCKER_COMPOSE -f $COMPOSE_FILE up -d \
+    node1-l-xapp node2-l-xapp node3-l-xapp node4-l-xapp node5-l-xapp
+
+sleep 5
+
+# 閉環驗證
+echo -e "\n${CYAN}=== Closed-Loop Verification ===${NC}"
+for i in 1 2 3 4 5; do
+    ZMQ_OK=$(docker logs xapp-node${i} 2>&1 | grep -c "ZMQ send ok" 2>/dev/null || echo 0)
+    INF_OK=$(docker logs inference-node${i} 2>&1 | grep -v "ERROR\|WARNING" | grep -c "allocations" 2>/dev/null || echo 0)
+    echo -e "  Node${i}: xApp ZMQ=${ZMQ_OK}次, Inference replies=${INF_OK}次"
+done
+
+echo ""
+echo -e "${CYAN}MongoDB 寫入狀況：${NC}"
+docker exec mongodb mongosh --quiet --eval '
+["node1","node2","node3","node4","node5"].forEach(n => {
+    const c = db.getSiblingDB("iab_xapp")[n+"_experiences"].countDocuments();
+    print("  " + n + ": " + c + " 筆");
+})' 2>/dev/null || echo "  (MongoDB 查詢失敗)"
+
+echo -e "\n${GREEN}All done! 閉環系統已啟動。${NC}"

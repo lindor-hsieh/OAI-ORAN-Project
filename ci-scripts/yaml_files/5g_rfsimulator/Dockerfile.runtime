@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     libblas3 \
     liblapack3 \
-    libz1 \
+    zlib1g \
     libyaml-cpp0.8 \
     # --- xApp 執行庫 (ZMQ + cJSON) ---
     libzmq5 \

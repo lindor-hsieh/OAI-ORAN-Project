@@ -47,6 +47,107 @@ services:
             - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/monitor/xapp_kpm_moni:/xapp_kpm_moni
             - /usr/local/lib/flexric/:/usr/local/lib/flexric/
 
+    # ==========================================================
+    # 0-a. MongoDB (FL 訓練資料持久化)
+    # ==========================================================
+    mongodb:
+        image: mongo:7.0
+        container_name: mongodb
+        restart: unless-stopped
+        ports:
+            - "27017:27017"
+        volumes:
+            - mongo_data:/data/db
+        healthcheck:
+            test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+            interval: 10s
+            timeout: 5s
+            retries: 6
+            start_period: 20s
+
+    # ==========================================================
+    # 0-b. Python 推論伺服器 (Near-RT 閉環 AI 推論)
+    # ==========================================================
+    inference-node1:
+        image: local-xapp-inference:latest
+        container_name: inference-node1
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "1"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+        volumes:
+            - /tmp:/tmp
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    inference-node2:
+        image: local-xapp-inference:latest
+        container_name: inference-node2
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "2"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+        volumes:
+            - /tmp:/tmp
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    inference-node3:
+        image: local-xapp-inference:latest
+        container_name: inference-node3
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "3"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+        volumes:
+            - /tmp:/tmp
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    inference-node4:
+        image: local-xapp-inference:latest
+        container_name: inference-node4
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "4"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+        volumes:
+            - /tmp:/tmp
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    inference-node5:
+        image: local-xapp-inference:latest
+        container_name: inference-node5
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "5"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+        volumes:
+            - /tmp:/tmp
+        command: ["python3", "main.py"]
+        restart: on-failure
+
     node1-l-xapp:
         image: custom-oai-runtime:24.04
         container_name: xapp-node1
@@ -384,3 +485,7 @@ networks:
         ipam:
             config:
                 - subnet: 192.168.72.128/26
+
+volumes:
+    mongo_data:
+        name: iab-xapp-mongo-data

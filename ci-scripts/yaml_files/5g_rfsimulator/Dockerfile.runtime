@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y \
     liblapack3 \
     libz1 \
     libyaml-cpp0.8 \
+    # --- xApp 執行庫 (ZMQ + cJSON) ---
+    libzmq5 \
+    libcjson1 \
     # --- 網路與除錯工具 (基地台與 UE 都會用到) ---
     iproute2 \
     iputils-ping \

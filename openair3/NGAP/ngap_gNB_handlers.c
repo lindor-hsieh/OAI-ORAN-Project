@@ -86,8 +86,13 @@ void ngap_handle_ng_setup_message(ngap_gNB_amf_data_t *amf_desc_p, int sctp_shut
   } else {
     LOG_A(NGAP, "Received NGSetupResponse from AMF\n");
     /* Check that at least one setup message is pending */
-    DevCheck(amf_desc_p->ngap_gNB_instance->ngap_amf_pending_nb > 0, amf_desc_p->ngap_gNB_instance->instance,
-             amf_desc_p->ngap_gNB_instance->ngap_amf_pending_nb, 0);
+    /* NOTE: Do not crash if pending_nb == 0; this can happen when a stale SCTP
+     * connection times out and delivers a duplicate NGSetupResponse after the
+     * first one already decremented the counter.  Log a warning and skip. */
+    if (amf_desc_p->ngap_gNB_instance->ngap_amf_pending_nb == 0) {
+      LOG_W(NGAP, "Received NGSetupResponse but no pending NGSetup (stale SCTP connection?), ignoring\n");
+      return 0;
+    }
 
     if (amf_desc_p->ngap_gNB_instance->ngap_amf_pending_nb > 0) {
       /* Decrease pending messages number */

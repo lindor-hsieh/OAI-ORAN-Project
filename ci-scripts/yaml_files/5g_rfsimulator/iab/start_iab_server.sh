@@ -131,6 +131,10 @@ docker exec -u 0 rfsim5g-iab-mt iptables -t nat -A POSTROUTING -o eth0 -j MASQUE
 sudo arp -s $MT1_MACVLAN_IP $MT1_MAC -i macvlan-br
 sudo ip route replace $MT1_TUNNEL_IP via $MT1_MACVLAN_IP dev macvlan-br
 
+# 動態更新 DU-1 conf 的 local_n_address 為 MT-1 實際取得的 tunnel IP
+sed -i "s|local_n_address = \"[0-9.]*\"|local_n_address = \"$MT1_TUNNEL_IP\"|" ./conf/iab_du.conf
+echo -e "  Node1 DU local_n_address updated to ${GREEN}$MT1_TUNNEL_IP${NC}"
+
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du
 sleep 3
 docker exec -d rfsim5g-iab-du /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --SCTP.local_portc 38473 --log_config.global_log_level info
@@ -148,6 +152,10 @@ MT2_MAC=$(docker exec rfsim5g-iab-mt-2 cat /sys/class/net/eth0/address)
 docker exec -u 0 rfsim5g-iab-mt-2 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 sudo arp -s $MT2_MACVLAN_IP $MT2_MAC -i macvlan-br
 sudo ip route replace $MT2_TUNNEL_IP via $MT2_MACVLAN_IP dev macvlan-br
+
+# 動態更新 DU-2 conf 的 local_n_address 為 MT-2 實際取得的 tunnel IP
+sed -i "s|local_n_address = \"[0-9.]*\"|local_n_address = \"$MT2_TUNNEL_IP\"|" ./conf/iab_du_2.conf
+echo -e "  Node2 DU local_n_address updated to ${GREEN}$MT2_TUNNEL_IP${NC}"
 
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du-2
 sleep 3
@@ -183,21 +191,76 @@ sudo iptables -A FORWARD -p sctp --dport 38472 -j ACCEPT
 echo -e "${GREEN}PC 1 Server Setup Complete!${NC}"
 
 # ==========================================
-# 8. 啟動 xApp 容器 (等 PC 2 的 E2 node 連上後再執行)
+# 函式：等待 FlexRIC 累積到指定 E2 Setup 數量
+# ==========================================
+wait_for_e2_setup_count() {
+    local EXPECTED=$1
+    local MAX_WAIT=300
+    local ELAPSED=0
+    echo -n "等待 FlexRIC E2 Setup 數量達到 ${EXPECTED}..."
+    while true; do
+        local COUNT
+        COUNT=$(docker logs flexric 2>/dev/null | grep -c "E2 SETUP-REQUEST" 2>/dev/null)
+        COUNT=${COUNT:-0}
+        if [ "${COUNT}" -ge "${EXPECTED}" ]; then
+            echo -e " ${GREEN}OK (${COUNT} setups)${NC}"
+            return 0
+        fi
+        if [ "${ELAPSED}" -ge "${MAX_WAIT}" ]; then
+            echo -e " ${RED}TIMEOUT (只有 ${COUNT}/${EXPECTED} setups)${NC}"
+            return 1
+        fi
+        sleep 3
+        ELAPSED=$((ELAPSED + 3))
+        echo -n "."
+    done
+}
+
+# ==========================================
+# 8. 啟動 xApp 容器 (自動等待對應 E2 node 連上後再執行)
 # ==========================================
 echo ""
 echo -e "${YELLOW}====================================================${NC}"
 echo -e "${YELLOW} [8/8] 等待 PC 2 啟動完成後，按 Enter 啟動 xApps${NC}"
-echo -e "${YELLOW} 請確認 FlexRIC log 已出現 Node 3/4/5 的 E2 Setup${NC}"
-echo -e "${CYAN}   docker logs flexric 2>&1 | grep -c 'E2 Setup'${NC}"
-echo -e "${YELLOW} (應看到 6 筆，含 Donor + Node1~5 的 DU)${NC}"
+echo -e "${YELLOW} 請確認 PC 2 的 start_iab_client.sh 已執行完畢${NC}"
+echo -e "${CYAN}   docker logs flexric 2>&1 | grep -c 'E2 SETUP-REQUEST'${NC}"
+echo -e "${YELLOW} (應看到 6 筆，含 Donor-CU + Node1~5 的 DU)${NC}"
 echo -e "${YELLOW}====================================================${NC}"
 read -p "Press [Enter] to launch xApps..."
 
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d \
-    node1-l-xapp node2-l-xapp node3-l-xapp node4-l-xapp node5-l-xapp
+# 確認全部 6 個 E2 Setup 都已完成再開始
+wait_for_e2_setup_count 6 || echo -e "${YELLOW}繼續嘗試啟動，請確認 PC2 節點狀態${NC}"
 
-sleep 5
+# 逐一啟動 xApp，每個都等 FlexRIC E42 Setup 回應穩定後再啟動下一個
+# 節點編號對應的最小累積 E2 Setup 數（Donor=1, DU1=2, DU2=3, DU3=4, DU4=5, DU5=6）
+declare -A NODE_E2_THRESHOLD=([1]=2 [2]=3 [3]=4 [4]=5 [5]=6)
+
+for NODE in 1 2 3 4 5; do
+    THRESHOLD=${NODE_E2_THRESHOLD[$NODE]}
+    echo -e "${YELLOW}  [Node${NODE}] 確認 E2 Setup 數量 >= ${THRESHOLD}...${NC}"
+    wait_for_e2_setup_count "${THRESHOLD}"
+
+    echo -e "${YELLOW}  啟動 xapp-node${NODE}...${NC}"
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d node${NODE}-l-xapp
+
+    # 等待 xApp 完成 E42 Setup 握手後再啟動下一個，避免 FlexRIC iApp 同時處理多個 E42 Setup Request
+    echo -n "  等待 xapp-node${NODE} E42 Setup 完成..."
+    E42_WAIT=0
+    while [ "${E42_WAIT}" -lt 30 ]; do
+        E42_COUNT=$(docker logs flexric 2>/dev/null | grep -c "E42 SETUP-RESPONSE" 2>/dev/null)
+        E42_COUNT=${E42_COUNT:-0}
+        if [ "${E42_COUNT}" -ge "${NODE}" ]; then
+            echo -e " ${GREEN}OK${NC}"
+            break
+        fi
+        sleep 2
+        E42_WAIT=$((E42_WAIT + 2))
+        echo -n "."
+    done
+    if [ "${E42_WAIT}" -ge 30 ]; then
+        echo -e " ${YELLOW}timeout，繼續下一個${NC}"
+    fi
+done
 
 # 閉環驗證
 echo -e "\n${CYAN}=== Closed-Loop Verification ===${NC}"

@@ -46,8 +46,7 @@ services:
             # [修正] 直接從宿主機的安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: >
-            /bin/bash -c "until python3 -c \"import socket,sys;s=socket.socket(socket.AF_INET,socket.SOCK_SEQPACKET,132);s.settimeout(3);r=s.connect_ex(('192.168.88.141',36421));s.close();sys.exit(0 if r==0 else 1)\" 2>/dev/null; do echo '[DU-3] Waiting for FlexRIC (192.168.88.141:36421)...'; sleep 5; done; echo '[DU-3] FlexRIC ready, starting nr-softmodem...'; exec /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time"
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
 
     # ==========================================
     # IAB Node 4 (Middle) - 連接 PC 1
@@ -95,8 +94,7 @@ services:
             # [修正] 直接從宿主機的安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: >
-            /bin/bash -c "until python3 -c \"import socket,sys;s=socket.socket(socket.AF_INET,socket.SOCK_SEQPACKET,132);s.settimeout(3);r=s.connect_ex(('192.168.88.141',36421));s.close();sys.exit(0 if r==0 else 1)\" 2>/dev/null; do echo '[DU-4] Waiting for FlexRIC (192.168.88.141:36421)...'; sleep 5; done; echo '[DU-4] FlexRIC ready, starting nr-softmodem...'; exec /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time"
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
 
     # ==========================================
     # IAB Node 5 (Right Leaf) - 連接 PC 1
@@ -144,8 +142,7 @@ services:
             # [修正] 直接從宿主機的安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: >
-            /bin/bash -c "until python3 -c \"import socket,sys;s=socket.socket(socket.AF_INET,socket.SOCK_SEQPACKET,132);s.settimeout(3);r=s.connect_ex(('192.168.88.141',36421));s.close();sys.exit(0 if r==0 else 1)\" 2>/dev/null; do echo '[DU-5] Waiting for FlexRIC (192.168.88.141:36421)...'; sleep 5; done; echo '[DU-5] FlexRIC ready, starting nr-softmodem...'; exec /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time"
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
 
     # ==========================================
     # Group A: 連接 Node 3

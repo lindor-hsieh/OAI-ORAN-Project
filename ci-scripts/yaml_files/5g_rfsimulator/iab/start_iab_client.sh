@@ -87,9 +87,11 @@ configure_and_start_du() {
     local MT_INTERNAL_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' $MT_NAME | grep '192.168.74' | head -n 1 | xargs)
     sleep 2
 
-    # [核心修正] 解決所有控制面非對稱路由問題 (CU & FlexRIC)
+    # [核心修正] 解決 F1AP 非對稱路由問題 (CU only)
+    # 注意：RIC_IP (FlexRIC) 不設 bridge 路由，讓 E2AP 走 macvlan 直接路徑
+    # FlexRIC container 無法透過 macvlan-br (192.168.88.1) 回覆 bridge IP 的封包
+    # 若設此路由，SCTP COOKIE_WAIT 會永久卡住 (macvlan host isolation 限制)
     docker exec -u 0 $DU_NAME ip route replace $SERVER_IP via 192.168.74.1 2>/dev/null
-    docker exec -u 0 $DU_NAME ip route replace $RIC_IP via 192.168.74.1 2>/dev/null
 
     # [核心修正] 讓 DU 知道資料面流量要丟給 MT (包含核心網與 UPF 網段)
     docker exec -u 0 $DU_NAME ip route replace $CN_SUBNET via $MT_INTERNAL_IP 2>/dev/null

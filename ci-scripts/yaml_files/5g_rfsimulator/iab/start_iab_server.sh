@@ -190,92 +190,17 @@ sudo iptables -A FORWARD -p sctp --dport 38472 -j ACCEPT
 
 echo -e "${GREEN}PC 1 Server Setup Complete!${NC}"
 
-# ==========================================
-# 函式：等待 FlexRIC 累積到指定 E2 Setup 數量
-# ==========================================
-wait_for_e2_setup_count() {
-    local EXPECTED=$1
-    local MAX_WAIT=300
-    local ELAPSED=0
-    echo -n "等待 FlexRIC E2 Setup 數量達到 ${EXPECTED}..."
-    while true; do
-        local COUNT
-        COUNT=$(docker logs flexric 2>/dev/null | grep -c "E2 SETUP-REQUEST" 2>/dev/null)
-        COUNT=${COUNT:-0}
-        if [ "${COUNT}" -ge "${EXPECTED}" ]; then
-            echo -e " ${GREEN}OK (${COUNT} setups)${NC}"
-            return 0
-        fi
-        if [ "${ELAPSED}" -ge "${MAX_WAIT}" ]; then
-            echo -e " ${RED}TIMEOUT (只有 ${COUNT}/${EXPECTED} setups)${NC}"
-            return 1
-        fi
-        sleep 3
-        ELAPSED=$((ELAPSED + 3))
-        echo -n "."
-    done
-}
-
-# ==========================================
-# 8. 啟動 xApp 容器 (自動等待對應 E2 node 連上後再執行)
-# ==========================================
 echo ""
-echo -e "${YELLOW}====================================================${NC}"
-echo -e "${YELLOW} [8/8] 等待 PC 2 啟動完成後，按 Enter 啟動 xApps${NC}"
-echo -e "${YELLOW} 請確認 PC 2 的 start_iab_client.sh 已執行完畢${NC}"
-echo -e "${CYAN}   docker logs flexric 2>&1 | grep -c 'E2 SETUP-REQUEST'${NC}"
-echo -e "${YELLOW} (應看到 6 筆，含 Donor-CU + Node1~5 的 DU)${NC}"
-echo -e "${YELLOW}====================================================${NC}"
-read -p "Press [Enter] to launch xApps..."
-
-# 確認全部 6 個 E2 Setup 都已完成再開始
-wait_for_e2_setup_count 6 || echo -e "${YELLOW}繼續嘗試啟動，請確認 PC2 節點狀態${NC}"
-
-# 逐一啟動 xApp，每個都等 FlexRIC E42 Setup 回應穩定後再啟動下一個
-# 節點編號對應的最小累積 E2 Setup 數（Donor=1, DU1=2, DU2=3, DU3=4, DU4=5, DU5=6）
-declare -A NODE_E2_THRESHOLD=([1]=2 [2]=3 [3]=4 [4]=5 [5]=6)
-
-for NODE in 1 2 3 4 5; do
-    THRESHOLD=${NODE_E2_THRESHOLD[$NODE]}
-    echo -e "${YELLOW}  [Node${NODE}] 確認 E2 Setup 數量 >= ${THRESHOLD}...${NC}"
-    wait_for_e2_setup_count "${THRESHOLD}"
-
-    echo -e "${YELLOW}  啟動 xapp-node${NODE}...${NC}"
-    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d node${NODE}-l-xapp
-
-    # 等待 xApp 完成 E42 Setup 握手後再啟動下一個，避免 FlexRIC iApp 同時處理多個 E42 Setup Request
-    echo -n "  等待 xapp-node${NODE} E42 Setup 完成..."
-    E42_WAIT=0
-    while [ "${E42_WAIT}" -lt 30 ]; do
-        E42_COUNT=$(docker logs flexric 2>/dev/null | grep -c "E42 SETUP-RESPONSE" 2>/dev/null)
-        E42_COUNT=${E42_COUNT:-0}
-        if [ "${E42_COUNT}" -ge "${NODE}" ]; then
-            echo -e " ${GREEN}OK${NC}"
-            break
-        fi
-        sleep 2
-        E42_WAIT=$((E42_WAIT + 2))
-        echo -n "."
-    done
-    if [ "${E42_WAIT}" -ge 30 ]; then
-        echo -e " ${YELLOW}timeout，繼續下一個${NC}"
-    fi
-done
-
-# 閉環驗證
-echo -e "\n${CYAN}=== Closed-Loop Verification ===${NC}"
-for i in 1 2 3 4 5; do
-    ZMQ_OK=$(docker logs xapp-node${i} 2>&1 | grep -c "ZMQ send ok" 2>/dev/null || echo 0)
-    INF_OK=$(docker logs inference-node${i} 2>&1 | grep -v "ERROR\|WARNING" | grep -c "allocations" 2>/dev/null || echo 0)
-    echo -e "  Node${i}: xApp ZMQ=${ZMQ_OK}次, Inference replies=${INF_OK}次"
-done
-
-echo ""
-echo -e "${CYAN}MongoDB 寫入狀況：${NC}"
-docker exec mongodb mongosh --quiet --eval '
-["node1","node2","node3","node4","node5"].forEach(n => {
-    const c = db.getSiblingDB("iab_xapp")[n+"_experiences"].countDocuments();
-    print("  " + n + ": " + c + " 筆");
-})' 2>/dev/null || echo "  (MongoDB 查詢失敗)"
-
-echo -e "\n${GREEN}All done! 閉環系統已啟動。${NC}"
+echo -e "${CYAN}====================================================${NC}"
+echo -e "${CYAN} 基礎設施已就緒，請手動啟動 xApp${NC}"
+echo -e "${CYAN}====================================================${NC}"
+echo -e " 1. 確認 PC 2 的 start_iab_client.sh 已執行完畢"
+echo -e " 2. 確認所有 6 個 E2 SETUP 已完成："
+echo -e "${YELLOW}    docker logs flexric 2>&1 | grep -c 'E2 SETUP-REQUEST'${NC}"
+echo -e " 3. 逐一啟動 xApp（建議每個間隔 2~3 秒）："
+echo -e "${YELLOW}    docker compose -f $COMPOSE_FILE up -d node1-l-xapp${NC}"
+echo -e "${YELLOW}    docker compose -f $COMPOSE_FILE up -d node2-l-xapp${NC}"
+echo -e "${YELLOW}    docker compose -f $COMPOSE_FILE up -d node3-l-xapp${NC}"
+echo -e "${YELLOW}    docker compose -f $COMPOSE_FILE up -d node4-l-xapp${NC}"
+echo -e "${YELLOW}    docker compose -f $COMPOSE_FILE up -d node5-l-xapp${NC}"
+echo -e "${CYAN}====================================================${NC}"

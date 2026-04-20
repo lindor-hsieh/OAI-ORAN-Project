@@ -1,10 +1,11 @@
 """
-main.py — Local xApp Python 推論伺服器入口
+main.py — Local xApp Python 推論伺服器入口 (Phase 4 DRL 版本)
 
 透過環境變數決定節點，5 個容器共用同一個 image：
   NODE_ID   : IAB Node 編號 (1~5)，必填
   MONGO_URI : MongoDB 連線位址，預設 mongodb://localhost:27017
   MONGO_DB  : MongoDB 資料庫名稱，預設 iab_xapp
+  MODEL_DIR : DRL 模型儲存目錄，預設 /app/models
 
 ZMQ endpoint 由 NODE_ID 自動推導：
   ipc:///tmp/zmq_node{NODE_ID}_inference.ipc
@@ -35,6 +36,7 @@ def main() -> None:
         zmq_endpoint=f"ipc:///tmp/zmq_node{node_id}_inference.ipc",
         mongo_uri=os.getenv("MONGO_URI", "mongodb://localhost:27017"),
         mongo_db=os.getenv("MONGO_DB", "iab_xapp"),
+        model_dir=os.getenv("MODEL_DIR", "/app/models"),
     )
     server.run()
 

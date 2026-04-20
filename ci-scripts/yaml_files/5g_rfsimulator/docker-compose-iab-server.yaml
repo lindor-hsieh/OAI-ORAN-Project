@@ -79,8 +79,11 @@ services:
             NODE_ID: "1"
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
         volumes:
             - /tmp:/tmp
+            # 模型持久化：容器重啟後繼續使用已訓練的權重
+            - inference_models_node1:/app/models
         command: ["python3", "main.py"]
         restart: on-failure
 
@@ -95,8 +98,10 @@ services:
             NODE_ID: "2"
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
         volumes:
             - /tmp:/tmp
+            - inference_models_node2:/app/models
         command: ["python3", "main.py"]
         restart: on-failure
 
@@ -111,8 +116,10 @@ services:
             NODE_ID: "3"
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
         volumes:
             - /tmp:/tmp
+            - inference_models_node3:/app/models
         command: ["python3", "main.py"]
         restart: on-failure
 
@@ -127,8 +134,10 @@ services:
             NODE_ID: "4"
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
         volumes:
             - /tmp:/tmp
+            - inference_models_node4:/app/models
         command: ["python3", "main.py"]
         restart: on-failure
 
@@ -143,8 +152,10 @@ services:
             NODE_ID: "5"
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
         volumes:
             - /tmp:/tmp
+            - inference_models_node5:/app/models
         command: ["python3", "main.py"]
         restart: on-failure
 
@@ -489,3 +500,14 @@ networks:
 volumes:
     mongo_data:
         name: iab-xapp-mongo-data
+    # DRL 模型持久化 volume：各節點獨立儲存，容器重啟後繼續訓練
+    inference_models_node1:
+        name: iab-xapp-model-node1
+    inference_models_node2:
+        name: iab-xapp-model-node2
+    inference_models_node3:
+        name: iab-xapp-model-node3
+    inference_models_node4:
+        name: iab-xapp-model-node4
+    inference_models_node5:
+        name: iab-xapp-model-node5

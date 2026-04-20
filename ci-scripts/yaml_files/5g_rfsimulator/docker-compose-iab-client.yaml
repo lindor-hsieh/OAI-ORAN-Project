@@ -37,7 +37,7 @@ services:
             iab_internal_net:
                 ipv4_address: 192.168.74.20
         ports:
-            - "127.0.0.1:9091:9091"
+            - "127.0.0.1:9091:9090"
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
         volumes:
@@ -45,7 +45,7 @@ services:
             - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
-            # [修正] 直接從宿主機的安裝目錄掛載
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
         command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4046 --telnetsrv --log_config.global_log_options level,nocolor,time
@@ -87,7 +87,7 @@ services:
             iab_internal_net:
                 ipv4_address: 192.168.74.21
         ports:
-            - "127.0.0.1:9092:9092"
+            - "127.0.0.1:9092:9090"
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
         volumes:
@@ -95,7 +95,7 @@ services:
             - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
-            # [修正] 直接從宿主機的安裝目錄掛載
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
         command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4047 --telnetsrv --log_config.global_log_options level,nocolor,time
@@ -137,7 +137,7 @@ services:
             iab_internal_net:
                 ipv4_address: 192.168.74.22
         ports:
-            - "127.0.0.1:9093:9093"
+            - "127.0.0.1:9093:9090"
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
         volumes:
@@ -145,7 +145,7 @@ services:
             - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
-            # [修正] 直接從宿主機的安裝目錄掛載
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
         command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --telnetsrv --log_config.global_log_options level,nocolor,time

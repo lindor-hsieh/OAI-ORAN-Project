@@ -63,18 +63,19 @@ check_fallback() {
     docker logs "xapp-node${node}" 2>&1 2>/dev/null | grep -c "fallback" || echo "0"
 }
 
-# channelmod telnet 連線（Node 3/4/5 在 PC2，透過 SSH 檢查）
+# channelmod 連線（SSH 到 PC2，用 /dev/tcp 繞過 nc 不存在的問題）
 check_channelmod() {
-    local port=$1
+    local node=$1
+    local container="rfsim5g-iab-du-${node}"
     ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} \
-        "echo 'channelmod show config' | nc -q1 127.0.0.1 $port 2>/dev/null | grep -q ." 2>/dev/null \
+        "docker exec $container bash -c 'exec 3<>/dev/tcp/127.0.0.1/9090 && echo \"channelmod show config\" >&3 && sleep 0.5 && cat <&3' 2>/dev/null | grep -q ." 2>/dev/null \
         && echo "OK" || echo "NO"
 }
 
 # ── 主迴圈 ──────────────────────────────────────────────────
 
-PREV_EXP_JSON=""
-declare -A PREV_EXP
+PREV_EXP_FILE="/tmp/monitor_drl_prev_exp.json"
+echo "{}" > "$PREV_EXP_FILE"
 
 while true; do
     clear
@@ -109,18 +110,23 @@ while true; do
 
     EXP_JSON=$(check_experiences)
     if [ -n "$EXP_JSON" ]; then
-        python3 - <<EOF
-import json
-data = json.loads('''$EXP_JSON''')
-prev = json.loads('''${PREV_EXP_JSON:-{}}''') if '''${PREV_EXP_JSON:-{}}''' != '{}' else {}
-for k in sorted(data.keys()):
-    v = data[k]
-    node_num = k[1]
-    delta = v - prev.get(k, 0)
-    delta_str = f'+{delta}' if delta >= 0 else str(delta)
-    print(f'  Node{node_num}: {v:>7,} 筆  ({delta_str}/刷新)')
-EOF
-        PREV_EXP_JSON="$EXP_JSON"
+        echo "$EXP_JSON" | python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read().strip())
+    with open('$PREV_EXP_FILE') as f:
+        prev = json.loads(f.read())
+    for k in sorted(data.keys()):
+        v = data[k]
+        node_num = k[1]
+        delta = v - prev.get(k, 0)
+        delta_str = f'+{delta}' if delta >= 0 else str(delta)
+        print(f'  Node{node_num}: {v:>7,} 筆  ({delta_str}/刷新)')
+    with open('$PREV_EXP_FILE', 'w') as f:
+        f.write(json.dumps(data))
+except Exception as e:
+    print(f'  (解析失敗: {e})')
+"
     else
         echo -e "  ${RED}(MongoDB 未回應，確認 mongodb 容器狀態)${NC}"
     fi
@@ -154,16 +160,12 @@ EOF
 
     # ── channelmod 連線 ───────────────────────────────────────
     echo -e "${YELLOW}── channelmod 連線 ──────────────────────────────────────────${NC}"
-    declare -A CM_PORTS=([3]=9091 [4]=9092 [5]=9093)
-    ALL_CM_OK=true
     for node in 3 4 5; do
-        port=${CM_PORTS[$node]}
-        CM=$(check_channelmod "$port")
+        CM=$(check_channelmod "$node")
         if [ "$CM" = "OK" ]; then
-            echo -e "  Node${node} (:${port}): ${GREEN}OK ✓${NC}"
+            echo -e "  Node${node} (rfsim5g-iab-du-${node}): ${GREEN}OK ✓${NC}"
         else
-            echo -e "  Node${node} (:${port}): ${RED}NO ✗ (DU 未加 --telnetsrv？)${NC}"
-            ALL_CM_OK=false
+            echo -e "  Node${node} (rfsim5g-iab-du-${node}): ${RED}NO ✗ (libtelnetsrv.so 未安裝或 DU 尚未就緒)${NC}"
         fi
     done
     echo ""

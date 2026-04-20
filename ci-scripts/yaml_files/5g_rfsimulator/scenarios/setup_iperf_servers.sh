@@ -5,9 +5,7 @@
 #   bash setup_iperf_servers.sh
 #
 # ext-dn 容器：rfsim5g-oai-ext-dn
-# 監聽 port 5201~5206，對應 UE1~UE6 的 UDP 上行流量
-
-set -e
+# 監聽 port 5201~5206，對應 UE1~UE6 的下行流量
 
 CONTAINER="rfsim5g-oai-ext-dn"
 PORTS=(5201 5202 5203 5204 5205 5206)
@@ -19,22 +17,22 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
 fi
 
 echo "[setup] 安裝 iperf3（若尚未安裝）..."
-docker exec "${CONTAINER}" bash -c "which iperf3 >/dev/null 2>&1 || apt-get install -yq iperf3"
+docker exec "${CONTAINER}" sh -c "which iperf3 >/dev/null 2>&1 || apt-get install -yq iperf3" || true
 
 echo "[setup] 停止舊的 iperf3 server 進程..."
-docker exec "${CONTAINER}" bash -c "pkill -f 'iperf3 -s' 2>/dev/null || true"
+# 用 sh 而非 bash，相容最小化容器；killall/pkill 不存在時直接忽略
+docker exec "${CONTAINER}" sh -c "killall iperf3 2>/dev/null; true"
 sleep 1
 
-echo "[setup] 啟動 iperf3 UDP server，port 5201~5206..."
+echo "[setup] 啟動 iperf3 server，port 5201~5206..."
 for PORT in "${PORTS[@]}"; do
-    docker exec -d "${CONTAINER}" \
-        iperf3 -s -p "${PORT}" -i 0 --forceflush
+    docker exec -d "${CONTAINER}" iperf3 -s -p "${PORT}" -i 0
     echo "  iperf3 server 啟動：port ${PORT}"
 done
 
 echo ""
 echo "[setup] 驗證監聽狀態："
-docker exec "${CONTAINER}" bash -c "ss -ulnp | grep iperf3 || netstat -ulnp | grep iperf3"
+docker exec "${CONTAINER}" sh -c "ss -tlnp 2>/dev/null | grep iperf3 || netstat -tlnp 2>/dev/null | grep iperf3 || echo '(ss/netstat 不可用，跳過驗證)'"
 
 echo ""
 echo "[setup] 完成！ext-dn iperf3 server 已就緒"

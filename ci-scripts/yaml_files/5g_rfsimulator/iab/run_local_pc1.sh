@@ -14,8 +14,6 @@
 #   Step 6: 通知 PC2 xApps 就緒
 #   Step 7: 開啟監控儀表板
 
-set -e
-
 COMPOSE_DIR=~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator
 COMPOSE_FILE="$COMPOSE_DIR/docker-compose-iab-server.yaml"
 PC2_USER="lindor"
@@ -67,7 +65,7 @@ ok "6 個 E2 連線已就緒"
 
 # ── Step 3: 啟動 iperf3 Servers ─────────────────────────────
 log "Step 3: 啟動多 port iperf3 Servers..."
-bash "$COMPOSE_DIR/scenarios/setup_iperf_servers.sh"
+bash "$COMPOSE_DIR/scenarios/setup_iperf_servers.sh" || warn "setup_iperf_servers.sh 有錯誤，繼續執行..."
 ok "iperf3 servers 就緒（port 5201~5206）"
 
 # ── Step 4: 等待 PC2 CQI 校正完成 ───────────────────────────

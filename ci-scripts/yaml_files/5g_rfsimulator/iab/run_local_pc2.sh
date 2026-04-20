@@ -14,8 +14,6 @@
 #   Step 5: 等待 PC1 xApps 就緒
 #   Step 6: 啟動動態流量場景（Scenario D）
 
-set -e
-
 COMPOSE_DIR=~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator
 SCENARIO_DIR="$COMPOSE_DIR/scenarios"
 PC1_USER="lindor"

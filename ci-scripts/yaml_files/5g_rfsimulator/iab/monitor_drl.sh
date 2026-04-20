@@ -63,13 +63,21 @@ check_fallback() {
     docker logs "xapp-node${node}" 2>&1 2>/dev/null | grep -c "fallback" || echo "0"
 }
 
-# channelmod 連線（SSH 到 PC2，用 /dev/tcp 繞過 nc 不存在的問題）
+# channelmod 連線
+# Node 1 (9089) / Node 2 (9090)：PC1 本機，直接查
+# Node 3 (9091) / Node 4 (9092) / Node 5 (9093)：SSH 到 PC2 容器內查
 check_channelmod() {
     local node=$1
+    local port=$((9088 + node))   # node1→9089, node2→9090, node3→9091, node4→9092, node5→9093
     local container="rfsim5g-iab-du-${node}"
-    ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} \
-        "docker exec $container bash -c 'exec 3<>/dev/tcp/127.0.0.1/9090 && echo \"channelmod show config\" >&3 && sleep 0.5 && cat <&3' 2>/dev/null | grep -q ." 2>/dev/null \
-        && echo "OK" || echo "NO"
+    if [ "$node" -le 2 ]; then
+        bash -c "exec 3<>/dev/tcp/127.0.0.1/${port} && echo 'channelmod show config' >&3 && sleep 0.5 && cat <&3" 2>/dev/null \
+            | grep -q . && echo "OK" || echo "NO"
+    else
+        ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} \
+            "docker exec $container bash -c 'exec 3<>/dev/tcp/127.0.0.1/${port} && echo \"channelmod show config\" >&3 && sleep 0.5 && cat <&3' 2>/dev/null | grep -q ." 2>/dev/null \
+            && echo "OK" || echo "NO"
+    fi
 }
 
 # ── 主迴圈 ──────────────────────────────────────────────────
@@ -160,12 +168,13 @@ except Exception as e:
 
     # ── channelmod 連線 ───────────────────────────────────────
     echo -e "${YELLOW}── channelmod 連線 ──────────────────────────────────────────${NC}"
-    for node in 3 4 5; do
+    for node in 1 2 3 4 5; do
         CM=$(check_channelmod "$node")
+        port=$((9088 + node))
         if [ "$CM" = "OK" ]; then
-            echo -e "  Node${node} (rfsim5g-iab-du-${node}): ${GREEN}OK ✓${NC}"
+            echo -e "  Node${node} (:${port}): ${GREEN}OK ✓${NC}"
         else
-            echo -e "  Node${node} (rfsim5g-iab-du-${node}): ${RED}NO ✗ (libtelnetsrv.so 未安裝或 DU 尚未就緒)${NC}"
+            echo -e "  Node${node} (:${port}): ${RED}NO ✗${NC}"
         fi
     done
     echo ""

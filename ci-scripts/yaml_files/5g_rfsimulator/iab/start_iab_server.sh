@@ -137,7 +137,7 @@ echo -e "  Node1 DU local_n_address updated to ${GREEN}$MT1_TUNNEL_IP${NC}"
 
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du
 sleep 3
-docker exec -d rfsim5g-iab-du /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --SCTP.local_portc 38473 --telnetsrv --telnetsrv.listenport 9089 --log_config.global_log_level info
+docker exec -d rfsim5g-iab-du /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --SCTP.local_portc 38473 --telnetsrv --log_config.global_log_level info
 
 # ==========================================
 # 5. 啟動本地 Node 2 (ID: 3586)
@@ -159,7 +159,7 @@ echo -e "  Node2 DU local_n_address updated to ${GREEN}$MT2_TUNNEL_IP${NC}"
 
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-du-2
 sleep 3
-docker exec -d rfsim5g-iab-du-2 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --SCTP.local_portc 38474 --telnetsrv --telnetsrv.listenport 9090 --log_config.global_log_level info
+docker exec -d rfsim5g-iab-du-2 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --SCTP.local_portc 38474 --telnetsrv --log_config.global_log_level info
 
 # ==========================================
 # 6. 最後路由與 UPF/FlexRIC 修正

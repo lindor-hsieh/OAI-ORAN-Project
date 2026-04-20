@@ -48,7 +48,7 @@ services:
             # [修正] 直接從宿主機的安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4046 --telnetsrv --telnetsrv.listenport 9091 --log_config.global_log_options level,nocolor,time
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4046 --telnetsrv --log_config.global_log_options level,nocolor,time
 
     # ==========================================
     # IAB Node 4 (Middle) - 連接 PC 1
@@ -98,7 +98,7 @@ services:
             # [修正] 直接從宿主機的安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4047 --telnetsrv --telnetsrv.listenport 9092 --log_config.global_log_options level,nocolor,time
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4047 --telnetsrv --log_config.global_log_options level,nocolor,time
 
     # ==========================================
     # IAB Node 5 (Right Leaf) - 連接 PC 1
@@ -148,7 +148,7 @@ services:
             # [修正] 直接從宿主機的安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --telnetsrv --telnetsrv.listenport 9093 --log_config.global_log_options level,nocolor,time
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --telnetsrv --log_config.global_log_options level,nocolor,time
 
     # ==========================================
     # Group A: 連接 Node 3

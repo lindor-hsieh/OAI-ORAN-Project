@@ -2,14 +2,14 @@
 # PC 2: IAB Client Script (Based on User's Successful Logic + Macvlan Prep)
 
 COMPOSE_FILE="docker-compose-iab-client.yaml"
-IFACE_NAME="enxc84d44350008" 
+IFACE_NAME="enxc84d44350008"
 
 # IP 設定
 CLIENT_IP="192.168.88.2"
-SERVER_IP="192.168.88.1"     
-CN_SUBNET="192.168.71.0/24" 
-UE_SUBNET="12.1.1.0/24" 
-UPF_DN_IP="192.168.72.135"   
+SERVER_IP="192.168.88.1"
+CN_SUBNET="192.168.71.0/24"
+UE_SUBNET="12.1.1.0/24"
+UPF_DN_IP="192.168.72.135"
 
 # DU 內部 IP
 DU3_IP="192.168.74.20"
@@ -18,6 +18,11 @@ DU5_IP="192.168.74.22"
 
 RIC_IP="192.168.88.141"
 DN_SUBNET="192.168.72.0/24" # UPF 所在的資料網段
+
+# PC1 SSH 設定（用於自動執行 CU magic commands，省去手動複製貼上）
+PC1_USER="lindor"
+PC1_IP="192.168.88.1"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes"
 
 if docker compose version &> /dev/null; then DOCKER_COMPOSE="docker compose"; else DOCKER_COMPOSE="docker-compose"; fi
 
@@ -28,8 +33,24 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 DONE_NODE3=0; DONE_NODE4=0; DONE_NODE5=0
-# 初始化即包含清空指令，確保魔法指令執行時先歸零
+# fallback 用：若 SSH 不通，仍累積指令供手動貼上
 CU_MAGIC_COMMANDS="docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT"
+SSH_AVAILABLE=false
+
+# 檢查 SSH 連線是否可用
+if ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; then
+    SSH_AVAILABLE=true
+    echo -e "${GREEN}[SSH] PC1 SSH 連線可用，CU magic commands 將自動執行${NC}"
+    # 先清空 OUTPUT NAT table
+    ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} \
+        "docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT" 2>/dev/null \
+        && echo -e "${GREEN}[SSH] OUTPUT NAT table 已清空${NC}" \
+        || echo -e "${YELLOW}[SSH] 清空 NAT table 失敗，請確認 rfsim5g-donor-cu 已啟動${NC}"
+else
+    echo -e "${YELLOW}[SSH] 無法連線 PC1，將改為印出 CU magic commands 供手動執行${NC}"
+    echo -e "${YELLOW}[SSH] 若要啟用自動模式，請在 PC2 執行：${NC}"
+    echo -e "${CYAN}       ssh-copy-id ${PC1_USER}@${PC1_IP}${NC}"
+fi
 
 echo -e "${CYAN}[0/5] Loading Kernel Modules & Macvlan Prep...${NC}"
 sudo modprobe sctp
@@ -61,8 +82,15 @@ configure_and_start_du() {
     
     local MT_TUNNEL_IP=$(docker exec $MT_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
     
-    # 這裡的魔法指令是給 PC 1 執行的，腳本結尾會印出來
-    CU_MAGIC_COMMANDS+="\ndocker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP"
+    # CU magic command：在 donor-cu 容器加 DNAT 規則，讓回程封包能找到 MT tunnel IP
+    local CU_CMD="docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP"
+    CU_MAGIC_COMMANDS+="\n${CU_CMD}"
+
+    if [ "$SSH_AVAILABLE" = true ]; then
+        ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "$CU_CMD" 2>/dev/null \
+            && echo -e "   ${GREEN}[SSH] CU DNAT rule applied: $DU_DOCKER_IP → $MT_TUNNEL_IP${NC}" \
+            || echo -e "   ${RED}[SSH] 套用失敗，請手動執行：${CU_CMD}${NC}"
+    fi
 
     docker exec -u 0 $MT_NAME sysctl -w net.ipv4.ip_forward=1 >/dev/null
     docker exec -u 0 $MT_NAME iptables -t nat -F PREROUTING
@@ -227,6 +255,10 @@ run_benchmarks() {
 # ==========================================
 # 主流程 (維持原邏輯)
 # ==========================================
+# --no-benchmark：跳過互動式 read 與 benchmark（供 run_phase4_pc2.sh 自動呼叫）
+NO_BENCHMARK=false
+for arg in "$@"; do [ "$arg" = "--no-benchmark" ] && NO_BENCHMARK=true; done
+
 echo -e "${CYAN}[1/5] Host Network Prep...${NC}"
 sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
@@ -263,14 +295,25 @@ $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-end-ue-1 rfsim5g-end-ue-2 rfsim5g
 for i in {1..6}; do wait_for_ue "rfsim5g-end-ue-$i"; done
 
 echo -e "\n${YELLOW}====================================================${NC}"
-echo -e "${YELLOW}[ACTION REQUIRED] FINAL ROUTING FIX ON PC 1 (SERVER)${NC}"
-echo -e "${CYAN}${CU_MAGIC_COMMANDS}${NC}"
+if [ "$SSH_AVAILABLE" = true ]; then
+    echo -e "${GREEN}[AUTO] CU magic commands 已透過 SSH 自動套用至 PC1 ✓${NC}"
+    echo -e "${YELLOW}驗證指令（在 PC1 執行）：${NC}"
+    echo -e "${CYAN}docker logs flexric 2>&1 | grep -c 'E2 SETUP-REQUEST'  # 預期: 6${NC}"
+else
+    echo -e "${YELLOW}[ACTION REQUIRED] FINAL ROUTING FIX ON PC 1 (SERVER)${NC}"
+    echo -e "${CYAN}$(echo -e "$CU_MAGIC_COMMANDS")${NC}"
+fi
 echo -e "${YELLOW}====================================================${NC}"
+
+if [ "$NO_BENCHMARK" = true ]; then
+    echo -e "\n${GREEN}IAB Client - All 6 UEs Ready! (benchmark skipped, run iab_perf_test.sh separately)${NC}"
+    exit 0
+fi
 
 read -p "Press [Enter] to do performance tests..."
 
 echo -e "\n${CYAN}[5/5] Running Performance Benchmarks...${NC}"
-sleep 2 
+sleep 2
 for i in {1..6}; do run_benchmarks "rfsim5g-end-ue-$i"; done
 
 # 彙整報告

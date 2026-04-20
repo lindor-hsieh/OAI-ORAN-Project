@@ -2,7 +2,7 @@
 traffic_scenario.py — UE 流量場景控制器（DRL 訓練用）
 
 部署環境：在 PC 2 執行
-  - 控制 6 個 UE 容器的 iperf3 上行流量（UE → ext-dn at 192.168.72.135）
+  - 控制 6 個 UE 容器的 iperf3 下行流量（ext-dn → UE，-R reverse，填滿 gNB DL buffer）
   - 透過 channelmod telnet 改變各 DU 對 UE 的通道條件（CQI）
   - 場景提供多樣化的 (BSR, CQI) 組合，驅動 DRL 訓練
 
@@ -116,8 +116,10 @@ def _get_ue_ip(container: str) -> Optional[str]:
 
 def start_iperf_client(ue: UEConfig) -> bool:
     """
-    在 UE 容器中啟動 iperf3 UDP 上行客戶端（UE → ext-dn）。
+    在 UE 容器中啟動 iperf3 UDP 下行客戶端（ext-dn → UE，-R reverse mode）。
 
+    使用 -R 讓 ext-dn server 向 UE 推送資料，產生 DL 流量讓 gNB DL buffer 有積壓，
+    使 dl_buffer_info > 0，驅動 DRL reward 計算。
     每次呼叫前先停止舊的 iperf3 進程，確保以新的頻寬參數重新啟動。
     """
     stop_iperf_client(ue)
@@ -132,6 +134,7 @@ def start_iperf_client(ue: UEConfig) -> bool:
         "iperf3",
         "-c", EXT_DN_IP,
         "-u",                           # UDP
+        "-R",                           # reverse: server→UE (DL), fills gNB DL buffer
         "-b", f"{ue.bandwidth_mbps:.0f}M",
         "-t", str(IPERF_DURATION),
         "-p", str(ue.iperf_port),

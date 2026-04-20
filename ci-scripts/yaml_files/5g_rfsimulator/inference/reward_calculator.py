@@ -85,7 +85,9 @@ def compute_reward(
         rnti = int(ue.get("rnti", 0))
         bsr  = max(float(ue.get("bsr", 0)), 0.0)
         cqi  = int(ue.get("wb_cqi", 7))
-        cqi  = max(0, min(15, cqi))       # 夾緊至合法範圍
+        # CQI=0 in OAI means "not yet measured"; treat as min valid CQI=1
+        # to avoid collapsing throughput reward to 0 during warm-up
+        cqi  = max(1, min(15, cqi))
         prb  = float(alloc_map.get(rnti, 1))
 
         # 估計吞吐量：頻譜效率 × 分配 PRB，正規化至 [0, 1]
@@ -145,7 +147,7 @@ def compute_reward_breakdown(
         rnti = int(ue.get("rnti", 0))
         bsr  = max(float(ue.get("bsr", 0)), 0.0)
         cqi  = int(ue.get("wb_cqi", 7))
-        cqi  = max(0, min(15, cqi))
+        cqi  = max(1, min(15, cqi))
         prb  = float(alloc_map.get(rnti, 1))
 
         eff = CQI_TO_EFFICIENCY[cqi]

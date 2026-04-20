@@ -127,6 +127,10 @@ class ChannelModController:
         """顯示目前 channelmod 設定（用於除錯/確認）。"""
         return self._send_command("channelmod show config")
 
+    def show_current(self) -> str:
+        """列出所有已載入的 channel model 及其索引（用於確認正確索引）。"""
+        return self._send_command("channelmod show current")
+
     def show_params(self, ue_id: int) -> str:
         """顯示指定 UE 的 channelmod 參數。"""
         return self._send_command(f"channelmod show params {ue_id}")
@@ -142,8 +146,8 @@ class ChannelModController:
         Returns:
             True 表示指令送達（不代表 OAI 成功套用）。
         """
-        resp = self._send_command(f"channelmod modify {ue_id} path_loss_dB {loss_db:.1f}")
-        ok = "OK" in resp or resp.strip() != ""
+        resp = self._send_command(f"channelmod modify {ue_id} ploss {loss_db:.1f}")
+        ok = len(resp.strip()) > 0
         log.info("set_path_loss ue=%d loss=%.1f dB → %s", ue_id, loss_db, "ok" if ok else "no-resp")
         return ok
 
@@ -156,7 +160,7 @@ class ChannelModController:
             noise_db : 雜訊功率 dB，OAI 預設 -50，越高 SNR 越低
         """
         resp = self._send_command(f"channelmod modify {ue_id} noise_power_dB {noise_db:.1f}")
-        ok = "OK" in resp or resp.strip() != ""
+        ok = len(resp.strip()) > 0
         log.info("set_noise_power ue=%d noise=%.1f dB → %s", ue_id, noise_db, "ok" if ok else "no-resp")
         return ok
 

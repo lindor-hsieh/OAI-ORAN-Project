@@ -437,6 +437,14 @@ class InferenceServer:
                     payload: dict[str, Any] = json.loads(raw)
                     ues: list[dict[str, Any]] = payload.get("ues", [])
 
+                    # ── 狀態 debug log（每 500 次）────────────────────────
+                    if self._total_inferences % 500 == 0 and ues:
+                        ue_summary = " ".join(
+                            f"rnti={u.get('rnti',0)} bsr={u.get('bsr',0)} cqi={u.get('wb_cqi',0)}"
+                            for u in ues
+                        )
+                        self._log.info("STATE[%d] %s", self._total_inferences, ue_summary)
+
                     # ── 計算上一步的獎勵並寫入 MongoDB ────────────────────
                     if (
                         self._prev_ues is not None

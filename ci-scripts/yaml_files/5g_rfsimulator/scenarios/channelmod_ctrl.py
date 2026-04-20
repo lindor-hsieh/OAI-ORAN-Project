@@ -8,7 +8,7 @@ OAI telnetsrv 接受 channelmod 指令：
 
 key parameters:
   path_loss_dB    : 信號路徑損耗（越高 → SNR 越低 → CQI 越低）
-  noise_power_dBm : 附加雜訊功率（越高 → SNR 越低 → CQI 越低）
+  noise_power_dB  : 附加雜訊功率（越高 → SNR 越低 → CQI 越低）
   max_Doppler     : 都卜勒頻率 (Hz)，增加時變通道效果
 
 path_loss_dB → 預計 wb_cqi 對照表（需依實際環境校正）：
@@ -147,17 +147,17 @@ class ChannelModController:
         log.info("set_path_loss ue=%d loss=%.1f dB → %s", ue_id, loss_db, "ok" if ok else "no-resp")
         return ok
 
-    def set_noise_power(self, ue_id: int, noise_dbm: float) -> bool:
+    def set_noise_power(self, ue_id: int, noise_db: float) -> bool:
         """
         設定附加雜訊功率（輔助旋鈕，與 path_loss_dB 搭配使用）。
 
         Args:
-            ue_id     : UE 連線索引 (0-based)
-            noise_dbm : 雜訊功率 dBm，建議範圍 [-120, -70]
+            ue_id    : UE 連線索引 (0-based)
+            noise_db : 雜訊功率 dB，OAI 預設 -50，越高 SNR 越低
         """
-        resp = self._send_command(f"channelmod modify {ue_id} noise_power_dBm {noise_dbm:.1f}")
+        resp = self._send_command(f"channelmod modify {ue_id} noise_power_dB {noise_db:.1f}")
         ok = "OK" in resp or resp.strip() != ""
-        log.info("set_noise_power ue=%d noise=%.1f dBm → %s", ue_id, noise_dbm, "ok" if ok else "no-resp")
+        log.info("set_noise_power ue=%d noise=%.1f dB → %s", ue_id, noise_db, "ok" if ok else "no-resp")
         return ok
 
     def set_doppler(self, ue_id: int, doppler_hz: float) -> bool:
@@ -182,9 +182,9 @@ class ChannelModController:
         return self.set_path_loss(ue_id, loss)
 
     def reset_channel(self, ue_id: int) -> None:
-        """恢復理想通道（path_loss=0, noise=-150 dBm）。"""
+        """恢復理想通道（path_loss=0, noise_power_dB=-50，即 OAI 預設值）。"""
         self.set_path_loss(ue_id, 0.0)
-        self.set_noise_power(ue_id, -150.0)
+        self.set_noise_power(ue_id, -50.0)
         log.info("reset_channel ue=%d → ideal", ue_id)
 
     # -------------------------------------------------------------------------

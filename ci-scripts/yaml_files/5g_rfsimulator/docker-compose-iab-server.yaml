@@ -418,6 +418,7 @@ services:
         ports:
             - "4044:4044/udp"
             - "4044:4044/tcp"
+            - "127.0.0.1:9089:9089"   # Node 1 DU telnetsrv (chanmod control)
         command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-iab-du:
@@ -436,7 +437,7 @@ services:
             # [修正] 插件從宿主機安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4044 --telnetsrv --telnetsrv.listenport 9089 --log_config.global_log_options level,nocolor,time
 
     # ==========================================================
     # 4. Layer 1: IAB Node 2 (Aggregator Right)
@@ -461,6 +462,7 @@ services:
         ports:
             - "4045:4045/udp"
             - "4045:4045/tcp"
+            - "127.0.0.1:9090:9090"   # Node 2 DU telnetsrv (chanmod control)
         command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-iab-du-2:
@@ -479,7 +481,7 @@ services:
             # [修正] 插件從宿主機安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4045 --telnetsrv --telnetsrv.listenport 9090 --log_config.global_log_options level,nocolor,time
 
 networks:
     public_net:

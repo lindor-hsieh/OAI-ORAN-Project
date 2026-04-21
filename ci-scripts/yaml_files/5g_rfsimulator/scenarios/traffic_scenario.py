@@ -208,12 +208,15 @@ def apply_scenario_phase(
     套用一個場景相位的設定到所有 UE。
 
     configs 長度必須為 6，對應 UE1~UE6。
+    各 UE 之間插入 300ms 間隔：避免 6 個 iperf3 同時重啟，造成短暫全網無流量
+    → gNB inactivity timer 觸發 / 多 UE 同時 RACH contention。
     """
     assert len(configs) == len(ues), "configs 長度必須等於 UE 數量"
     log.info("── 套用場景相位 ──")
     for ue, (cqi, bw) in zip(ues, configs):
         ctrl = ctrls[ue.node_id]
         apply_ue_config(ue, ctrl, new_cqi=cqi, new_bw=bw)
+        time.sleep(0.3)
 
 
 # =============================================================================
@@ -271,8 +274,11 @@ def scenario_d_random(ues: list[UEConfig]) -> list[tuple[int, float]]:
     場景 D：隨機相位（每 60 秒呼叫一次，生成新的隨機設定）
     目標：最大化訓練資料多樣性，讓 DRL 學習通用策略。
     """
-    cqi_choices = [1, 2, 4, 6, 8, 10, 12, 15]
-    bw_choices = [1.0, 2.0, 5.0, 8.0, 10.0, 15.0, 20.0, 25.0]
+    # CQI 最低 5：避免 SINR 跌至 RLF 門檻（CQI 1~4 在 rfsimulator 下 SINR < -5dB，
+    # 會觸發 t310 計時器並引發 Radio Link Failure，多 UE 同時 RLF 造成 PRACH contention。）
+    cqi_choices = [5, 6, 8, 10, 12, 15]
+    # BW 最低 2 Mbps：確保 UE 始終有上行流量讓 gNB 維持 RRC 連線活躍
+    bw_choices = [2.0, 5.0, 8.0, 10.0, 15.0, 20.0, 25.0]
     configs = []
     for _ in ues:
         cqi = random.choice(cqi_choices)

@@ -111,9 +111,18 @@ configure_and_start_du() {
 
     echo "   -> [Docker] Starting DU: $DU_NAME"
     $DOCKER_COMPOSE -f $COMPOSE_FILE up -d --force-recreate $DU_NAME
-    
+
+    # 等待 DU 容器真正可執行指令（sleep 2 不夠，DU3/DU4 首批啟動較慢導致 docker exec 失敗）
+    local _wait=0
+    until docker exec -u 0 "$DU_NAME" true 2>/dev/null; do
+        sleep 1; _wait=$((_wait+1))
+        if [ $_wait -ge 20 ]; then
+            echo -e "   ${RED}警告：$DU_NAME 等待逾時，路由可能未設定成功${NC}"
+            break
+        fi
+    done
+
     local MT_INTERNAL_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' $MT_NAME | grep '192.168.74' | head -n 1 | xargs)
-    sleep 2
 
     # [核心修正] 解決 F1AP 非對稱路由問題 (CU only)
     # 注意：RIC_IP (FlexRIC) 不設 bridge 路由，讓 E2AP 走 macvlan 直接路徑

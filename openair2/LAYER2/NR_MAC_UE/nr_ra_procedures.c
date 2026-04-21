@@ -1108,7 +1108,13 @@ static uint8_t *fill_msg3_pdu_from_rlc(NR_UE_MAC_INST_t *mac, uint8_t *pdu, int 
                                        0, // SRB0 for messages sent in MSG3
                                        TBS_max - sizeof(NR_MAC_SUBHEADER_FIXED), /* size of mac_ce above */
                                        (char *)pdu);
-  AssertFatal(len > 0, "no data for Msg3/MsgA_PUSCH\n");
+  if (len <= 0) {
+    /* RLC buffer empty during re-attach (e.g. after inactivity release).
+       Fill with padding so Msg3 is non-empty and RA can proceed. */
+    LOG_W(NR_MAC, "fill_msg3_pdu_from_rlc: RLC returned len=%d, using padding\n", len);
+    len = TBS_max - sizeof(NR_MAC_SUBHEADER_FIXED);
+    memset(pdu, 0, len);
+  }
   // UE Contention Resolution Identity
   // Store the first 48 bits belonging to the uplink CCCH SDU within Msg3 to determine whether or not the
   // Random Access Procedure has been successful after reception of Msg4

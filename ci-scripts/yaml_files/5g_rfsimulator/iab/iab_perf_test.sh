@@ -59,34 +59,34 @@ run_benchmarks() {
         fi
 
         # 2. TCP Downlink (-R reverse mode)
-        # 使用 -t 2 (2秒) 快速採樣，避免拖太久
-        local dl_raw=$(docker exec $UE_NAME iperf3 -c $UPF_DN_IP -t 2 -R 2>/dev/null)
+        # 使用 -t 2 (2秒) 快速採樣，避免拖太久；timeout 10 防止 server 忙時永久卡住
+        local dl_raw=$(timeout 10 docker exec $UE_NAME iperf3 -c $UPF_DN_IP -t 2 -R 2>/dev/null)
         local dl_val=$(echo "$dl_raw" | grep "receiver" | awk '{print $7}')
-        if [ ! -z "$dl_val" ] && [ "$dl_val" != "0.00" ]; then 
+        if [ ! -z "$dl_val" ] && [ "$dl_val" != "0.00" ]; then
             u_tcp_dl=$(echo "$u_tcp_dl + $dl_val" | bc)
             u_tcp_dl_c=$((u_tcp_dl_c+1))
         fi
 
         # 3. TCP Uplink
-        local ul_raw=$(docker exec $UE_NAME iperf3 -c $UPF_DN_IP -t 2 2>/dev/null)
+        local ul_raw=$(timeout 10 docker exec $UE_NAME iperf3 -c $UPF_DN_IP -t 2 2>/dev/null)
         local ul_val=$(echo "$ul_raw" | grep "receiver" | awk '{print $7}')
-        if [ ! -z "$ul_val" ] && [ "$ul_val" != "0.00" ]; then 
+        if [ ! -z "$ul_val" ] && [ "$ul_val" != "0.00" ]; then
             u_tcp_ul=$(echo "$u_tcp_ul + $ul_val" | bc)
             u_tcp_ul_c=$((u_tcp_ul_c+1))
         fi
 
         # 4. UDP Downlink (頻寬設為 20M 測試瓶頸)
-        local udl_raw=$(docker exec $UE_NAME iperf3 -c $UPF_DN_IP -u -b 20M -t 2 -R 2>/dev/null)
+        local udl_raw=$(timeout 10 docker exec $UE_NAME iperf3 -c $UPF_DN_IP -u -b 20M -t 2 -R 2>/dev/null)
         local udl_val=$(echo "$udl_raw" | grep "receiver" | awk '{print $7}')
-        if [ ! -z "$udl_val" ] && [ "$udl_val" != "0.00" ]; then 
+        if [ ! -z "$udl_val" ] && [ "$udl_val" != "0.00" ]; then
             u_udp_dl=$(echo "$u_udp_dl + $udl_val" | bc)
             u_udp_dl_c=$((u_udp_dl_c+1))
         fi
-        
+
         # 5. UDP Uplink
-        local uul_raw=$(docker exec $UE_NAME iperf3 -c $UPF_DN_IP -u -b 20M -t 2 2>/dev/null)
+        local uul_raw=$(timeout 10 docker exec $UE_NAME iperf3 -c $UPF_DN_IP -u -b 20M -t 2 2>/dev/null)
         local uul_val=$(echo "$uul_raw" | grep "receiver" | awk '{print $7}')
-        if [ ! -z "$uul_val" ] && [ "$uul_val" != "0.00" ]; then 
+        if [ ! -z "$uul_val" ] && [ "$uul_val" != "0.00" ]; then
             u_udp_ul=$(echo "$u_udp_ul + $uul_val" | bc)
             u_udp_ul_c=$((u_udp_ul_c+1))
         fi

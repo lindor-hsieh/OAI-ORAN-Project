@@ -2,17 +2,18 @@
 # run_local_pc1.sh — PC1 第四階段全自動流程
 #
 # 用法：
-#   bash run_local_pc1.sh              # 完整流程
+#   bash run_local_pc1.sh               # 完整流程
 #   bash run_local_pc1.sh --skip-server # 跳過 start_iab_server.sh（已在跑時用）
 #
-# 流程：
+# 流程（xApps 保證在 Baseline 測試結束後才啟動）：
 #   Step 1: start_iab_server.sh
 #   Step 2: 等待 E2 連線數 = 6（PC2 已完成）
 #   Step 3: setup_iperf_servers.sh
 #   Step 4: 等待 PC2 CQI 校正完成
-#   Step 5: 逐一啟動 5 個 xApp
-#   Step 6: 通知 PC2 xApps 就緒
-#   Step 7: 開啟監控儀表板
+#   Step 5: 等待 PC2 PF Baseline 完成（確保量到乾淨 OAI PF 數據）
+#   Step 6: 逐一啟動 5 個 xApp + inference 容器
+#   Step 7: 通知 PC2 xApps 就緒
+#   Step 8: 開啟 DRL 監控儀表板
 
 COMPOSE_DIR=~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator
 COMPOSE_FILE="$COMPOSE_DIR/docker-compose-iab-server.yaml"
@@ -39,9 +40,13 @@ wait_ssh_pc2() {
     echo ""
 }
 
+FLAG_BASELINE_DONE="/tmp/local_baseline_done"
+
 # ── 清除舊 flag ──────────────────────────────────────────────
-rm -f "$FLAG_XAPPS_READY" "$FLAG_CALIBRATION_DONE"
-ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} "rm -f /tmp/local_calibration_done /tmp/local_xapps_ready" 2>/dev/null || true
+rm -f "$FLAG_XAPPS_READY" "$FLAG_CALIBRATION_DONE" "$FLAG_BASELINE_DONE"
+ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} \
+    "rm -f /tmp/local_calibration_done /tmp/local_baseline_done /tmp/local_xapps_ready" \
+    2>/dev/null || true
 
 # ── Step 1: 啟動基礎設施 ────────────────────────────────────
 if [[ "$*" == *"--skip-server"* ]]; then
@@ -73,8 +78,14 @@ wait_ssh_pc2 "Step 4: 等待 PC2 CQI 校正完成..." \
     "test -f /tmp/local_calibration_done"
 ok "PC2 CQI 校正完成"
 
-# ── Step 5: 逐一啟動 xApps ──────────────────────────────────
-log "Step 5: 逐一啟動 xApps..."
+# ── Step 5: 等待 PC2 PF Baseline 完成 ────────────────────────
+# xApps 必須在 Baseline 結束後才啟動，確保量到乾淨的 OAI PF Scheduler 數據
+wait_ssh_pc2 "Step 5: 等待 PC2 PF Baseline 測試完成（xApps 尚未啟動）..." \
+    "test -f /tmp/local_baseline_done"
+ok "PC2 PF Baseline 完成，開始啟動 xApps"
+
+# ── Step 6: 逐一啟動 xApps ──────────────────────────────────
+log "Step 6: 逐一啟動 xApps..."
 for node in 1 2 3 4 5; do
     docker compose -f "$COMPOSE_FILE" up -d "node${node}-l-xapp"
     ok "node${node}-l-xapp 已啟動"
@@ -89,16 +100,16 @@ FB=$(docker logs xapp-node1 2>&1 | grep -c "fallback" 2>/dev/null || echo 0)
 [ "$FB" -gt 0 ] && warn "Node1 fallback 次數：$FB（確認 inference-node1 容器）" \
                 || ok "Node1 ZMQ 正常（無 fallback）"
 
-# ── Step 6: 通知 PC2 xApps 就緒 ─────────────────────────────
-log "Step 6: 通知 PC2 xApps 就緒..."
+# ── Step 7: 通知 PC2 xApps 就緒 ─────────────────────────────
+log "Step 7: 通知 PC2 xApps 就緒..."
 touch "$FLAG_XAPPS_READY"
 if ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} "touch /tmp/local_xapps_ready" 2>/dev/null; then
-    ok "已通知 PC2"
+    ok "已通知 PC2，流量場景即將啟動"
 else
     warn "SSH 通知失敗，請在 PC2 手動執行：touch /tmp/local_xapps_ready"
 fi
 
-# ── Step 7: 開啟監控儀表板 ──────────────────────────────────
-log "Step 7: 開啟監控儀表板..."
+# ── Step 8: 開啟監控儀表板 ──────────────────────────────────
+log "Step 8: 開啟 DRL 監控儀表板..."
 echo ""
 bash "$COMPOSE_DIR/iab/monitor_drl.sh"

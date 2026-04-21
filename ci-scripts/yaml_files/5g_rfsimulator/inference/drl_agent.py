@@ -39,7 +39,7 @@ import torch.optim as optim
 MAX_UE_COUNT: int = 16
 STATE_DIM: int = MAX_UE_COUNT * 2 + 1   # [bsr, cqi] × N + active_ratio
 
-MAX_BSR: float = 150_000.0              # BSR 正規化上限 (bytes)
+MAX_BSR: float = 100_000.0              # DL delta-TBS 正規化上限 (bytes/10ms, ≈80 Mbps)
 GAMMA: float = 0.95                      # 折扣因子
 
 LR_ACTOR: float = 1e-4
@@ -169,14 +169,12 @@ class DRLAgent:
         mask_vec = np.zeros(MAX_UE_COUNT, dtype=bool)
 
         for i, ue in enumerate(ues[:n]):
-            bsr = float(ue.get("bsr", 0))
-            # CQI=0 in OAI means "not yet measured"; clip to 1 for consistency
-            # with reward_calculator and to avoid a degenerate zero-state
-            cqi = max(1.0, float(ue.get("wb_cqi", 0)))
-            # Log 正規化 BSR → [0, 1]
+            bsr = float(ue.get("bsr", 0))          # delta_dl_aggr_tbs (bytes)
+            mcs = float(ue.get("wb_cqi", 0))       # dl_mcs1 (0-28, mapped to wb_cqi key)
+            # Log 正規化 delta TBS → [0, 1]
             state_vec[i * 2]     = np.log1p(bsr) / np.log1p(MAX_BSR)
-            # 正規化 CQI → [0, 1]
-            state_vec[i * 2 + 1] = cqi / 15.0
+            # 正規化 MCS → [0, 1]（MCS=0 合法，反映低通道品質）
+            state_vec[i * 2 + 1] = mcs / 28.0
             mask_vec[i] = True
 
         # 活躍 UE 比例作為全域 context 特徵

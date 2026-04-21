@@ -309,7 +309,7 @@ class InferenceServer:
             scores = np.array(
                 [
                     max(float(ue.get("bsr", 0)), 1.0)
-                    * (1.0 + float(ue.get("wb_cqi", 7)) / 15.0 * 0.2)
+                    * (1.0 + float(ue.get("wb_cqi", 0)) / 28.0 * 0.2)
                     for ue in ues
                 ],
                 dtype=np.float32,
@@ -465,7 +465,7 @@ class InferenceServer:
                     # ── 狀態 debug log（每 500 次）────────────────────────
                     if self._total_inferences % 500 == 0 and ues:
                         ue_summary = " ".join(
-                            f"rnti={u.get('rnti',0)} bsr={u.get('bsr',0)} cqi={u.get('wb_cqi',0)}"
+                            f"rnti={u.get('rnti',0)} delta_tbs={u.get('bsr',0)} mcs={u.get('wb_cqi',0)}"
                             for u in ues
                         )
                         self._log.info("STATE[%d] %s", self._total_inferences, ue_summary)

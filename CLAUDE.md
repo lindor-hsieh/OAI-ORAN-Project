@@ -146,3 +146,37 @@
 
 `~/openairinterface5g/openair2/E2AP/flexric/src/xApp/db/sqlite3/sqlite3_wrapper.c`
 我希望除了`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl.c`這個是 xApp 本身,能有五份程式碼給不同的 node ,其他都檔案能夠讓node 1~node 5的 xApp 共用,刪除整份檔案需要經過我的授權,所有修改都先在這個電腦(PC 1)完成就好,我會再將修改好的檔案傳給(PC 2)
+
+---
+
+## 8. 實驗基準數據 (PF Scheduler Baseline)
+
+測量時間：2026-04-20，xApp 與 DRL 啟動前，OAI 預設 Proportional Fairness 排程器。
+測量方式：`iab_perf_test.sh 3`（每 UE 3 輪取平均）
+
+### 各 UE 結果
+
+| UE | Latency | TCP-DL | TCP-UL | UDP-DL | UDP-UL |
+|---|---|---|---|---|---|
+| UE1 (12.1.1.9) | 76.36 ms | 6.81 Mbps | 9.21 Mbps | 20.25 Mbps | 13.80 Mbps |
+| UE2 (12.1.1.8) | 67.84 ms | 10.66 Mbps | 9.59 Mbps | 19.43 Mbps | 13.23 Mbps |
+| UE3 (12.1.1.12) | 83.25 ms | 11.35 Mbps | 9.34 Mbps | 18.80 Mbps | 12.26 Mbps |
+| UE4 (12.1.1.10) | 71.39 ms | 6.81 Mbps | 9.90 Mbps | 18.43 Mbps | 13.26 Mbps |
+| UE5 (12.1.1.7) | 65.12 ms | 9.44 Mbps | 8.95 Mbps | 19.20 Mbps | 12.73 Mbps |
+| UE6 | 81.43 ms | 6.99 Mbps | 9.67 Mbps | 19.76 Mbps | 13.66 Mbps |
+
+### 全網平均
+
+| 指標 | 數值 |
+|---|---|
+| Avg. Latency | **74.23 ms** |
+| Avg. TCP-DL | **8.67 Mbps** |
+| Avg. TCP-UL | **9.44 Mbps** |
+| Avg. UDP-DL | **19.31 Mbps** |
+| Avg. UDP-UL | **13.15 Mbps** |
+
+### Jain's Fairness Index (TCP-DL)
+
+xi = [6.81, 10.66, 11.35, 6.81, 9.44, 6.99]，JFI ≈ **0.924**
+
+> DRL 目標：TCP-DL 總量相近或更高，JFI > 0.924（各 UE 分佈更均勻），Latency 降低。

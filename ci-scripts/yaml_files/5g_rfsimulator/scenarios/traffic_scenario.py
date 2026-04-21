@@ -120,13 +120,14 @@ def start_iperf_client(ue: UEConfig) -> bool:
 
     使用 -R 讓 ext-dn server 向 UE 推送資料，產生 DL 流量讓 gNB DL buffer 有積壓，
     使 dl_buffer_info > 0，驅動 DRL reward 計算。
-    每次呼叫前先停止舊的 iperf3 進程，確保以新的頻寬參數重新啟動。
-    """
-    stop_iperf_client(ue)
 
+    重啟順序：先取得 UE IP（舊 iperf3 仍在跑，oaitun_ue1 必然存在），
+    再 pkill 舊進程並立刻啟動新進程，將流量空隙壓縮至毫秒級，
+    避免 gNB inactivity timer 釋放 RRC 連線導致 UE crash。
+    """
     ue_ip = _get_ue_ip(ue.container)
     if ue_ip is None:
-        log.error("%s: oaitun_ue1 尚未就緒，跳過 iperf3 啟動", ue.container)
+        log.error("%s: oaitun_ue1 不存在，跳過 iperf3 啟動", ue.container)
         return False
 
     cmd = [
@@ -143,6 +144,8 @@ def start_iperf_client(ue: UEConfig) -> bool:
     ]
 
     try:
+        # 停舊進程後立刻啟動新進程，縮短無流量的空窗期
+        stop_iperf_client(ue)
         ue._iperf_proc = subprocess.Popen(cmd)
         log.info("iperf3 start: %s → %s:%d @ %.0fMbps",
                  ue.container, EXT_DN_IP, ue.iperf_port, ue.bandwidth_mbps)

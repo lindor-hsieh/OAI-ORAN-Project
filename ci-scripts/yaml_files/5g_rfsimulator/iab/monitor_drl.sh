@@ -63,20 +63,22 @@ check_fallback() {
     docker logs "xapp-node${node}" 2>&1 2>/dev/null | grep -c "fallback" || echo "0"
 }
 
-# channelmod 連線
-# Node 1 (9089) / Node 2 (9090)：PC1 本機，直接查
-# Node 3 (9091) / Node 4 (9092) / Node 5 (9093)：SSH 到 PC2 容器內查
+# channelmod 連線：只測試 TCP 能否連上，不等回應（避免 cat 卡住）
+# Node 1→9089, Node 2→9090, Node 3→9091, Node 4→9092, Node 5→9093
 check_channelmod() {
     local node=$1
-    local port=$((9088 + node))   # node1→9089, node2→9090, node3→9091, node4→9092, node5→9093
-    local container="rfsim5g-iab-du-${node}"
+    local port=$((9088 + node))
+    local container="rfsim5g-iab-du"
+    [ "$node" -gt 1 ] && container="rfsim5g-iab-du-${node}"
+
     if [ "$node" -le 2 ]; then
-        bash -c "exec 3<>/dev/tcp/127.0.0.1/${port} && echo 'channelmod show config' >&3 && sleep 0.5 && cat <&3" 2>/dev/null \
-            | grep -q . && echo "OK" || echo "NO"
+        timeout 2 docker exec "$container" bash -c \
+            "exec 3<>/dev/tcp/127.0.0.1/${port} && exec 3>&-" 2>/dev/null \
+            && echo "OK" || echo "NO"
     else
         ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} \
-            "docker exec $container bash -c 'exec 3<>/dev/tcp/127.0.0.1/${port} && echo \"channelmod show config\" >&3 && sleep 0.5 && cat <&3' 2>/dev/null | grep -q ." 2>/dev/null \
-            && echo "OK" || echo "NO"
+            "timeout 2 docker exec $container bash -c 'exec 3<>/dev/tcp/127.0.0.1/${port} && exec 3>&-' 2>/dev/null" \
+            2>/dev/null && echo "OK" || echo "NO"
     fi
 }
 

@@ -48,6 +48,8 @@ MONGO_FLUSH_INTERVAL: float = 1.0   # 批次寫入 MongoDB 的間隔（秒）
 INFERENCE_WARN_MS: float = 4.0      # 推論延遲警告閾值（ms）
 TRAIN_INTERVAL_S: float = 60.0      # DRL 背景訓練間隔（秒）
 TRAIN_FETCH_LIMIT: int = 2000       # 每次從 MongoDB 讀取的最多筆數
+TRAIN_EPOCHS_PER_ROUND: int = 10    # 每輪訓練的梯度更新次數
+EXPLORE_PROB: float = 0.30          # 啟發式階段 Dirichlet 隨機探索的比例
 
 
 # =============================================================================
@@ -247,13 +249,22 @@ class InferenceServer:
             )
             return
 
-        metrics = self._agent.train_on_batch(experiences)
-        if metrics:
+        last_metrics: dict = {}
+        for epoch in range(TRAIN_EPOCHS_PER_ROUND):
+            m = self._agent.train_on_batch(experiences)
+            if m:
+                last_metrics = m
+        if last_metrics:
             self._agent.save()
             self._log.info(
-                "訓練完成 | DRL 推論模式: %s | "
-                "DRL/啟發式 = %d/%d",
-                self._agent.is_trained,
+                "訓練完成 %d epochs | step=%d actor_loss=%.4f critic_loss=%.4f "
+                "entropy=%.4f mean_reward=%.4f | DRL/啟發式=%d/%d",
+                TRAIN_EPOCHS_PER_ROUND,
+                last_metrics.get("train_step", 0),
+                last_metrics.get("actor_loss", 0),
+                last_metrics.get("critic_loss", 0),
+                last_metrics.get("entropy", 0),
+                last_metrics.get("mean_reward", 0),
                 self._drl_inferences,
                 self._heuristic_inferences,
             )
@@ -262,50 +273,63 @@ class InferenceServer:
     # 推論邏輯
     # -------------------------------------------------------------------------
 
-    def _infer_heuristic(self, ues: list[dict]) -> tuple[list[dict], np.ndarray]:
+    def _infer_heuristic(
+        self, ues: list[dict], explore: bool = False
+    ) -> tuple[list[dict], np.ndarray]:
         """
         Phase 3 BSR 比例加權啟發式推論（冷啟動 Fallback）。
 
-        PRB 分配策略：
-          1. 以 BSR 反映各 UE 的排隊資料量作為基礎權重。
-          2. 以 CQI 反映通道品質進行輕微加成（最高 +20%）。
-          3. 每個 UE 保底 MIN_PRB_PER_UE 個 PRB，防止低 BSR UE 餓死。
-          4. 捨入後將剩餘 PRB 補給分數最高的 UE。
-
-        Returns:
-            (allocations, action_ratios)
+        explore=True 時使用 Dirichlet 隨機分配，產生多樣化訓練資料：
+          - 與等量分配相比，不同的 action 會導致不同的 reward（fairness 差異）
+          - 讓 DRL 學到「公平分配 ≻ 不公平分配」，打破全 0 梯度瓶頸
         """
         n = len(ues)
         if n == 0:
             return [], np.zeros(MAX_UE_COUNT, dtype=np.float32)
 
-        scores = np.array(
-            [
-                max(float(ue.get("bsr", 0)), 1.0)
-                * (1.0 + float(ue.get("wb_cqi", 7)) / 15.0 * 0.2)
-                for ue in ues
-            ],
-            dtype=np.float32,
-        )
-
-        reserved = MIN_PRB_PER_UE * n
-        available = max(self.total_prb - reserved, 0)
-        ratios = scores / scores.sum()
-        prb_extra = (ratios * available).astype(np.int32)
-
-        remainder = int(available - prb_extra.sum())
-        if remainder > 0:
-            prb_extra[int(np.argmax(ratios))] += remainder
+        if explore:
+            # Dirichlet(α<1) 傾向產生稀疏/不均勻的分配，增加 reward 方差
+            alpha = np.ones(n, dtype=np.float32) * 0.7
+            ratios = np.random.dirichlet(alpha).astype(np.float32)
+            prb_floats = ratios * self.total_prb
+            prb_ints = np.maximum(np.floor(prb_floats).astype(np.int32), 1)
+            diff = self.total_prb - int(prb_ints.sum())
+            if diff > 0:
+                prb_ints[int(np.argmax(ratios))] += diff
+            elif diff < 0:
+                # 從最大的逐一減去（保底 1 PRB）
+                for idx in np.argsort(prb_ints)[::-1]:
+                    if diff >= 0:
+                        break
+                    can_remove = int(prb_ints[idx]) - 1
+                    remove = min(can_remove, -diff)
+                    prb_ints[idx] -= remove
+                    diff += remove
+        else:
+            scores = np.array(
+                [
+                    max(float(ue.get("bsr", 0)), 1.0)
+                    * (1.0 + float(ue.get("wb_cqi", 7)) / 15.0 * 0.2)
+                    for ue in ues
+                ],
+                dtype=np.float32,
+            )
+            reserved = MIN_PRB_PER_UE * n
+            available = max(self.total_prb - reserved, 0)
+            ratios = scores / scores.sum()
+            prb_extra = (ratios * available).astype(np.int32)
+            remainder = int(available - prb_extra.sum())
+            if remainder > 0:
+                prb_extra[int(np.argmax(ratios))] += remainder
+            prb_ints = np.array(
+                [MIN_PRB_PER_UE + prb_extra[i] for i in range(n)], dtype=np.int32
+            )
 
         allocations = [
-            {
-                "rnti":    int(ues[i]["rnti"]),
-                "prb_abs": int(MIN_PRB_PER_UE + prb_extra[i]),
-            }
+            {"rnti": int(ues[i]["rnti"]), "prb_abs": int(prb_ints[i])}
             for i in range(n)
         ]
 
-        # 建立 action_ratios 向量
         action_ratios = np.zeros(MAX_UE_COUNT, dtype=np.float32)
         for i in range(n):
             action_ratios[i] = allocations[i]["prb_abs"] / self.total_prb
@@ -318,7 +342,7 @@ class InferenceServer:
 
         策略：
           - DRL 訓練完成 → 使用 DRL Actor Network
-          - 尚未完成首次訓練 → 使用 BSR 啟發式（同時積累訓練資料）
+          - 尚未完成首次訓練 → BSR 啟發式 + EXPLORE_PROB 機率的 Dirichlet 探索
         """
         use_drl = self._agent.is_trained
 
@@ -330,8 +354,9 @@ class InferenceServer:
             except Exception as exc:
                 self._log.warning("DRL 推論失敗: %s，退回啟發式", exc)
 
-        # BSR 啟發式（Phase 3 或 Fallback）
-        allocations, action_ratios = self._infer_heuristic(ues)
+        # 啟發式階段：以 EXPLORE_PROB 比例注入 Dirichlet 隨機探索
+        explore = (not use_drl) and (np.random.rand() < EXPLORE_PROB)
+        allocations, action_ratios = self._infer_heuristic(ues, explore=explore)
         self._heuristic_inferences += 1
         return allocations, action_ratios
 

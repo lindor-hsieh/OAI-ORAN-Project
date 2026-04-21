@@ -170,7 +170,9 @@ class DRLAgent:
 
         for i, ue in enumerate(ues[:n]):
             bsr = float(ue.get("bsr", 0))
-            cqi = float(ue.get("wb_cqi", 7))
+            # CQI=0 in OAI means "not yet measured"; clip to 1 for consistency
+            # with reward_calculator and to avoid a degenerate zero-state
+            cqi = max(1.0, float(ue.get("wb_cqi", 0)))
             # Log 正規化 BSR → [0, 1]
             state_vec[i * 2]     = np.log1p(bsr) / np.log1p(MAX_BSR)
             # 正規化 CQI → [0, 1]
@@ -348,9 +350,10 @@ class DRLAgent:
         weighted_log_prob = (log_probs * actions).sum(dim=1)  # (batch,)
         actor_loss = -(advantages * weighted_log_prob).mean()
 
-        # Entropy 正規化：防止策略過早收斂，鼓勵探索
+        # Entropy 正規化：鼓勵探索，係數隨訓練步數衰減以允許收斂
         entropy = -(probs * log_probs).sum(dim=1).mean()
-        actor_loss = actor_loss - 0.01 * entropy
+        entropy_coeff = max(0.001, 0.01 * (0.997 ** self._train_steps))
+        actor_loss = actor_loss - entropy_coeff * entropy
 
         self.actor_opt.zero_grad()
         actor_loss.backward()

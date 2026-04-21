@@ -13,40 +13,45 @@ key parameters:
 
 path_loss_dB → 預計 wb_cqi 對照表（需依實際環境校正）：
   配置前提：max_pdschReferenceSignalPower = -27, att_tx = 0
+  實測安全上限：path_loss > 25~30dB → UE 斷線（MCS max=28，系統 SNR 極高）
   ─────────────────────────────
-   path_loss_dB │ SINR 估計 │ CQI
+   path_loss_dB │ 預計 CQI  │ 備註
   ─────────────────────────────
-        0       │  >60 dB   │  15
-       40       │  ~22 dB   │  15
-       50       │  ~12 dB   │ 12~13
-       55       │  ~7  dB   │  10
-       60       │  ~2  dB   │  7~8
-       65       │  ~-3 dB   │   5
-       70       │  ~-8 dB   │   3
-       75       │ ~-13 dB   │   1
+        0       │  15       │ 理想通道
+        5       │  12~15    │ 需校正
+       10       │  10~12    │ 需校正
+       14       │   8~10    │ 需校正
+       18       │   6~8     │ 需校正
+       21       │   4~6     │ 需校正
+       23       │   2~4     │ 需校正
+       25       │   1~2     │ 安全下限（勿超過）
   ─────────────────────────────
-  上表為理論估算，需執行 calibrate_cqi() 取得實際對應值。
+  請執行 calibrate_cqi() 取得實際對應值並更新 _DEFAULT_CQI_TO_PATHLOSS。
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import socket
+import subprocess
 import time
 from typing import Optional
 
 log = logging.getLogger("channelmod_ctrl")
 
 # 預設 path_loss_dB 對應各目標 CQI（第一次校正前使用）
+# 實測安全上限：path_loss > 25~30dB 會導致 UE 斷線（MCS 最高 28，系統 SNR 高）
+# 所有值壓縮在 0~25dB 範圍內，校正後以實測值取代
 _DEFAULT_CQI_TO_PATHLOSS: dict[int, float] = {
     15: 0.0,
-    12: 50.0,
-    10: 55.0,
-    8:  58.0,
-    6:  62.0,
-    4:  66.0,
-    2:  70.0,
-    1:  75.0,
+    12: 5.0,
+    10: 10.0,
+    8:  14.0,
+    6:  18.0,
+    4:  21.0,
+    2:  23.0,
+    1:  25.0,
 }
 
 
@@ -195,22 +200,75 @@ class ChannelModController:
     # 校正輔助
     # -------------------------------------------------------------------------
 
+    def read_wb_cqi(self, du_container: str, retries: int = 3) -> Optional[int]:
+        """
+        從 DU 容器的 nrMAC_stats.log 自動讀取最低 wb_cqi。
+
+        OAI 的 nrmac_stats_thread 每秒將 MAC 統計寫入 nrMAC_stats.log，
+        格式為 "UE xxxx: CQI X, RI X, PMI (X,X)"。
+        每個 Node 有 2 個 UE：ue_id=0 套用了 path_loss，CQI 較低，
+        取 min() 即可得到 ue_id=0 的觀測 CQI。
+        """
+        for attempt in range(retries):
+            # 動態找出 log 檔路徑（OAI 從執行目錄寫入，不同容器可能不同）
+            find_res = subprocess.run(
+                ["docker", "exec", du_container,
+                 "find", "/", "-maxdepth", "6", "-name", "nrMAC_stats.log"],
+                capture_output=True, text=True, timeout=10,
+            )
+            paths = [p.strip() for p in find_res.stdout.splitlines() if p.strip()]
+            for path in paths:
+                cat_res = subprocess.run(
+                    ["docker", "exec", du_container, "cat", path],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if cat_res.returncode == 0 and cat_res.stdout.strip():
+                    cqis = re.findall(r'\bCQI\s+(\d+)', cat_res.stdout)
+                    if cqis:
+                        return min(int(c) for c in cqis)
+            if attempt < retries - 1:
+                log.debug("read_wb_cqi: 第 %d 次未讀到 CQI，等待 2s 重試", attempt + 1)
+                time.sleep(2)
+        log.warning("read_wb_cqi: 無法從 %s 讀取 CQI（nrMAC_stats.log 不存在或 UE 未連線）",
+                    du_container)
+        return None
+
+    def calibrate_auto(
+        self,
+        ue_id: int,
+        du_container: str,
+        loss_values: list[float],
+        wait_s: float = 5.0,
+    ) -> list[tuple[float, int]]:
+        """
+        全自動校正：掃描 path_loss，從容器 log 讀取實際 CQI，回傳觀測序列。
+
+        回傳: [(path_loss_dB, observed_cqi), ...]
+        """
+        print(f"\n[自動校正] telnet:{self.port}  DU容器:{du_container}")
+        print(f"{'path_loss_dB':>14} │ 實測 CQI")
+        print("─" * 26)
+        observed: list[tuple[float, int]] = []
+        for loss in loss_values:
+            self.set_path_loss(ue_id, loss)
+            time.sleep(wait_s)
+            cqi = self.read_wb_cqi(du_container)
+            if cqi is None:
+                print(f"{loss:>14.1f} │ (讀取失敗，跳過)")
+                continue
+            observed.append((loss, cqi))
+            print(f"{loss:>14.1f} │ {cqi}")
+        self.reset_channel(ue_id)
+        return observed
+
     def calibrate_cqi(
         self,
         ue_id: int,
         loss_values: list[float],
         wait_s: float = 5.0,
     ) -> None:
-        """
-        掃描 path_loss_dB 值並列印觀測提示，協助建立準確的 CQI 對照表。
-
-        用法：
-          ctrl = ChannelModController("127.0.0.1", 9091)
-          ctrl.calibrate_cqi(ue_id=0, loss_values=[0, 40, 50, 55, 60, 65, 70, 75])
-
-        執行後，觀察 gNB log 中的 wb_cqi 值並手動更新 cqi_to_pathloss。
-        """
-        print(f"\n[校正] 開始掃描 ue_id={ue_id}，間隔 {wait_s}s")
+        """手動校正（已由 calibrate_auto 取代）：掃描並列印提示，需人工記錄 CQI。"""
+        print(f"\n[手動校正] 開始掃描 ue_id={ue_id}，間隔 {wait_s}s")
         print("請同時觀察 gNB log 中的 wb_cqi 欄位\n")
         print(f"{'path_loss_dB':>14} │ 請記錄 wb_cqi")
         print("─" * 32)

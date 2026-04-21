@@ -33,10 +33,12 @@ from __future__ import annotations
 import argparse
 import logging
 import random
+import re
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from channelmod_ctrl import ChannelModController
@@ -65,6 +67,19 @@ NODE_CONFIG = {
     4: (9092, [("rfsim5g-end-ue-3", 0), ("rfsim5g-end-ue-4", 1)]),
     5: (9093, [("rfsim5g-end-ue-5", 0), ("rfsim5g-end-ue-6", 1)]),
 }
+
+# Node → DU 容器名稱（校正時用來讀取 nrMAC_stats.log）
+NODE_TO_DU_CONTAINER: dict[int, str] = {
+    3: "rfsim5g-iab-du-3",
+    4: "rfsim5g-iab-du-4",
+    5: "rfsim5g-iab-du-5",
+}
+
+# 校正掃描的 path_loss 值（單位 dB）；上限 25dB，超過會斷線
+CALIBRATE_LOSS_VALUES: list[float] = [0.0, 5.0, 10.0, 14.0, 18.0, 21.0, 23.0, 25.0]
+
+# _DEFAULT_CQI_TO_PATHLOSS 的標準 CQI 鍵值集合
+_STANDARD_CQIS: list[int] = [15, 12, 10, 8, 6, 4, 2, 1]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -181,7 +196,12 @@ def apply_ue_config(
     new_cqi: Optional[int] = None,
     new_bw: Optional[float] = None,
 ) -> None:
-    """套用新的 CQI 與頻寬設定到單一 UE。"""
+    """套用新的 CQI 與頻寬設定到單一 UE。
+
+    BW 變更只更新記錄，不重啟 iperf3。
+    重啟 iperf3 會造成短暫無流量 → gNB inactivity timer → RRCRelease → 多 UE 同時 RACH contention。
+    BSR 多樣性由 CQI 變化自然產生（CQI↓ → 實際吞吐↓ → UL buffer 累積 → BSR↑）。
+    """
     changed = False
 
     if new_cqi is not None and new_cqi != ue.target_cqi:
@@ -191,7 +211,10 @@ def apply_ue_config(
 
     if new_bw is not None and abs(new_bw - ue.bandwidth_mbps) > 0.5:
         ue.bandwidth_mbps = new_bw
-        start_iperf_client(ue)
+        if ue._iperf_proc is None:
+            # iperf3 尚未啟動（第一個相位）→ 用新 BW 啟動
+            start_iperf_client(ue)
+        # iperf3 已在跑 → 只更新記錄，不殺不重啟，維持流量連續性
         changed = True
 
     if changed:
@@ -208,15 +231,14 @@ def apply_scenario_phase(
     套用一個場景相位的設定到所有 UE。
 
     configs 長度必須為 6，對應 UE1~UE6。
-    各 UE 之間插入 300ms 間隔：避免 6 個 iperf3 同時重啟，造成短暫全網無流量
-    → gNB inactivity timer 觸發 / 多 UE 同時 RACH contention。
+    各 UE 之間插入 100ms 間隔給 channelmod telnet 指令回應。
     """
     assert len(configs) == len(ues), "configs 長度必須等於 UE 數量"
     log.info("── 套用場景相位 ──")
     for ue, (cqi, bw) in zip(ues, configs):
         ctrl = ctrls[ue.node_id]
         apply_ue_config(ue, ctrl, new_cqi=cqi, new_bw=bw)
-        time.sleep(0.3)
+        time.sleep(0.1)
 
 
 # =============================================================================
@@ -274,9 +296,8 @@ def scenario_d_random(ues: list[UEConfig]) -> list[tuple[int, float]]:
     場景 D：隨機相位（每 60 秒呼叫一次，生成新的隨機設定）
     目標：最大化訓練資料多樣性，讓 DRL 學習通用策略。
     """
-    # CQI 最低 5：避免 SINR 跌至 RLF 門檻（CQI 1~4 在 rfsimulator 下 SINR < -5dB，
-    # 會觸發 t310 計時器並引發 Radio Link Failure，多 UE 同時 RLF 造成 PRACH contention。）
-    cqi_choices = [5, 6, 8, 10, 12, 15]
+    # path_loss 表已壓縮至 0~25dB 安全範圍，所有 CQI 值皆可使用
+    cqi_choices = [1, 2, 4, 6, 8, 10, 12, 15]
     # BW 最低 2 Mbps：確保 UE 始終有上行流量讓 gNB 維持 RRC 連線活躍
     bw_choices = [2.0, 5.0, 8.0, 10.0, 15.0, 20.0, 25.0]
     configs = []
@@ -390,20 +411,93 @@ def run_dynamic_scenario(
                     ctrl.reset_channel(ue.ue_id)
 
 
+def _build_full_cqi_mapping(observed: list[tuple[float, int]]) -> dict[int, float]:
+    """
+    從 (path_loss, observed_cqi) 觀測序列建構 {standard_cqi: path_loss} 映射。
+
+    對每個標準 CQI 鍵，選取觀測 CQI 最接近的點；
+    差距相同時選 path_loss 最高的（讓通道差異最大化）。
+    """
+    result: dict[int, float] = {}
+    for target in _STANDARD_CQIS:
+        best = min(observed, key=lambda lc: (abs(lc[1] - target), -lc[0]))
+        result[target] = best[0]
+    return result
+
+
+def _write_cqi_pathloss_table(mapping: dict[int, float]) -> None:
+    """
+    將 mapping 寫回 channelmod_ctrl.py 的 _DEFAULT_CQI_TO_PATHLOSS。
+    使用 regex 原地替換，保留其他程式碼不變。
+    """
+    ctrl_file = Path(__file__).parent / "channelmod_ctrl.py"
+    content = ctrl_file.read_text()
+
+    entries = "{\n"
+    for cqi in sorted(mapping.keys(), reverse=True):
+        entries += f"    {cqi}: {mapping[cqi]:.1f},\n"
+    entries += "}"
+
+    new_content = re.sub(
+        r'_DEFAULT_CQI_TO_PATHLOSS: dict\[int, float\] = \{[^}]*\}',
+        f'_DEFAULT_CQI_TO_PATHLOSS: dict[int, float] = {entries}',
+        content,
+        flags=re.DOTALL,
+    )
+    if new_content == content:
+        print("[警告] 找不到 _DEFAULT_CQI_TO_PATHLOSS，請手動更新 channelmod_ctrl.py")
+        return
+    ctrl_file.write_text(new_content)
+    log.info("channelmod_ctrl.py _DEFAULT_CQI_TO_PATHLOSS 已更新")
+
+
 def run_calibration(node_id: int) -> None:
-    """對指定 Node 的 DU 執行 CQI 校正掃描。"""
+    """
+    全自動 CQI 校正：
+      1. 掃描 path_loss 0~25dB（每步等 5s 穩定）
+      2. 自動從 DU 容器的 nrMAC_stats.log 讀取實測 CQI
+      3. 建構 {standard_cqi: path_loss} 映射
+      4. 寫回 channelmod_ctrl.py（Node 3 負責寫檔；Node 4/5 共用相同通道特性）
+    """
     telnet_port = NODE_CONFIG[node_id][0]
+    du_container = NODE_TO_DU_CONTAINER[node_id]
     ctrl = ChannelModController("127.0.0.1", telnet_port)
 
-    print(f"\n=== Node {node_id} CQI 校正（telnet port {telnet_port}）===")
-    print("請確認至少有一個 UE 連線到此 Node，且正在傳輸流量")
-    input("按 Enter 繼續...")
+    print(f"\n=== Node {node_id} 全自動 CQI 校正 ===")
+    print(f"  telnet port : {telnet_port}")
+    print(f"  DU 容器     : {du_container}")
+    print(f"  掃描範圍    : {CALIBRATE_LOSS_VALUES[0]}~{CALIBRATE_LOSS_VALUES[-1]} dB")
+    print("請確認至少有一個 UE 連線到此 Node（oaitun_ue1 已取得 IP）")
+    input("按 Enter 開始（約需 40 秒）...")
 
-    ctrl.calibrate_cqi(
+    observed = ctrl.calibrate_auto(
         ue_id=0,
-        loss_values=[0.0, 40.0, 50.0, 55.0, 58.0, 62.0, 66.0, 70.0, 75.0],
+        du_container=du_container,
+        loss_values=CALIBRATE_LOSS_VALUES,
         wait_s=5.0,
     )
+
+    if not observed:
+        print("\n[校正失敗] 未讀取到任何 CQI 值。")
+        print("  可能原因：DU 容器未運行、nrMAC_stats.log 尚未生成、UE 未連線。")
+        return
+
+    mapping = _build_full_cqi_mapping(observed)
+
+    print(f"\n校正結果（標準 CQI → path_loss）：")
+    for cqi in sorted(mapping.keys(), reverse=True):
+        print(f"  CQI {cqi:2d}  →  {mapping[cqi]:.1f} dB")
+
+    # 立即生效（更新 class 變數）
+    ChannelModController.cqi_to_pathloss.update(mapping)
+
+    # Node 3 作為代表寫回 channelmod_ctrl.py（rfsimulator 各節點通道特性相同）
+    if node_id == 3:
+        _write_cqi_pathloss_table(mapping)
+        print("\n[完成] channelmod_ctrl.py _DEFAULT_CQI_TO_PATHLOSS 已自動更新。")
+        print("       下次啟動不需重新校正（除非修改硬體/參數）。")
+    else:
+        print(f"\n[完成] Node {node_id} 校正結果已套用至本次執行（Node 3 的結果已寫入檔案）。")
 
 
 # =============================================================================

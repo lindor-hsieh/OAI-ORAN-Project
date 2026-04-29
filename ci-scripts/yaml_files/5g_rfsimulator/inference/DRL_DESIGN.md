@@ -25,6 +25,8 @@ OAI gNB (C 語言)
 
 > **注意**：OAI RF Simulator 的 `dl_buffer_info`（DL buffer queue depth）與 `wb_cqi`（Wideband CQI）在模擬環境下恆為 0，因此改用上述兩個欄位作為 state 輸入。
 
+> **流量方向前提**：`Δ DL TBS` 有意義的前提是 **gNB DL buffer 持續有資料排程**，因此訓練流量必須使用 **DL iperf3（iperf3 -R，ext-dn → UE）**，並設定頻寬遠大於通道容量（建議 ≥ 200 Mbps），確保 DL buffer 始終滿載。若使用 UL 方向，`dl_aggr_tbs` 差分恆為 0，reward 退化為常數，DRL 無法學習。
+
 ### 2.2 State 向量編碼
 
 State 為固定長度 **33 維**的 float32 向量（MAX\_UE\_COUNT = 16）：
@@ -127,6 +129,8 @@ $$R = W_{tp} \cdot R_{tp} + W_{fair} \cdot R_{fair} - W_{delay} \cdot R_{delay}$
 
 ### 5.2 各分量說明
 
+**Reward 計算時序**：reward 在步驟 t 觀測到 S_t 時，使用 **S_t**（curr_ues）而非 S_{t-1}（prev_ues）來計算。原因：S_t 的 `Δtbs` 是 gNB 用 A_{t-1} 排程後的實際產出，代表 A_{t-1} 的真實效果；S_{t-1} 的 `Δtbs` 反映的是 A_{t-2}，與 A_{t-1} 無關。
+
 **R_throughput**：衡量 DL 實際吞吐量。`Δtbs_i` 為 C 端 `dl_aggr_tbs` 的差分值（每 10ms 實際傳輸 bytes），直接反映 MAC 層真實產出，而非估計值。
 
 **R_fairness**：Jain's Fairness Index（JFI）作用在各 UE 的吞吐量上。JFI = 1 代表所有 UE 吞吐量完全相等；JFI = 1/N 代表資源全集中於單一 UE。論文優化目標為 JFI > 0.924（超越 OAI PF Scheduler baseline）。
@@ -174,14 +178,27 @@ $$\mathcal{L}_{critic} = \text{MSE}(V(s),\; r + \gamma \cdot V(s'))$$
 - TD target：$r + \gamma \cdot V(s')$，$\gamma = 0.95$
 - 使用 `stop_gradient` 避免 bootstrapping 不穩定
 
-### 6.3 Actor 更新
+### 6.3 Actor 更新（Dirichlet Policy Gradient）
 
-$$\mathcal{L}_{actor} = -\mathbb{E}\left[A(s,a) \cdot \sum_i \log\pi(a_i|s) \cdot \text{ratio}_i\right] - \beta_t \cdot H(\pi)$$
+$$\mathcal{L}_{actor} = -\mathbb{E}\left[A(s,a) \cdot \log p_{\text{Dir}}(a \mid \alpha(s))\right] - \beta_t \cdot H\!\left(\text{Dir}(\alpha(s))\right)$$
 
 其中：
+- **策略分佈**：$\text{Dir}(\alpha)$，集中度參數 $\alpha_i = \pi_{\theta}(s)_i \times K$，$K = 5$
 - **Advantage**：$A(s,a) = r + \gamma V(s') - V(s)$，標準化（zero-mean, unit-std）
-- **加權 log 機率**：以儲存的 `action_ratios` 作為連續動作的示範權重
-- **Entropy 正則化**：$\beta_t = \max(0.001,\; 0.01 \times 0.997^t)$，隨訓練步數衰減，初期鼓勵探索，後期允許收斂
+- **log 機率**：$\log p_{\text{Dir}}(a \mid \alpha)$ 為 Dirichlet 分佈在採樣動作 $a$ 處的對數機率，由 `torch.distributions.Dirichlet.log_prob()` 計算，對每個樣本的活躍 UE 子集獨立計算
+- **Entropy 正則化**：$\beta_t = \max(0.001,\; 0.01 \times 0.997^t)$，隨訓練步數衰減
+
+**為何改用 Dirichlet Policy Gradient**：
+
+舊設計使用 $\sum_i \log\pi(a_i|s) \cdot \text{ratio}_i$，在 DRL 推論階段 `action_ratios` ≈ actor 輸出的 softmax probs，導致：
+
+$$\sum_i \log\pi(a_i|s) \cdot \pi(a_i|s) = -H(\pi)$$
+
+Actor loss 退化為熵的最大化/最小化，而非 policy gradient，Actor 無法學習。
+
+新設計以 **Dirichlet 分佈**作為策略：推論時從 $\text{Dir}(\pi_\theta(s) \times K)$ **採樣** action，儲存採樣值（非 softmax 均值），訓練時用 Dirichlet log_prob 計算真正的 policy gradient 梯度。
+
+### 6.4 訓練超參數
 
 ### 6.4 訓練超參數
 
@@ -195,6 +212,7 @@ $$\mathcal{L}_{actor} = -\mathbb{E}\left[A(s,a) \cdot \sum_i \log\pi(a_i|s) \cdo
 | Entropy 初始係數 | 0.01 |
 | Entropy 衰減率 | 0.997 / step |
 | Entropy 最小值 | 0.001 |
+| Dirichlet 集中度 K | 5.0 |
 
 ---
 
@@ -217,15 +235,21 @@ $$\text{ratios} \sim \text{Dirichlet}(\alpha),\quad \alpha = [0.7, 0.7, \ldots]$
 
 Dirichlet(α < 1) 傾向生成稀疏、不均勻的分配，增加 reward 方差，有助於 DRL 收斂時識別有效策略。
 
-### 7.3 DRL 推論
+### 7.3 DRL 推論（Dirichlet 隨機策略）
 
 完成首次訓練後切換至 Actor Network 推論，啟發式模式作為 ZeroMQ 超時的 Fallback（5ms timeout）。
+
+DRL 推論使用**隨機策略**：以 actor softmax 輸出乘以集中度 K 作為 Dirichlet 分佈的參數，從中採樣 PRB 比例向量。此設計確保：
+
+1. 推論動作與 actor 輸出不同（有隨機性），訓練時 log_prob 梯度非零
+2. 採樣值仍受 actor 引導（期望值 = softmax 輸出），策略方向正確
+3. 訓練步數增加後 actor 輸出更集中，配合 entropy 衰減自然收斂
 
 | 模式 | 觸發條件 | 動作來源 |
 |---|---|---|
 | 啟發式（BSR 加權） | experiences < 200 或未完成訓練 | `_infer_heuristic()` |
-| Dirichlet 探索 | 啟發式階段 + 30% 機率 | `np.random.dirichlet()` |
-| DRL 推論 | 完成首次訓練後 | `Actor.forward()` |
+| Dirichlet 探索 | 啟發式階段 + 30% 機率 | `np.random.dirichlet(α=0.7)` |
+| DRL 推論 | 完成首次訓練後 | `Dirichlet(actor_probs × K).sample()` |
 | Fallback | ZeroMQ 超時（5ms） | C 端等比例分配 |
 
 ---
@@ -266,7 +290,8 @@ Collection 命名規則：`node{1~5}_experiences`（各 Node 獨立儲存）。
         ▼
 [Inference Server Python / ZeroMQ REP]
   encode_state() → state_vec (33,)
-  Actor.forward() 或 _infer_heuristic()
+  DRL: Actor.forward() → probs → Dirichlet(probs × K).sample() → action_ratios
+  啟發式: _infer_heuristic() → action_ratios
   → allocations: [{"rnti", "prb_abs"}, ...]
         │
         ▼
@@ -275,7 +300,7 @@ Collection 命名規則：`node{1~5}_experiences`（各 Node 獨立儲存）。
         │
         ▼ (下一個 10ms 收到新 state)
 [reward_calculator.py]
-  compute_reward(prev_ues, prev_alloc) → reward
+  compute_reward(curr_ues, prev_alloc) → reward   ← 用 S_t 計算 A_{t-1} 的效果
   存入 MongoDB
         │
         ▼ (每 60 秒)

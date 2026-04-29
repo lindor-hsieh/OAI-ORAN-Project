@@ -375,15 +375,18 @@ class InferenceServer:
         reward 以上一步的 (state, action) 與當前 state 計算，
         實現 one-step TD 結構。
         """
-        # 計算獎勵：R(S_{t-1}, A_{t-1}, S_t)
-        reward = compute_reward(prev_ues, prev_allocations, self.total_prb)
+        # 計算獎勵：R(A_{t-1}, S_t)
+        # 使用 curr_ues（S_t）而非 prev_ues（S_{t-1}）：
+        # S_t.delta_tbs 反映的是 A_{t-1} 排程後的 DL 吞吐量，
+        # 才是 A_{t-1} 真正造成的結果。
+        reward = compute_reward(curr_ues, prev_allocations, self.total_prb)
 
         # 編碼當前狀態 S_t（作為 S' ）
         next_state_vec, next_mask_vec = self._agent.encode_state(curr_ues)
 
         # 獎勵細節（用於 MongoDB 監控）
         breakdown = compute_reward_breakdown(
-            prev_ues, prev_allocations, self.total_prb
+            curr_ues, prev_allocations, self.total_prb
         )
 
         doc: dict[str, Any] = {

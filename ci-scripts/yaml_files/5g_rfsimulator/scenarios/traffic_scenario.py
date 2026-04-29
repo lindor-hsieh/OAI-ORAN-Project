@@ -131,11 +131,12 @@ def _get_ue_ip(container: str) -> Optional[str]:
 
 def start_iperf_client(ue: UEConfig) -> bool:
     """
-    在 UE 容器中啟動 iperf3 UDP 上行客戶端（UE → ext-dn，UL 方向）。
+    在 UE 容器中啟動 iperf3 UDP 下行客戶端（ext-dn → UE，DL 方向，-R reverse）。
 
-    使用 UL 流量讓 UE 的 MAC 層產生非零 BSR（Buffer Status Report），
-    xApp 讀取 BSR 作為 DRL 狀態輸入。若使用 -R（DL），UE 無 UL 資料，
-    BSR 恆為 0，DRL 無法學習。
+    使用 DL 流量讓 gNB DL buffer 持續有資料需要排程，
+    xApp 讀取的 delta_dl_aggr_tbs 才會隨 PRB 分配變化，DRL reward 才有學習信號。
+    若使用 UL 方向，gNB DL buffer 無資料，delta_dl_aggr_tbs ≈ 0，
+    reward 恆為常數，DRL 無法學習。
 
     重啟順序：先取得 UE IP（舊 iperf3 仍在跑，oaitun_ue1 必然存在），
     再 pkill 舊進程並立刻啟動新進程，將流量空隙壓縮至毫秒級，
@@ -150,11 +151,12 @@ def start_iperf_client(ue: UEConfig) -> bool:
         "docker", "exec", "-d", ue.container,
         "iperf3",
         "-c", EXT_DN_IP,
-        "-u",                           # UDP
-        "-b", f"{ue.bandwidth_mbps:.0f}M",   # UL：UE → ext-dn，產生 BSR
+        "-u",                                # UDP
+        "-b", f"{ue.bandwidth_mbps:.0f}M",   # 請求 DL 頻寬（遠大於實際通道容量，填滿 DL buffer）
+        "-R",                                # Reverse：ext-dn → UE（DL 方向）
         "-t", str(IPERF_DURATION),
         "-p", str(ue.iperf_port),
-        "-B", ue_ip,                    # 綁定 PDN 介面 IP，確保流量走 5G 路徑
+        "-B", ue_ip,                         # 綁定 PDN 介面 IP，確保流量走 5G 路徑
         "--forceflush",
     ]
 

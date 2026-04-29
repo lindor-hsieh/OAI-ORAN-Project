@@ -47,6 +47,8 @@ LR_CRITIC: float = 3e-4
 HIDDEN_DIM: int = 128
 TRAIN_BATCH_SIZE: int = 128
 MIN_TRAIN_EXPERIENCES: int = 200         # 觸發第一次訓練所需的最少經驗數
+DIRICHLET_CONCENTRATION: float = 5.0    # Dirichlet 策略集中度 K：α = probs × K
+                                         # K 越大越確定性，K 越小探索性越強
 
 
 # =============================================================================
@@ -220,15 +222,13 @@ class DRLAgent:
 
         self.actor.eval()
         with torch.no_grad():
-            ratios = self.actor(state_t, mask_t)[0].cpu().numpy()  # (MAX_UE_COUNT,)
+            probs = self.actor(state_t, mask_t)[0]          # (MAX_UE_COUNT,) on device
 
-        # 只取活躍 UE 的比例並重新正規化
-        active_ratios = ratios[:n].copy()
-        total = active_ratios.sum()
-        if total > 1e-8:
-            active_ratios /= total
-        else:
-            active_ratios[:] = 1.0 / n
+            # Dirichlet 隨機策略：從 Dirichlet(α = probs[:n] × K) 採樣
+            # 確保 action_ratios ≠ actor probs，訓練時 log π(a|s) 梯度有效
+            alpha = torch.clamp(probs[:n] * DIRICHLET_CONCENTRATION, min=1e-3)
+            dist = torch.distributions.Dirichlet(alpha)
+            active_ratios = dist.sample().cpu().numpy()     # (n,)，加總恰好為 1
 
         # 轉換為整數 PRB，修正捨入誤差
         prb_floats = active_ratios * self.total_prb
@@ -249,10 +249,9 @@ class DRLAgent:
             for i in range(n)
         ]
 
-        # 建立完整的 action_ratios 向量 (含非活躍 slot)
+        # 儲存 Dirichlet 採樣值（四捨五入前），供訓練時計算 log π(a|s)
         action_ratios = np.zeros(MAX_UE_COUNT, dtype=np.float32)
-        for i in range(n):
-            action_ratios[i] = prb_ints[i] / self.total_prb
+        action_ratios[:n] = active_ratios
 
         return allocations, action_ratios
 
@@ -328,30 +327,52 @@ class DRLAgent:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_opt.step()
 
-        # ── Actor 更新 (Advantage-weighted Policy Gradient) ───────────────
+        # ── Actor 更新 (Dirichlet Policy Gradient) ────────────────────────
         self.actor.train()
         with torch.no_grad():
-            # Advantage = TD target - V(s)
             advantages = (targets - self.critic(states)).detach()
-            # 正規化 advantage，提升訓練穩定性
             if advantages.std() > 1e-8:
                 advantages = (advantages - advantages.mean()) / (
                     advantages.std() + 1e-8
                 )
 
-        # π(a|s) 的 log 機率
         probs = self.actor(states, masks)              # (batch, MAX_UE_COUNT)
-        log_probs = torch.log(probs + 1e-8)           # 數值穩定
 
-        # Actor loss = -E[advantage × Σ(log π(a_i|s) × ratio_i)]
-        # 以儲存的 action_ratios 作為「示範動作」的連續加權 log 機率
-        weighted_log_prob = (log_probs * actions).sum(dim=1)  # (batch,)
-        actor_loss = -(advantages * weighted_log_prob).mean()
+        # 對每個樣本分別計算 Dirichlet log π(a|s) 與 entropy
+        # 每個樣本的活躍 UE 數量不同，需逐一處理
+        log_probs_list: list[torch.Tensor] = []
+        entropy_list: list[torch.Tensor] = []
+        for i in range(len(batch)):
+            n_i = int(masks[i].sum().item())
+            if n_i == 0:
+                log_probs_list.append(torch.tensor(0.0, device=self.device))
+                entropy_list.append(torch.tensor(0.0, device=self.device))
+                continue
 
-        # Entropy 正規化：鼓勵探索，係數隨訓練步數衰減以允許收斂
-        entropy = -(probs * log_probs).sum(dim=1).mean()
+            alpha_i = torch.clamp(
+                probs[i, :n_i] * DIRICHLET_CONCENTRATION, min=1e-3
+            )
+            dist_i = torch.distributions.Dirichlet(alpha_i)
+
+            # 取出此樣本的儲存動作（active UE 子集），正規化確保加總為 1
+            a_i = actions[i, :n_i]
+            a_sum = a_i.sum()
+            if a_sum < 1e-8:
+                log_probs_list.append(torch.tensor(0.0, device=self.device))
+                entropy_list.append(dist_i.entropy())
+                continue
+            a_i = torch.clamp(a_i / a_sum, min=1e-6)
+            a_i = a_i / a_i.sum()
+
+            log_probs_list.append(dist_i.log_prob(a_i))
+            entropy_list.append(dist_i.entropy())
+
+        log_probs_t = torch.stack(log_probs_list)    # (batch,)
+        entropy_t   = torch.stack(entropy_list)       # (batch,)
+
+        actor_loss = -(advantages * log_probs_t).mean()
         entropy_coeff = max(0.001, 0.01 * (0.997 ** self._train_steps))
-        actor_loss = actor_loss - entropy_coeff * entropy
+        actor_loss = actor_loss - entropy_coeff * entropy_t.mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()

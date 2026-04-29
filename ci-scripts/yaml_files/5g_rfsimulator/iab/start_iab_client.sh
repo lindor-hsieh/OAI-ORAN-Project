@@ -281,23 +281,23 @@ COUNT=0
 while [ $COUNT -lt 60 ]; do
     if [ $DONE_NODE3 -eq 1 ] && [ $DONE_NODE4 -eq 1 ] && [ $DONE_NODE5 -eq 1 ]; then break; fi
 
-    if [ $DONE_NODE3 -eq 0 ] && docker exec rfsim5g-iab-mt-3 ip addr show oaitun_ue1 &>/dev/null; then
+    if [ $DONE_NODE3 -eq 0 ] && docker exec rfsim5g-iab-mt-3 ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
         configure_and_start_du "rfsim5g-iab-mt-3" "rfsim5g-iab-du-3" "$DU3_IP"
         DONE_NODE3=1
     fi
-    if [ $DONE_NODE4 -eq 0 ] && docker exec rfsim5g-iab-mt-4 ip addr show oaitun_ue1 &>/dev/null; then
+    if [ $DONE_NODE4 -eq 0 ] && docker exec rfsim5g-iab-mt-4 ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
         configure_and_start_du "rfsim5g-iab-mt-4" "rfsim5g-iab-du-4" "$DU4_IP"
         DONE_NODE4=1
     fi
-    if [ $DONE_NODE5 -eq 0 ] && docker exec rfsim5g-iab-mt-5 ip addr show oaitun_ue1 &>/dev/null; then
+    if [ $DONE_NODE5 -eq 0 ] && docker exec rfsim5g-iab-mt-5 ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
         configure_and_start_du "rfsim5g-iab-mt-5" "rfsim5g-iab-du-5" "$DU5_IP"
         DONE_NODE5=1
     fi
     sleep 5; COUNT=$((COUNT+1))
 done
 
-echo -e "${CYAN}Finalizing Control Plane, waiting 5s...${NC}"
-sleep 5
+echo -e "${CYAN}Finalizing Control Plane, waiting 15s...${NC}"
+sleep 15
 
 echo -e "\n${CYAN}[4/5] Launching All 6 End-UEs...${NC}"
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-end-ue-1 rfsim5g-end-ue-2 rfsim5g-end-ue-3 rfsim5g-end-ue-4 rfsim5g-end-ue-5 rfsim5g-end-ue-6

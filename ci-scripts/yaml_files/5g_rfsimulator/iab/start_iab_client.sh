@@ -37,19 +37,38 @@ DONE_NODE3=0; DONE_NODE4=0; DONE_NODE5=0
 CU_MAGIC_COMMANDS="docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT"
 SSH_AVAILABLE=false
 
-# 檢查 SSH 連線是否可用
+# 等待 PC1 SSH 可用，再等待 rfsim5g-donor-cu 起來後清空 NAT TABLE
+# 若 CU 未就緒就繼續，舊 DNAT 規則會殘留導致 GTP 送錯 MT，F1-U DRB 狀態損壞
+echo -e "${CYAN}[SSH] 等待 PC1 SSH 連線...${NC}"
+_wait=0
+until ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; do
+    sleep 3; _wait=$((_wait+3))
+    echo -ne "\r  等待 PC1 SSH... ${_wait}s"
+    if [ $_wait -ge 120 ]; then
+        echo -e "\n${YELLOW}[SSH] 無法連線 PC1，將改為印出 CU magic commands 供手動執行${NC}"
+        echo -e "${YELLOW}[SSH] 若要啟用自動模式，請在 PC2 執行：ssh-copy-id ${PC1_USER}@${PC1_IP}${NC}"
+        break
+    fi
+done
+
 if ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; then
     SSH_AVAILABLE=true
-    echo -e "${GREEN}[SSH] PC1 SSH 連線可用，CU magic commands 將自動執行${NC}"
-    # 先清空 OUTPUT NAT table
-    ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} \
-        "docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT" 2>/dev/null \
-        && echo -e "${GREEN}[SSH] OUTPUT NAT table 已清空${NC}" \
-        || echo -e "${YELLOW}[SSH] 清空 NAT table 失敗，請確認 rfsim5g-donor-cu 已啟動${NC}"
-else
-    echo -e "${YELLOW}[SSH] 無法連線 PC1，將改為印出 CU magic commands 供手動執行${NC}"
-    echo -e "${YELLOW}[SSH] 若要啟用自動模式，請在 PC2 執行：${NC}"
-    echo -e "${CYAN}       ssh-copy-id ${PC1_USER}@${PC1_IP}${NC}"
+    echo -e "${GREEN}[SSH] PC1 SSH 連線可用${NC}"
+
+    # 等待 rfsim5g-donor-cu 容器就緒，再清空 OUTPUT NAT TABLE
+    # 必須等 CU 就緒，否則 flush 靜默失敗，舊規則殘留
+    echo -e "${CYAN}[SSH] 等待 rfsim5g-donor-cu 就緒...${NC}"
+    _wait=0
+    until ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} \
+        "docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT" 2>/dev/null; do
+        sleep 3; _wait=$((_wait+3))
+        echo -ne "\r  等待 CU... ${_wait}s"
+        if [ $_wait -ge 180 ]; then
+            echo -e "\n${RED}[SSH] 等待 CU 超時！請確認 run_local_pc1.sh 已先執行${NC}"
+            exit 1
+        fi
+    done
+    echo -e "${GREEN}[SSH] CU NAT OUTPUT table 已清空${NC}"
 fi
 
 echo -e "${CYAN}[0/5] Loading Kernel Modules & Macvlan Prep...${NC}"

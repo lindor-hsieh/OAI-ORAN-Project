@@ -27,11 +27,13 @@
 ### 核心控制元件定義
 
 1.  **Local xApp (PC 1 & PC 2)**：
-    * **實作**：C 語言 FlexRIC 程式 + Python ZeroMQ 推論伺服器 (部署於 5 個獨立容器)。
-    * **職責**：毫秒級局部迴圈 (10ms)。具備「局部視野 (Local View)」，透過 E2SM-MAC 擷取所屬 Node 的 BSR 與 CQI，交由 Python 神經網路進行瞬間推論，將輸出的 PRB 權重分配陣列寫回 OAI MAC 層。
+    * **實作**：純 C 語言 FlexRIC 程式。
+    * **職責**：毫秒級局部迴圈 (10ms)。**只負責 PRB 分配這一個動作**：透過 E2SM-MAC 擷取所屬 Node 的 BSR 與 CQI，將 JSON 狀態透過 ZeroMQ REQ 送給 Local rApp Python 端，收回 PRB 權重陣列後立即寫回 OAI MAC 層。C 語言端不含任何 AI 邏輯，確保在毫秒內完成。
 2.  **Local rApp / Flower Client (PC 1 & PC 2)**：
-    * **實作**：Python 程式 (與 Local xApp 推論伺服器運行於同一進程，共享模型)。
-    * **職責**：秒/分鐘級迴圈。從 MongoDB 讀取歷史狀態與獎勵，執行本地模型微調 (Fine-tuning)，準備參與聯邦學習。
+    * **實作**：Python ZeroMQ REP 伺服器（部署於 5 個獨立容器），與 Flower Client 運行於同一進程、共享 DRL 模型。
+    * **職責（雙重角色）**：
+      * **Near-RT 推論（毫秒級）**：接收 Local xApp 的 ZeroMQ 請求，執行 DRL Actor 網路 forward pass，回傳 PRB 權重陣列，並將 State/Action/Reward 非同步寫入 MongoDB。
+      * **Non-RT Fine-tuning（秒/分鐘級）**：從 MongoDB 讀取歷史資料，執行本地模型微調，準備作為 Flower Client 參與聯邦學習聚合。
 3.  **Global xApp (PC 1)**：
     * **實作**：獨立的 Python Docker 容器。
     * **職責**：毫秒級全域迴圈 (10ms)。具備「全域視野 (Global View)」，透過 ZeroMQ 接收全網 5 個 Node 的瞬時狀態，負責跨節點的巨觀調度推論（例如：動態介入 IAB 節點間的回傳鏈路 Backhaul 頻寬配額），以避免局部最優導致的全局壅塞。
@@ -61,15 +63,16 @@
 * **Python 對接**：建立 Python 端的 ZeroMQ REP 伺服器，解析 JSON 狀態並回傳推論結果。
 * **資料持久化**：將每次的 State (狀態)、Action (決策) 寫入 MongoDB，為聯邦學習準備歷史資料集。
 
-### 第四階段：Local 單節點 AI 閉環控制 (當前進行中)
+### 第四階段：Local 單節點 AI 閉環控制 + Local rApp (當前進行中)
 * **模型建構**：在 Python 端建立深度強化學習 (DRL) Actor 網路。
 * **Reward 設計**：撰寫複合獎勵函數，結合 Throughput 最大化、Delay 懲罰與 Fairness 補償。
 * **穩定度測試**：讓 AI 取代 Hardcode 邏輯，觀察系統在高併發流量下的穩定度。
+* **Local rApp 開發**：與 Local xApp 推論伺服器運行於**同一 Python 進程、共享 DRL 模型**。從 MongoDB 讀取歷史 State/Action/Reward，執行本地模型 Fine-tuning，為第五階段 Flower Client 整合做準備。
 
 ### 第五階段：Global 控制平面與聯邦學習整合 (待開發)
 * **Global xApp 開發**：建構全域 Python 容器，透過 ZeroMQ 收集全網狀態，實作跨節點的回傳鏈路頻寬限制或路由覆寫邏輯。
 * **Flower Server 啟動**：在 PC 1 啟動 Flower Server，實作自定義的 `aggregate_kpm_metrics` 以計算全網 Jain's Fairness。
-* **跨機權重同步**：將 Local Python 程式擴充為 Flower Client，實作 `train()` 方法讀取 MongoDB 資料進行訓練，並驗證 TCP 控制封包能穩定穿透實體 Backhaul 鏈路完成權重同步。
+* **Local rApp 擴充為 Flower Client**：在第四階段 Local rApp 基礎上，實作 `train()` 方法將本地 Fine-tuning 結果上傳，並驗證 TCP 控制封包能穩定穿透實體 Backhaul 鏈路完成權重同步。
 
 ### 第六階段：實驗數據驗證與論文撰寫 (待開發)
 * 設定動態干擾與高負載測試情境。
@@ -119,33 +122,30 @@
 
 ## 7. 注意事項
 
-目前先從第三階段開始開發，依據我之前的經驗開發一個xApp至少要修改以下這些檔案
-`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl.c`
+目前進行中為**第四階段**（DRL 閉環控制 + Local rApp）。開發 xApp 至少要修改以下這些檔案：
 
-`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/../mac_data_ie.c`
+**xApp 本體（每個 Node 各自獨立，共 5 份）**
+`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node1.c`
+`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node2.c`
+`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node3.c`
+`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node4.c`
+`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node5.c`
 
-`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/../mac_data_ie.h`
-
-`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/../mac_enc_plain.c`
-
-`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/../mac_dec_plain.c`
-
-`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/../mac_sm_agent.c`
-
+**共用底層檔案（Node 1~5 共用，修改須謹慎）**
+`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/ie/mac_data_ie.c`
+`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/ie/mac_data_ie.h`
+`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/enc/mac_enc_plain.c`
+`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/dec/mac_dec_plain.c`
+`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/mac_sm_agent.c`
 `~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/mac_sm_ric.c`
-
 `~/openairinterface5g/openair2/E2AP/flexric/src/xApp/sm_ran_function_def.c`
-
-`~/openairinterface5g/openair2/E2AP/flexric/test/sm/mac_sm/main.c`
-
-`~/openairinterface5g/openair2/E2AP/RAN_FUNCTION/../ran_func_mac.c`
-
+`~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/test/main.c`
+`~/openairinterface5g/openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_mac.c`
 `~/openairinterface5g/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h`
-
 `~/openairinterface5g/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c`
-
 `~/openairinterface5g/openair2/E2AP/flexric/src/xApp/db/sqlite3/sqlite3_wrapper.c`
-我希望除了`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl.c`這個是 xApp 本身,能有五份程式碼給不同的 node ,其他都檔案能夠讓node 1~node 5的 xApp 共用,刪除整份檔案需要經過我的授權,所有修改都先在這個電腦(PC 1)完成就好,我會再將修改好的檔案傳給(PC 2)
+
+> **規則**：刪除整份檔案需經過授權。所有修改先在 PC 1 完成，再將修改好的檔案傳給 PC 2。
 
 ---
 

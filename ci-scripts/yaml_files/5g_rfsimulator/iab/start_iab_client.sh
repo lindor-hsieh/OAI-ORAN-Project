@@ -72,6 +72,12 @@ if ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; then
     ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} \
         "docker exec -u 0 rfsim5g-donor-cu conntrack -F 2>/dev/null || true" 2>/dev/null
     echo -e "${GREEN}[SSH] CU conntrack 已清空${NC}"
+    # 清除 OAI CU/UPF 跨次執行累積的 12.1.1.x stale host routes
+    # CU 使用 host networking，這些 route 寫在 PC1 主機的路由表裡，docker compose down 不會清除
+    # 若舊 route 指向錯誤的 MT transport IP，GTP 封包會被送到錯誤容器
+    ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} \
+        'docker exec -u 0 rfsim5g-donor-cu bash -c "ip route show | awk \"/^12\\.1\\.1\\.[0-9]+ /{print \$1}\" | while read r; do ip route del \$r 2>/dev/null; done"' 2>/dev/null
+    echo -e "${GREEN}[SSH] 12.1.1.x stale host routes 已清除${NC}"
 fi
 
 echo -e "${CYAN}[0/5] Loading Kernel Modules & Macvlan Prep...${NC}"
@@ -185,7 +191,6 @@ reapply_dnat_rules() {
     if [ "$SSH_AVAILABLE" = true ]; then
         ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "
             docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT
-            docker exec -u 0 rfsim5g-donor-cu conntrack -F 2>/dev/null || true
             docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU3_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT3_IP}
             docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU4_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT4_IP}
             docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU5_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT5_IP}
@@ -367,6 +372,9 @@ reapply_dnat_rules
 echo -e "\n${CYAN}[4/5] Launching All 6 End-UEs...${NC}"
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-end-ue-1 rfsim5g-end-ue-2 rfsim5g-end-ue-3 rfsim5g-end-ue-4 rfsim5g-end-ue-5 rfsim5g-end-ue-6
 for i in {1..6}; do wait_for_ue "rfsim5g-end-ue-$i"; done
+
+# UE 附著期間 MT PDU session 可能再次重建（IP 飄移），重新確認 DNAT 規則
+reapply_dnat_rules
 
 echo -e "\n${YELLOW}====================================================${NC}"
 if [ "$SSH_AVAILABLE" = true ]; then

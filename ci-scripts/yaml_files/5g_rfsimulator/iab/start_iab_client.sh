@@ -69,6 +69,9 @@ if ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; then
         fi
     done
     echo -e "${GREEN}[SSH] CU NAT OUTPUT table 已清空${NC}"
+    ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} \
+        "docker exec -u 0 rfsim5g-donor-cu conntrack -F 2>/dev/null || true" 2>/dev/null
+    echo -e "${GREEN}[SSH] CU conntrack 已清空${NC}"
 fi
 
 echo -e "${CYAN}[0/5] Loading Kernel Modules & Macvlan Prep...${NC}"
@@ -114,6 +117,7 @@ configure_and_start_du() {
     docker exec -u 0 $MT_NAME sysctl -w net.ipv4.ip_forward=1 >/dev/null
     docker exec -u 0 $MT_NAME iptables -t nat -F PREROUTING
     docker exec -u 0 $MT_NAME iptables -t nat -F POSTROUTING
+    docker exec -u 0 $MT_NAME conntrack -F 2>/dev/null || true
     docker exec -u 0 $MT_NAME iptables -t nat -A POSTROUTING -s $DU_DOCKER_IP -o oaitun_ue1 -j MASQUERADE
     docker exec -u 0 $MT_NAME iptables -t nat -A PREROUTING -i oaitun_ue1 -p sctp -j DNAT --to-destination $DU_DOCKER_IP
     docker exec -u 0 $MT_NAME iptables -t nat -A PREROUTING -i oaitun_ue1 -p udp --dport 2152 -j DNAT --to-destination $DU_DOCKER_IP
@@ -156,6 +160,46 @@ configure_and_start_du() {
 
     echo -e "${YELLOW} Waiting 10s for CU F1AP stability...${NC}"
     sleep 10
+}
+
+# 重新驗證並套用 CU DNAT 規則
+# MT 的 oaitun_ue1 IP 在 DU3~5 啟動期間可能被 5GC 重新分配（IP 飄移），
+# 導致舊 DNAT 規則指向錯誤 MT，UE 資料面斷線。
+# 此函式在 UE 啟動前原子性地 flush + 重建三條規則。
+reapply_dnat_rules() {
+    echo -e "${CYAN}[DNAT] 重新驗證 CU DNAT 規則（防止 MT tunnel IP 飄移）...${NC}"
+
+    local MT3_IP=$(docker exec rfsim5g-iab-mt-3 ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+    local MT4_IP=$(docker exec rfsim5g-iab-mt-4 ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+    local MT5_IP=$(docker exec rfsim5g-iab-mt-5 ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+
+    echo -e "   DU3 (${DU3_IP}) → MT3 tunnel: ${MT3_IP:-MISSING}"
+    echo -e "   DU4 (${DU4_IP}) → MT4 tunnel: ${MT4_IP:-MISSING}"
+    echo -e "   DU5 (${DU5_IP}) → MT5 tunnel: ${MT5_IP:-MISSING}"
+
+    if [ -z "$MT3_IP" ] || [ -z "$MT4_IP" ] || [ -z "$MT5_IP" ]; then
+        echo -e "   ${RED}[DNAT] 有 MT tunnel IP 缺失，請確認 IAB MT 容器狀態${NC}"
+        return 1
+    fi
+
+    if [ "$SSH_AVAILABLE" = true ]; then
+        ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "
+            docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT
+            docker exec -u 0 rfsim5g-donor-cu conntrack -F 2>/dev/null || true
+            docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU3_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT3_IP}
+            docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU4_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT4_IP}
+            docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU5_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT5_IP}
+        " 2>/dev/null \
+            && echo -e "   ${GREEN}[DNAT] 全部 3 條規則已更新 ✓${NC}" \
+            || echo -e "   ${RED}[DNAT] SSH 更新失敗，請手動執行上述指令${NC}"
+    else
+        echo -e "   ${YELLOW}[DNAT] SSH 不可用，請在 PC1 手動執行：${NC}"
+        echo -e "   docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT"
+        echo -e "   docker exec -u 0 rfsim5g-donor-cu conntrack -F"
+        echo -e "   docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU3_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT3_IP}"
+        echo -e "   docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU4_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT4_IP}"
+        echo -e "   docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${DU5_IP} -p udp --dport 2152 -j DNAT --to-destination ${MT5_IP}"
+    fi
 }
 
 wait_for_ue() {
@@ -317,6 +361,8 @@ done
 
 echo -e "${CYAN}Finalizing Control Plane, waiting 15s...${NC}"
 sleep 15
+
+reapply_dnat_rules
 
 echo -e "\n${CYAN}[4/5] Launching All 6 End-UEs...${NC}"
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-end-ue-1 rfsim5g-end-ue-2 rfsim5g-end-ue-3 rfsim5g-end-ue-4 rfsim5g-end-ue-5 rfsim5g-end-ue-6

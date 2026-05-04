@@ -386,7 +386,7 @@ class DRLAgent:
             "train_step":  self._train_steps,
             "actor_loss":  float(actor_loss.item()),
             "critic_loss": float(critic_loss.item()),
-            "entropy":     float(entropy.item()),
+            "entropy":     float(entropy_t.mean().item()),
             "mean_reward": float(rewards.mean().item()),
             "mean_adv":    float(advantages.mean().item()),
         }

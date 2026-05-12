@@ -131,40 +131,39 @@ def _get_ue_ip(container: str) -> Optional[str]:
 
 def start_iperf_client(ue: UEConfig) -> bool:
     """
-    在 UE 容器中啟動 iperf3 UDP 下行客戶端（ext-dn → UE，DL 方向，-R reverse）。
+    在 UE 容器內以 while loop 持續執行 iperf3 UDP 下行客戶端。
 
-    使用 DL 流量讓 gNB DL buffer 持續有資料需要排程，
-    xApp 讀取的 delta_dl_aggr_tbs 才會隨 PRB 分配變化，DRL reward 才有學習信號。
-    若使用 UL 方向，gNB DL buffer 無資料，delta_dl_aggr_tbs ≈ 0，
-    reward 恆為常數，DRL 無法學習。
+    不使用 docker exec -d（detached）：-d 會讓 docker exec 立刻以 rc=0 返回，
+    導致 _iperf_proc.poll() 馬上非 None，watchdog 誤判死亡並不斷重啟。
 
-    重啟順序：先取得 UE IP（舊 iperf3 仍在跑，oaitun_ue1 必然存在），
-    再 pkill 舊進程並立刻啟動新進程，將流量空隙壓縮至毫秒級，
-    避免 gNB inactivity timer 釋放 RRC 連線導致 UE crash。
+    改為前台執行 sh -c "while true; do iperf3 ...; sleep 3; done"：
+    - docker exec 持續存活，poll() 恆為 None → watchdog 不誤觸發
+    - iperf3 若因任何原因退出，容器內 loop 自動重啟（3 秒後）
+    - trap TERM/INT 確保 stop_iperf_client 可以乾淨地終止整個 loop
     """
     ue_ip = _get_ue_ip(ue.container)
     if ue_ip is None:
         log.error("%s: oaitun_ue1 不存在，跳過 iperf3 啟動", ue.container)
         return False
 
-    cmd = [
-        "docker", "exec", "-d", ue.container,
-        "iperf3",
-        "-c", EXT_DN_IP,
-        "-u",                                # UDP
-        "-b", f"{ue.bandwidth_mbps:.0f}M",   # 請求 DL 頻寬（遠大於實際通道容量，填滿 DL buffer）
-        "-R",                                # Reverse：ext-dn → UE（DL 方向）
-        "-t", str(IPERF_DURATION),
-        "-p", str(ue.iperf_port),
-        "-B", ue_ip,                         # 綁定 PDN 介面 IP，確保流量走 5G 路徑
-        "--forceflush",
-    ]
+    loop_cmd = (
+        f"trap 'pkill -f iperf3; exit 0' TERM INT; "
+        f"while true; do "
+        f"iperf3 -c {EXT_DN_IP} -u -b {ue.bandwidth_mbps:.0f}M -R "
+        f"-t {IPERF_DURATION} -p {ue.iperf_port} -B {ue_ip} --forceflush; "
+        f"sleep 3; "
+        f"done"
+    )
+    cmd = ["docker", "exec", ue.container, "sh", "-c", loop_cmd]
 
     try:
-        # 停舊進程後立刻啟動新進程，縮短無流量的空窗期
         stop_iperf_client(ue)
-        ue._iperf_proc = subprocess.Popen(cmd)
-        log.info("iperf3 start: %s → %s:%d @ %.0fMbps",
+        ue._iperf_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("iperf3 loop start: %s → %s:%d @ %.0fMbps",
                  ue.container, EXT_DN_IP, ue.iperf_port, ue.bandwidth_mbps)
         return True
     except FileNotFoundError:
@@ -173,13 +172,20 @@ def start_iperf_client(ue: UEConfig) -> bool:
 
 
 def stop_iperf_client(ue: UEConfig) -> None:
-    """停止 UE 容器中所有 iperf3 進程。"""
+    """停止 UE 容器中的 iperf3 loop（先殺容器內程序，再終止 docker exec）。"""
+    # 殺容器內的 iperf3 與 sh loop（SIGTERM 觸發 trap，sh 會自行退出）
     subprocess.run(
-        ["docker", "exec", ue.container, "pkill", "-f", "iperf3"],
-        capture_output=True,
+        ["docker", "exec", ue.container, "sh", "-c",
+         "pkill -f iperf3 2>/dev/null; pkill -f 'while true' 2>/dev/null; true"],
+        capture_output=True, timeout=5,
     )
     if ue._iperf_proc:
-        ue._iperf_proc.wait()
+        try:
+            ue._iperf_proc.terminate()
+            ue._iperf_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ue._iperf_proc.kill()
+            ue._iperf_proc.wait()
         ue._iperf_proc = None
 
 
@@ -402,16 +408,21 @@ def run_dynamic_scenario(
                 if ue._iperf_proc is None:
                     start_iperf_client(ue)
 
-            # 每 5 秒輪詢一次，偵測並重啟已死亡的 iperf3（poll() != None 表示已退出）
+            # 每 10 秒輪詢一次，只處理容器級別的失敗
+            # iperf3 崩潰由容器內 while loop 自動處理（3 秒重啟），不需外部介入
             deadline = time.time() + phase_duration
             while time.time() < deadline:
-                time.sleep(5)
+                time.sleep(10)
                 for ue in ues:
                     if ue._iperf_proc is not None and ue._iperf_proc.poll() is not None:
-                        log.warning("iperf3 意外結束 %s (rc=%d)，重啟中...",
+                        log.warning("iperf3 supervisor 退出 %s (rc=%d)，等待 tunnel 後重啟...",
                                     ue.container, ue._iperf_proc.returncode)
                         ue._iperf_proc = None
-                        start_iperf_client(ue)
+                        time.sleep(8)
+                        if _get_ue_ip(ue.container) is not None:
+                            start_iperf_client(ue)
+                        else:
+                            log.warning("%s tunnel 未就緒，跳過本次重啟", ue.container)
     except KeyboardInterrupt:
         log.info("收到中斷，停止動態場景（共執行 %d 個相位）", phase)
     finally:

@@ -26,14 +26,15 @@ import numpy as np
 # 超參數
 # =============================================================================
 
-# 獎勵權重（三項總計 1.0，與舊設計保持相同比例）
-W_THROUGHPUT: float = 0.5   # 吞吐量最大化
-W_FAIRNESS:   float = 0.3   # Jain's Fairness 公平性
+# 獎勵權重（三項總計 1.0）
+W_THROUGHPUT: float = 0.4   # 吞吐量最大化
+W_FAIRNESS:   float = 0.4   # Jain's Fairness 公平性（與吞吐量並重）
 W_DELAY:      float = 0.2   # PRB 效率懲罰（間接延遲代理）
 
-# delta_tbs 正規化參考值 (bytes/10ms)
-# 106 PRB × MCS28 ≈ 100,000 bytes per 10ms（峰值上限）
-MAX_BSR: float = 100_000.0
+# delta_tbs 正規化參考值 (bytes/100ms)
+# C xApp rate limiter 每 10 個 MAC callback 才送一次 ZMQ，測量窗口為 100ms。
+# 106 PRB × MCS28 ≈ 80 Mbps = 1,000,000 bytes per 100ms（峰值上限）
+MAX_BSR: float = 1_000_000.0
 
 
 # =============================================================================
@@ -111,6 +112,12 @@ def compute_reward_breakdown(
     dp_arr  = np.array(delay_penalties, dtype=np.float64)
 
     r_tp    = float(tp_arr.mean())
+
+    # 所有 UE 皆無流量（idle 狀態）→ 不懲罰，直接回傳 0
+    # 原本 r_delay=1.0 會導致 reward=-0.2，污染訓練資料
+    if r_tp < 1e-9:
+        return {"reward": 0.0, "r_throughput": 0.0, "r_fairness": 0.0, "r_delay": 0.0}
+
     r_fair  = _jains_fairness(tp_arr)
     r_delay = float(dp_arr.mean())
 

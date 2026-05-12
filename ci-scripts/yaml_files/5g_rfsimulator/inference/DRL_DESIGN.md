@@ -20,7 +20,7 @@ OAI gNB (C 語言)
 
 | 欄位 | OAI 結構體欄位 | 說明 | 備註 |
 |---|---|---|---|
-| **Δ DL TBS** | `dl_aggr_tbs` 差分 | 每 10ms callback 實際傳送的 DL bytes | 累計值差分，反映瞬時吞吐量 |
+| **Δ DL TBS** | `dl_aggr_tbs` 差分 | 每 **100ms** 實際傳送的 DL bytes | C xApp Rate Limiter：每 10 個 MAC callback 才觸發一次 ZMQ，測量窗口為 100ms |
 | **DL MCS** | `dl_mcs1` | 下行 Modulation and Coding Scheme index (0–28) | 通道品質代理指標 |
 
 > **注意**：OAI RF Simulator 的 `dl_buffer_info`（DL buffer queue depth）與 `wb_cqi`（Wideband CQI）在模擬環境下恆為 0，因此改用上述兩個欄位作為 state 輸入。
@@ -43,7 +43,7 @@ state_vec = [
 
 | 特徵 | 正規化方式 | 範圍 |
 |---|---|---|
-| `norm_tbs_i` | `log(1 + Δtbs_i) / log(1 + 100000)` | [0, 1] |
+| `norm_tbs_i` | `log(1 + Δtbs_i) / log(1 + 1000000)` | [0, 1] |
 | `norm_mcs_i` | `mcs_i / 28.0` | [0, 1] |
 | `active_ratio` | `n_active / 16` | [0, 1] |
 
@@ -125,13 +125,13 @@ $$R = W_{tp} \cdot R_{tp} + W_{fair} \cdot R_{fair} - W_{delay} \cdot R_{delay}$
 | $R_{fair}$ | 0.3 | $\dfrac{(\sum_i \Delta TBS_i)^2}{N \cdot \sum_i \Delta TBS_i^2}$ | Jain's Fairness Index，= 1 表示完全公平 |
 | $R_{delay}$ | 0.2 | $\frac{1}{N}\sum_i \text{clip}\!\left(1 - \dfrac{\Delta TBS_i / B_{max}}{PRB_i / PRB_{total}},\;0,\;1\right)$ | PRB 效率懲罰（越高越差） |
 
-其中 $B_{max} = 100{,}000$ bytes/10ms（對應峰值 ≈ 80 Mbps）。
+其中 $B_{max} = 1{,}000{,}000$ bytes/100ms（對應峰值 ≈ 80 Mbps；C xApp Rate Limiter 使測量窗口為 100ms）。
 
 ### 5.2 各分量說明
 
 **Reward 計算時序**：reward 在步驟 t 觀測到 S_t 時，使用 **S_t**（curr_ues）而非 S_{t-1}（prev_ues）來計算。原因：S_t 的 `Δtbs` 是 gNB 用 A_{t-1} 排程後的實際產出，代表 A_{t-1} 的真實效果；S_{t-1} 的 `Δtbs` 反映的是 A_{t-2}，與 A_{t-1} 無關。
 
-**R_throughput**：衡量 DL 實際吞吐量。`Δtbs_i` 為 C 端 `dl_aggr_tbs` 的差分值（每 10ms 實際傳輸 bytes），直接反映 MAC 層真實產出，而非估計值。
+**R_throughput**：衡量 DL 實際吞吐量。`Δtbs_i` 為 C 端 `dl_aggr_tbs` 的差分值（每 100ms 實際傳輸 bytes，因 Rate Limiter），直接反映 MAC 層真實產出，而非估計值。
 
 **R_fairness**：Jain's Fairness Index（JFI）作用在各 UE 的吞吐量上。JFI = 1 代表所有 UE 吞吐量完全相等；JFI = 1/N 代表資源全集中於單一 UE。論文優化目標為 JFI > 0.924（超越 OAI PF Scheduler baseline）。
 
@@ -159,9 +159,9 @@ $$\text{efficiency}_i = \frac{\Delta TBS_i / B_{max}}{PRB_i / PRB_{total}}$$
 本系統採用**離線 Advantage Actor-Critic（Offline A2C）**，與標準 online A2C 的差異在於訓練資料來自 MongoDB experience replay，而非即時 rollout。
 
 ```
-每 10ms（推論迴圈）：
+每 100ms（推論迴圈，C xApp Rate Limiter = 10 × MAC callback）：
   state_t → Actor → action_t（PRB 分配）→ 寫回 OAI
-  下一個 10ms：state_{t+1}
+  下一個 100ms：state_{t+1}
   計算 reward_t → 寫入 MongoDB
 
 每 60 秒（背景訓練執行緒）：
@@ -177,6 +177,7 @@ $$\mathcal{L}_{critic} = \text{MSE}(V(s),\; r + \gamma \cdot V(s'))$$
 
 - TD target：$r + \gamma \cdot V(s')$，$\gamma = 0.95$
 - 使用 `stop_gradient` 避免 bootstrapping 不穩定
+- **實作順序**：$V(s)$、$V(s')$、Advantage 均在 `critic_opt.step()` **之前**用同一版本的 Critic 計算，確保 TD target 與 baseline 一致，避免新舊 Critic 混用導致梯度偏移
 
 ### 6.3 Actor 更新（Dirichlet Policy Gradient）
 
@@ -197,8 +198,6 @@ $$\sum_i \log\pi(a_i|s) \cdot \pi(a_i|s) = -H(\pi)$$
 Actor loss 退化為熵的最大化/最小化，而非 policy gradient，Actor 無法學習。
 
 新設計以 **Dirichlet 分佈**作為策略：推論時從 $\text{Dir}(\pi_\theta(s) \times K)$ **採樣** action，儲存採樣值（非 softmax 均值），訓練時用 Dirichlet log_prob 計算真正的 policy gradient 梯度。
-
-### 6.4 訓練超參數
 
 ### 6.4 訓練超參數
 
@@ -280,10 +279,10 @@ Collection 命名規則：`node{1~5}_experiences`（各 Node 獨立儲存）。
 ## 9. 整體資料流
 
 ```
-[OAI gNB MAC, 每 10ms]
+[OAI gNB MAC, 每 10ms callback]
   dl_aggr_tbs (累計), dl_mcs1 (0-28)
-        │
-        ▼ delta_tbs = curr - prev  (C 端計算)
+        │  Rate Limiter: 每 10 次 callback 才觸發一次（= 每 100ms）
+        ▼ delta_tbs = curr - prev  (C 端計算，測量窗口 100ms)
 [xApp C / ZeroMQ REQ]
   JSON: {"node_id": X, "ues": [{"rnti", "bsr": delta_tbs, "wb_cqi": mcs}, ...]}
         │

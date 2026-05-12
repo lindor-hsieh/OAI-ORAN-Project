@@ -39,7 +39,9 @@ import torch.optim as optim
 MAX_UE_COUNT: int = 16
 STATE_DIM: int = MAX_UE_COUNT * 2 + 1   # [bsr, cqi] × N + active_ratio
 
-MAX_BSR: float = 100_000.0              # DL delta-TBS 正規化上限 (bytes/10ms, ≈80 Mbps)
+MAX_BSR: float = 1_000_000.0            # DL delta-TBS 正規化上限 (bytes/100ms, ≈80 Mbps)
+                                         # C xApp rate limiter 每 10 個 MAC callback 才送一次 ZMQ，
+                                         # 測量窗口為 100ms，故上限 = 100,000 × 10 = 1,000,000
 GAMMA: float = 0.95                      # 折扣因子
 
 LR_ACTOR: float = 1e-4
@@ -239,10 +241,21 @@ class DRLAgent:
             top_idx = int(np.argmax(fracs))
             prb_ints[top_idx] += remainder
 
-        # 確保每個活躍 UE 至少分配 1 個 PRB
+        # 確保每個活躍 UE 至少分配 5 個 PRB（防止極端分配觸發 MAC 層 SIGSEGV）
+        MIN_PRB = 5
         for i in range(n):
-            if prb_ints[i] < 1:
-                prb_ints[i] = 1
+            if prb_ints[i] < MIN_PRB:
+                prb_ints[i] = MIN_PRB
+        # 修正因保底導致總和超過 total_prb：從最大的逐一扣除
+        overflow = int(prb_ints.sum()) - self.total_prb
+        if overflow > 0:
+            for idx in np.argsort(prb_ints)[::-1]:
+                can_remove = prb_ints[idx] - MIN_PRB
+                remove = min(can_remove, overflow)
+                prb_ints[idx] -= remove
+                overflow -= remove
+                if overflow <= 0:
+                    break
 
         allocations = [
             {"rnti": int(ues[i]["rnti"]), "prb_abs": int(prb_ints[i])}
@@ -315,11 +328,17 @@ class DRLAgent:
 
         # ── Critic 更新 (最小化 TD 誤差) ──────────────────────────────────
         self.critic.train()
+        current_values = self.critic(states)                 # V(s)，舊 Critic
         with torch.no_grad():
-            next_values = self.critic(next_states)           # V(s')
+            next_values = self.critic(next_states)           # V(s')，舊 Critic
             targets = rewards + GAMMA * next_values          # TD target
+            # Advantage 在 Critic 更新前計算，確保 target 與 baseline 使用同一版本 Critic
+            advantages = (targets - current_values).detach()
+            if advantages.std() > 1e-8:
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std() + 1e-8
+                )
 
-        current_values = self.critic(states)                 # V(s)
         critic_loss = F.mse_loss(current_values, targets)
 
         self.critic_opt.zero_grad()
@@ -329,12 +348,6 @@ class DRLAgent:
 
         # ── Actor 更新 (Dirichlet Policy Gradient) ────────────────────────
         self.actor.train()
-        with torch.no_grad():
-            advantages = (targets - self.critic(states)).detach()
-            if advantages.std() > 1e-8:
-                advantages = (advantages - advantages.mean()) / (
-                    advantages.std() + 1e-8
-                )
 
         probs = self.actor(states, masks)              # (batch, MAX_UE_COUNT)
 
@@ -371,7 +384,13 @@ class DRLAgent:
         entropy_t   = torch.stack(entropy_list)       # (batch,)
 
         actor_loss = -(advantages * log_probs_t).mean()
-        entropy_coeff = max(0.001, 0.01 * (0.997 ** self._train_steps))
+        entropy_coeff = max(0.01, 0.01 * (0.997 ** self._train_steps))
+
+        # entropy 緊急保護：entropy < -5 時大幅拉高 entropy 係數，阻止繼續崩潰
+        current_entropy = float(entropy_t.mean())
+        if current_entropy < -5.0:
+            entropy_coeff = max(entropy_coeff, 0.1 * abs(current_entropy) / 5.0)
+
         actor_loss = actor_loss - entropy_coeff * entropy_t.mean()
 
         self.actor_opt.zero_grad()

@@ -42,7 +42,7 @@ from reward_calculator import compute_reward, compute_reward_breakdown
 # =============================================================================
 
 TOTAL_PRB_COUNT: int = 106          # 必須與 C xApp 的 TOTAL_PRB_COUNT 一致
-MIN_PRB_PER_UE: int = 2             # BSR 啟發式：每個 UE 的最小 PRB 保底
+MIN_PRB_PER_UE: int = 5             # BSR 啟發式：每個 UE 的最小 PRB 保底（與 DRL 路徑一致，防止 MAC 層 SIGSEGV）
 ZMQ_POLL_MS: int = 100              # ZMQ poller 超時，允許優雅退出
 MONGO_FLUSH_INTERVAL: float = 1.0   # 批次寫入 MongoDB 的間隔（秒）
 INFERENCE_WARN_MS: float = 4.0      # 推論延遲警告閾值（ms）
@@ -118,6 +118,9 @@ class InferenceServer:
         self._total_inferences: int = 0
         self._drl_inferences: int = 0
         self._heuristic_inferences: int = 0
+
+        # 訓練保護：記錄上一輪訓練時的 MongoDB 筆數，無新資料則跳過
+        self._last_train_mongo_count: int = 0
 
         # 設定日誌格式
         logging.basicConfig(
@@ -219,6 +222,17 @@ class InferenceServer:
         # 先強制寫入緩衝區，確保最新資料可被讀到
         self._flush_to_mongo()
 
+        # 若 MongoDB 筆數與上一輪相同（ZMQ 停擺，無新資料），跳過訓練
+        # 防止在 stale 資料上反覆訓練導致 entropy collapse
+        try:
+            current_count = self._mongo_col.count_documents({})
+        except Exception:
+            current_count = self._last_train_mongo_count
+        if current_count <= self._last_train_mongo_count and self._last_train_mongo_count > 0:
+            self._log.info("MongoDB 無新資料（%d 筆），跳過本輪訓練", current_count)
+            return
+        self._last_train_mongo_count = current_count
+
         # 查詢含完整 RL 欄位的文件
         try:
             cursor = (
@@ -292,16 +306,16 @@ class InferenceServer:
             alpha = np.ones(n, dtype=np.float32) * 0.7
             ratios = np.random.dirichlet(alpha).astype(np.float32)
             prb_floats = ratios * self.total_prb
-            prb_ints = np.maximum(np.floor(prb_floats).astype(np.int32), 1)
+            prb_ints = np.maximum(np.floor(prb_floats).astype(np.int32), MIN_PRB_PER_UE)
             diff = self.total_prb - int(prb_ints.sum())
             if diff > 0:
                 prb_ints[int(np.argmax(ratios))] += diff
             elif diff < 0:
-                # 從最大的逐一減去（保底 1 PRB）
+                # 從最大的逐一減去（保底 MIN_PRB_PER_UE）
                 for idx in np.argsort(prb_ints)[::-1]:
                     if diff >= 0:
                         break
-                    can_remove = int(prb_ints[idx]) - 1
+                    can_remove = int(prb_ints[idx]) - MIN_PRB_PER_UE
                     remove = min(can_remove, -diff)
                     prb_ints[idx] -= remove
                     diff += remove
@@ -535,7 +549,28 @@ class InferenceServer:
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                     self._log.error("請求解析失敗: %s，回傳空分配", exc)
                     # 即使失敗也必須回傳 reply，否則 REQ socket 會卡住
-                    self._zmq_sock.send_string('{"allocations":[]}')
+                    try:
+                        self._zmq_sock.send_string('{"allocations":[]}')
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    # 捕捉所有非預期例外（含 ZMQError、推論崩潰等）
+                    # 必須嘗試送 reply，否則 REP socket 卡在「必須先 send」狀態
+                    self._log.error("推論迴圈非預期例外: %s，嘗試送空分配並重置 socket", exc)
+                    try:
+                        self._zmq_sock.send_string('{"allocations":[]}')
+                    except Exception:
+                        pass
+                    # 重建 ZMQ socket，避免 REP 卡住
+                    try:
+                        poller.unregister(self._zmq_sock)
+                        self._zmq_sock.close(linger=0)
+                        self._zmq_sock = self._zmq_ctx.socket(zmq.REP)
+                        self._zmq_sock.bind(self.zmq_endpoint)
+                        poller.register(self._zmq_sock, zmq.POLLIN)
+                        self._log.info("ZMQ REP socket 已重建")
+                    except Exception as reset_exc:
+                        self._log.error("ZMQ socket 重建失敗: %s", reset_exc)
 
         except KeyboardInterrupt:
             self._log.info("收到中斷訊號，正在關閉...")

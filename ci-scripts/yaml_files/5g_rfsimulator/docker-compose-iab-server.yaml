@@ -164,6 +164,7 @@ services:
         container_name: xapp-node1
         privileged: true
         tty: true
+        restart: on-failure
         depends_on:
             oai-flexric:
                 condition: service_healthy
@@ -185,6 +186,7 @@ services:
         container_name: xapp-node2
         privileged: true
         tty: true
+        restart: on-failure
         depends_on:
             oai-flexric:
                 condition: service_healthy
@@ -206,6 +208,7 @@ services:
         container_name: xapp-node3
         privileged: true
         tty: true
+        restart: on-failure
         depends_on:
             oai-flexric:
                 condition: service_healthy
@@ -235,6 +238,7 @@ services:
         container_name: xapp-node4
         privileged: true
         tty: true
+        restart: on-failure
         depends_on:
             oai-flexric:
                 condition: service_healthy
@@ -256,6 +260,7 @@ services:
         container_name: xapp-node5
         privileged: true
         tty: true
+        restart: on-failure
         depends_on:
             oai-flexric:
                 condition: service_healthy

@@ -12,7 +12,7 @@
 | **PC 2** | IAB Node 3, 4, 5<br>UE 1 ~ 6 | Access Nodes (邊緣存取)<br>終端使用者 | 透過實體網路與 PC 1 連線。Node 3, 4, 5 各自獨立運行專屬的 Local xApp 容器。 |
 
 > **開發進度註記**：目前已確認 PC 1 的 FlexRIC Server 能夠成功與所有 6 個節點 (Donor + 5 IAB Nodes) 建立 SCTP/E2AP 連線，並且驗證了 OAI MAC 層確實開放 PRB 控制權給 xApp 進行覆寫，已開發 Node 1 到 Node 5 各自獨立的 Local xApp 程式碼。
-> **目前尚未開發 Local rApp 程式碼。**
+> **Local rApp 已完成開發**：`inference_server.py` 同一 Python 進程中包含 Near-RT 推論（ZeroMQ REP）與 Non-RT Fine-tuning（背景訓練執行緒，每 60 秒從 MongoDB 讀取經驗執行 Offline A2C 更新）兩個功能，共享同一 DRLAgent 實例。
 
 ---
 
@@ -28,7 +28,7 @@
 
 1.  **Local xApp (PC 1 & PC 2)**：
     * **實作**：純 C 語言 FlexRIC 程式。
-    * **職責**：毫秒級局部迴圈 (10ms)。**只負責 PRB 分配這一個動作**：透過 E2SM-MAC 擷取所屬 Node 的 BSR 與 CQI，將 JSON 狀態透過 ZeroMQ REQ 送給 Local rApp Python 端，收回 PRB 權重陣列後立即寫回 OAI MAC 層。C 語言端不含任何 AI 邏輯，確保在毫秒內完成。
+    * **職責**：局部控制迴圈（實際 **100ms**，C xApp 設有 Rate Limiter：每 10 個 10ms MAC callback 才觸發一次 ZMQ，以避免 FlexRIC pending event queue 滿載崩潰）。**只負責 PRB 分配這一個動作**：透過 E2SM-MAC 擷取所屬 Node 的 **Δ DL TBS 與 MCS**（OAI RF Simulator 的 `wb_cqi` 與 `dl_buffer_info` 在模擬環境下恆為 0，以 `dl_aggr_tbs` 差分值作為吞吐量代理、`dl_mcs1` 作為通道品質代理），將 JSON 狀態透過 ZeroMQ REQ 送給 Local rApp Python 端，收回 PRB 權重陣列後立即寫回 OAI MAC 層。C 語言端不含任何 AI 邏輯。
 2.  **Local rApp / Flower Client (PC 1 & PC 2)**：
     * **實作**：Python ZeroMQ REP 伺服器（部署於 5 個獨立容器），與 Flower Client 運行於同一進程、共享 DRL 模型。
     * **職責（雙重角色）**：
@@ -64,10 +64,10 @@
 * **資料持久化**：將每次的 State (狀態)、Action (決策) 寫入 MongoDB，為聯邦學習準備歷史資料集。
 
 ### 第四階段：Local 單節點 AI 閉環控制 + Local rApp (當前進行中)
-* **模型建構**：在 Python 端建立深度強化學習 (DRL) Actor 網路。
-* **Reward 設計**：撰寫複合獎勵函數，結合 Throughput 最大化、Delay 懲罰與 Fairness 補償。
-* **穩定度測試**：讓 AI 取代 Hardcode 邏輯，觀察系統在高併發流量下的穩定度。
-* **Local rApp 開發**：與 Local xApp 推論伺服器運行於**同一 Python 進程、共享 DRL 模型**。從 MongoDB 讀取歷史 State/Action/Reward，執行本地模型 Fine-tuning，為第五階段 Flower Client 整合做準備。
+* **模型建構**：在 Python 端建立深度強化學習 (DRL) Actor 網路。✅ 已完成（Actor-Critic + Dirichlet Policy Gradient）
+* **Reward 設計**：撰寫複合獎勵函數，結合 Throughput 最大化、Delay 懲罰與 Fairness 補償。✅ 已完成
+* **Local rApp 開發**：與 Local xApp 推論伺服器運行於**同一 Python 進程、共享 DRL 模型**。從 MongoDB 讀取歷史 State/Action/Reward，執行本地模型 Fine-tuning，為第五階段 Flower Client 整合做準備。✅ 已完成（`inference_server.py` 背景訓練執行緒）
+* **穩定度測試**：讓 AI 取代 Hardcode 邏輯，觀察系統在高併發流量下的穩定度與收斂情況。⬜ 進行中
 
 ### 第五階段：Global 控制平面與聯邦學習整合 (待開發)
 * **Global xApp 開發**：建構全域 Python 容器，透過 ZeroMQ 收集全網狀態，實作跨節點的回傳鏈路頻寬限制或路由覆寫邏輯。

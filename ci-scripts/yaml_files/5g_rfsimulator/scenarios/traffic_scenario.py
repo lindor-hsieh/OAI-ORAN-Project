@@ -299,9 +299,9 @@ def scenario_d_random(ues: list[UEConfig]) -> list[tuple[int, float]]:
     目標：最大化訓練資料多樣性，讓 DRL 學習通用策略。
     """
     # path_loss 表已壓縮至 0~25dB 安全範圍，所有 CQI 值皆可使用
-    cqi_choices = [1, 2, 4, 6, 8, 10, 12, 15]
-    # BW 最低 2 Mbps：確保 UE 始終有上行流量讓 gNB 維持 RRC 連線活躍
-    bw_choices = [2.0, 5.0, 8.0, 10.0, 15.0, 20.0, 25.0]
+    cqi_choices = list(range(1, 16))   # 1~15 完整覆蓋
+    # BW 最低 5 Mbps，最高 80 Mbps（接近 106 PRB MCS28 理論上限），每 5 Mbps 一個區間
+    bw_choices = [float(x) for x in range(5, 85, 5)]
     configs = []
     for _ in ues:
         cqi = random.choice(cqi_choices)
@@ -402,7 +402,16 @@ def run_dynamic_scenario(
                 if ue._iperf_proc is None:
                     start_iperf_client(ue)
 
-            time.sleep(phase_duration)
+            # 每 5 秒輪詢一次，偵測並重啟已死亡的 iperf3（poll() != None 表示已退出）
+            deadline = time.time() + phase_duration
+            while time.time() < deadline:
+                time.sleep(5)
+                for ue in ues:
+                    if ue._iperf_proc is not None and ue._iperf_proc.poll() is not None:
+                        log.warning("iperf3 意外結束 %s (rc=%d)，重啟中...",
+                                    ue.container, ue._iperf_proc.returncode)
+                        ue._iperf_proc = None
+                        start_iperf_client(ue)
     except KeyboardInterrupt:
         log.info("收到中斷，停止動態場景（共執行 %d 個相位）", phase)
     finally:

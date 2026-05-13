@@ -39,6 +39,27 @@ SSH_AVAILABLE=false
 
 # 等待 PC1 SSH 可用，再等待 rfsim5g-donor-cu 起來後清空 NAT TABLE
 # 若 CU 未就緒就繼續，舊 DNAT 規則會殘留導致 GTP 送錯 MT，F1-U DRB 狀態損壞
+echo -e "${CYAN}[0/5] Loading Kernel Modules & Macvlan Prep...${NC}"
+sudo modprobe sctp
+sudo modprobe nf_conntrack_sctp 2>/dev/null || sudo modprobe nf_conntrack_proto_sctp 2>/dev/null
+
+# PC2 實體網卡調優（防封包掉包）
+sudo ethtool -K $IFACE_NAME rx off tx off gso off tso off gro off lro off 2>/dev/null
+sudo ip link set $IFACE_NAME promisc on
+sudo ip link set $IFACE_NAME mtu 1350
+
+# 清除實體網卡上的 IP，避免 rp_filter 丟包
+sudo ip link set $IFACE_NAME up
+sudo ip addr flush dev $IFACE_NAME 2>/dev/null || true
+
+# 建立 macvlan-br：IP 先設好，PC1 SSH 等待才能在兩端同時連通
+sudo ip link add macvlan-br link $IFACE_NAME type macvlan mode bridge 2>/dev/null || true
+sudo ip addr add 192.168.88.2/24 dev macvlan-br 2>/dev/null || true
+sudo ip link set macvlan-br mtu 1350
+sudo ip link set macvlan-br up
+sudo ip route replace 192.168.88.128/25 dev macvlan-br
+echo -e "${GREEN}  macvlan-br 192.168.88.2/24 已就緒${NC}"
+
 echo -e "${CYAN}[SSH] 等待 PC1 SSH 連線...${NC}"
 _wait=0
 until ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; do
@@ -80,27 +101,7 @@ if ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; then
     echo -e "${GREEN}[SSH] 12.1.1.x stale host routes 已清除${NC}"
 fi
 
-echo -e "${CYAN}[0/5] Loading Kernel Modules & Macvlan Prep...${NC}"
-sudo modprobe sctp
-sudo modprobe nf_conntrack_sctp 2>/dev/null || sudo modprobe nf_conntrack_proto_sctp 2>/dev/null
-
-# 加入 PC 2 Macvlan 與實體網卡調優 (防 IQ 封包掉包)
-sudo ethtool -K $IFACE_NAME rx off tx off gso off tso off gro off lro off 2>/dev/null
-sudo ip link set $IFACE_NAME promisc on
-sudo ip link set $IFACE_NAME mtu 1350
-
-# 清除實體網卡上的 IP，避免雙網卡衝突 (rp_filter 丟包元兇)
-sudo ip link set $IFACE_NAME up
-sudo ip addr flush dev $IFACE_NAME 2>/dev/null || true
-
-# 建立 macvlan-br，並將 IP「唯一」綁定在虛擬網卡上
-sudo ip link add macvlan-br link $IFACE_NAME type macvlan mode bridge 2>/dev/null || true
-sudo ip addr add 192.168.88.2/24 dev macvlan-br 2>/dev/null || true
-sudo ip link set macvlan-br mtu 1350
-sudo ip link set macvlan-br up
-sudo ip route replace 192.168.88.128/25 dev macvlan-br
-
-# 函式：設定網路與啟動 DU 
+# 函式：設定網路與啟動 DU
 configure_and_start_du() {
     local MT_NAME=$1
     local DU_NAME=$2

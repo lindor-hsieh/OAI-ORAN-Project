@@ -172,11 +172,18 @@ def start_iperf_client(ue: UEConfig) -> bool:
 def stop_iperf_client(ue: UEConfig) -> None:
     """停止 UE 容器中的 iperf3 loop（先殺容器內程序，再終止 docker exec）。"""
     # 殺容器內的 iperf3 與 sh loop（SIGTERM 觸發 trap，sh 會自行退出）
-    subprocess.run(
-        ["docker", "exec", ue.container, "sh", "-c",
-         "pkill -f iperf3 2>/dev/null; pkill -f 'while true' 2>/dev/null; true"],
-        capture_output=True, timeout=5,
-    )
+    # 容器重啟中（rc=137 SIGKILL）時 docker exec 可能掛住，需吞掉 TimeoutExpired
+    try:
+        subprocess.run(
+            ["docker", "exec", ue.container, "sh", "-c",
+             "pkill -f iperf3 2>/dev/null; pkill -f 'while true' 2>/dev/null; true"],
+            capture_output=True, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("stop_iperf_client: %s docker exec 超時（容器可能重啟中），跳過 pkill",
+                    ue.container)
+    except Exception as exc:
+        log.warning("stop_iperf_client: %s 異常: %s", ue.container, exc)
     if ue._iperf_proc:
         try:
             ue._iperf_proc.terminate()

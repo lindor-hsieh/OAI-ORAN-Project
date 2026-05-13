@@ -138,19 +138,17 @@ def start_iperf_client(ue: UEConfig) -> bool:
 
     改為前台執行 sh -c "while true; do iperf3 ...; sleep 3; done"：
     - docker exec 持續存活，poll() 恆為 None → watchdog 不誤觸發
-    - iperf3 若因任何原因退出，容器內 loop 自動重啟（3 秒後）
+    - loop 每次迭代前動態查詢 oaitun_ue1 的 IP：UE 暫時斷線重連後可自動恢復
+    - 若介面尚未就緒（IP 為空），每 5 秒輪詢一次，待 IP 出現後立即重啟 iperf3
     - trap TERM/INT 確保 stop_iperf_client 可以乾淨地終止整個 loop
     """
-    ue_ip = _get_ue_ip(ue.container)
-    if ue_ip is None:
-        log.error("%s: oaitun_ue1 不存在，跳過 iperf3 啟動", ue.container)
-        return False
-
     loop_cmd = (
         f"trap 'pkill -f iperf3; exit 0' TERM INT; "
         f"while true; do "
+        f"UE_IP=$(ip addr show {IPERF_BIND_IF} 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1); "
+        f"if [ -z \"$UE_IP\" ]; then sleep 5; continue; fi; "
         f"iperf3 -c {EXT_DN_IP} -u -b {ue.bandwidth_mbps:.0f}M -R "
-        f"-t {IPERF_DURATION} -p {ue.iperf_port} -B {ue_ip} --forceflush; "
+        f"-t {IPERF_DURATION} -p {ue.iperf_port} -B $UE_IP --forceflush; "
         f"sleep 3; "
         f"done"
     )
@@ -415,14 +413,10 @@ def run_dynamic_scenario(
                 time.sleep(10)
                 for ue in ues:
                     if ue._iperf_proc is not None and ue._iperf_proc.poll() is not None:
-                        log.warning("iperf3 supervisor 退出 %s (rc=%d)，等待 tunnel 後重啟...",
+                        log.warning("iperf3 supervisor 退出 %s (rc=%d)，重啟 loop...",
                                     ue.container, ue._iperf_proc.returncode)
                         ue._iperf_proc = None
-                        time.sleep(8)
-                        if _get_ue_ip(ue.container) is not None:
-                            start_iperf_client(ue)
-                        else:
-                            log.warning("%s tunnel 未就緒，跳過本次重啟", ue.container)
+                        start_iperf_client(ue)  # loop 內部自行等待 oaitun_ue1 就緒
     except KeyboardInterrupt:
         log.info("收到中斷，停止動態場景（共執行 %d 個相位）", phase)
     finally:

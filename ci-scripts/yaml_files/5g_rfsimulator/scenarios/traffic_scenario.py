@@ -168,7 +168,7 @@ def start_iperf_client(ue: UEConfig) -> bool:
         f"UE_IP=$(ip addr show {IPERF_BIND_IF} 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1); "
         f"if [ -z \"$UE_IP\" ]; then sleep 5; continue; fi; "
         f"timeout {IPERF_DURATION + 30} "
-        f"iperf3 -c {EXT_DN_IP} -u -b {ue.bandwidth_mbps:.0f}M -R "
+        f"iperf3 -c {EXT_DN_IP} -b {ue.bandwidth_mbps:.0f}M -R "
         f"-t {IPERF_DURATION} -p {ue.iperf_port} -B $UE_IP --forceflush; "
         f"sleep 2; "
         f"done"
@@ -194,14 +194,17 @@ def start_iperf_client(ue: UEConfig) -> bool:
 
 def stop_iperf_client(ue: UEConfig) -> None:
     """停止 UE 容器中的 iperf3 loop（先殺容器內程序，再終止 docker exec）。"""
-    # 殺容器內的 iperf3 與 sh loop（SIGTERM 觸發 trap，sh 會自行退出）
-    # 容器重啟中（rc=137 SIGKILL）時 docker exec 可能掛住，需吞掉 TimeoutExpired
+    # 用 SIGKILL（-9）直接殺，避免 SIGTERM trap handler 慢速執行造成 race condition：
+    # SIGTERM 會觸發 sh loop 的 trap，trap 內又 pkill，導致 stop_iperf_client.wait(5) timeout，
+    # wait timeout 後只 kill docker exec（PC 端），容器內 sh loop 仍殘存 → 多 loop 並發。
+    # SIGKILL 則立即終止，不給 trap 機會，確保容器內只有一個 loop。
     try:
         subprocess.run(
             ["docker", "exec", ue.container, "sh", "-c",
-             "pkill -f iperf3 2>/dev/null; pkill -f 'while true' 2>/dev/null; true"],
+             "pkill -9 -f iperf3 2>/dev/null; pkill -9 -f 'while true' 2>/dev/null; true"],
             capture_output=True, timeout=5,
         )
+        time.sleep(0.3)   # 給 kernel 時間清理進程，避免 Popen 啟動時舊 loop 仍存在
     except subprocess.TimeoutExpired:
         log.warning("stop_iperf_client: %s docker exec 超時（容器可能重啟中），跳過 pkill",
                     ue.container)
@@ -210,7 +213,7 @@ def stop_iperf_client(ue: UEConfig) -> None:
     if ue._iperf_proc:
         try:
             ue._iperf_proc.terminate()
-            ue._iperf_proc.wait(timeout=5)
+            ue._iperf_proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             ue._iperf_proc.kill()
             ue._iperf_proc.wait()
@@ -464,15 +467,11 @@ def run_dynamic_scenario(
                             "DL frozen: %s rx_bytes=%d 超過 %ds 未增加，強制重啟 iperf3 session",
                             ue.container, rx, FLOW_WATCHDOG_INTERVAL,
                         )
-                        try:
-                            subprocess.run(
-                                ["docker", "exec", ue.container,
-                                 "pkill", "-9", "-f", "iperf3"],
-                                capture_output=True, timeout=5,
-                            )
-                        except Exception as exc:
-                            log.warning("pkill iperf3 失敗 %s: %s", ue.container, exc)
-                    ue._last_rx_bytes = rx
+                        # 殺完立即重啟（不等下一輪 poll 偵測 _iperf_proc.poll()）
+                        start_iperf_client(ue)
+                        ue._last_rx_bytes = 0   # 重置計數，新 session 從 0 開始判斷
+                    else:
+                        ue._last_rx_bytes = rx
                     ue._last_rx_check = now
     except KeyboardInterrupt:
         log.info("收到中斷，停止動態場景（共執行 %d 個相位）", phase)

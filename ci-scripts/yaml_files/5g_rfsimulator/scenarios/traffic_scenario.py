@@ -149,16 +149,16 @@ def _get_ue_ip(container: str) -> Optional[str]:
 
 def start_iperf_client(ue: UEConfig) -> bool:
     """
-    在 UE 容器內以 while loop 持續執行 iperf3 UDP 下行客戶端。
+    在 UE 容器內以 while loop 持續執行 iperf3 TCP 下行客戶端（-R reverse mode）。
 
     不使用 docker exec -d（detached）：-d 會讓 docker exec 立刻以 rc=0 返回，
     導致 _iperf_proc.poll() 馬上非 None，watchdog 誤判死亡並不斷重啟。
 
-    改為前台執行 sh -c "while true; do iperf3 ...; sleep 3; done"：
+    改為前台執行 sh -c "while true; do iperf3 ...; sleep 2; done"：
     - docker exec 持續存活，poll() 恆為 None → watchdog 不誤觸發
     - loop 每次迭代前動態查詢 oaitun_ue1 的 IP：UE 暫時斷線重連後可自動恢復
     - 若介面尚未就緒（IP 為空），每 5 秒輪詢一次，待 IP 出現後立即重啟 iperf3
-    - trap TERM/INT 確保 stop_iperf_client 可以乾淨地終止整個 loop
+    - 使用 TCP 而非 UDP：TCP 擁塞控制可自適應 DRL PRB 震盪，不因 TCP 控制通道中斷而斷線
     """
     # timeout {IPERF_DURATION+30} 確保即使 iperf3 卡死也會被強制結束，
     # 避免 while loop 永遠等不到下一次迭代。
@@ -237,9 +237,8 @@ def apply_ue_config(
 ) -> None:
     """套用新的 CQI 與頻寬設定到單一 UE。
 
-    BW 變更只更新記錄，不重啟 iperf3。
-    重啟 iperf3 會造成短暫無流量 → gNB inactivity timer → RRCRelease → 多 UE 同時 RACH contention。
-    BSR 多樣性由 CQI 變化自然產生（CQI↓ → 實際吞吐↓ → UL buffer 累積 → BSR↑）。
+    CQI 變更：透過 channelmod telnet 即時設定，無需重啟 iperf3。
+    BW 變更：BW 烘焙進 loop_cmd，必須重啟 iperf3 loop 才能套用新值（~0.3s 短暫無流量）。
     """
     changed = False
 

@@ -19,9 +19,9 @@ fi
 echo "[setup] 安裝 iperf3（若尚未安裝）..."
 docker exec "${CONTAINER}" sh -c "which iperf3 >/dev/null 2>&1 || apt-get install -yq iperf3" || true
 
-echo "[setup] 停止舊的 iperf3 server 進程..."
-# 用 sh 而非 bash，相容最小化容器；killall/pkill 不存在時直接忽略
-docker exec "${CONTAINER}" sh -c "killall iperf3 2>/dev/null; true"
+echo "[setup] 停止舊的 iperf3 server 進程（含 while-loop）..."
+# 必須同時殺 iperf3 和外層 while-loop sh，否則重啟時舊 loop 殘存，造成每個 port 兩個 server 並發。
+docker exec "${CONTAINER}" sh -c "pkill -9 -f iperf3 2>/dev/null; pkill -9 -f 'while true' 2>/dev/null; true"
 sleep 1
 
 echo "[setup] 啟動 iperf3 server，port 5201~5206（含自動重啟 loop）..."

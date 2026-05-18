@@ -24,9 +24,15 @@ echo "[setup] 停止舊的 iperf3 server 進程..."
 docker exec "${CONTAINER}" sh -c "killall iperf3 2>/dev/null; true"
 sleep 1
 
-echo "[setup] 啟動 iperf3 server，port 5201~5206..."
+echo "[setup] 啟動 iperf3 server，port 5201~5206（含自動重啟 loop）..."
+# 每個 server 包在 while loop + timeout 400s 裡：
+#   - client session 最長 330s（IPERF_DURATION 300 + timeout grace 30）
+#   - server timeout 400s > client timeout，確保 client 先死並送 RST
+#   - server 收到 RST 後正常退出，while loop 立即重啟新 server
+#   - 若 client 沒送 RST（極少數情況），server 400s 後強制退出
 for PORT in "${PORTS[@]}"; do
-    docker exec -d "${CONTAINER}" iperf3 -s -p "${PORT}" -i 0
+    docker exec -d "${CONTAINER}" sh -c \
+        "while true; do timeout 400 iperf3 -s -p ${PORT} -i 0 --forceflush 2>/dev/null; sleep 1; done"
     echo "  iperf3 server 啟動：port ${PORT}"
 done
 

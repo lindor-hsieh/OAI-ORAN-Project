@@ -48,8 +48,9 @@ from channelmod_ctrl import ChannelModController
 # =============================================================================
 
 EXT_DN_IP = "192.168.72.135"       # ext-dn 在 traffic_net 的 IP
-IPERF_DURATION = 86400             # iperf3 每次啟動持續時間 (s)，夠長以持續執行
+IPERF_DURATION = 300               # iperf3 每次 session 持續時間 (s)；定期循環以刷新連線狀態
 IPERF_BIND_IF = "oaitun_ue1"      # UE PDN 介面名稱
+FLOW_WATCHDOG_INTERVAL = 30        # 每 30s 檢查一次 DL flow 是否凍結
 
 # iperf3 server port 分配（PC 1 setup_iperf_servers.sh 必須一致）
 UE_IPERF_PORTS = {
@@ -101,6 +102,8 @@ class UEConfig:
     target_cqi: int = 12
     bandwidth_mbps: float = 10.0
     _iperf_proc: Optional[subprocess.Popen] = field(default=None, repr=False)
+    _last_rx_bytes: int = field(default=0, repr=False)       # watchdog: 上次量到的 oaitun_ue1 rx bytes
+    _last_rx_check: float = field(default=0.0, repr=False)   # watchdog: 上次檢查的 timestamp
 
     @property
     def iperf_port(self) -> int:
@@ -110,6 +113,21 @@ class UEConfig:
 # =============================================================================
 # iperf3 控制
 # =============================================================================
+
+def _get_oaitun_rx_bytes(container: str) -> int:
+    """讀取 UE 容器 oaitun_ue1 介面的 RX byte 計數（用於 DL flow watchdog）。"""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", container,
+             "cat", "/sys/class/net/oaitun_ue1/statistics/rx_bytes"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
 
 def _get_ue_ip(container: str) -> Optional[str]:
     """取得 UE 容器 oaitun_ue1 介面的 IP 位址。"""
@@ -142,14 +160,17 @@ def start_iperf_client(ue: UEConfig) -> bool:
     - 若介面尚未就緒（IP 為空），每 5 秒輪詢一次，待 IP 出現後立即重啟 iperf3
     - trap TERM/INT 確保 stop_iperf_client 可以乾淨地終止整個 loop
     """
+    # timeout {IPERF_DURATION+30} 確保即使 iperf3 卡死也會被強制結束，
+    # 避免 while loop 永遠等不到下一次迭代。
     loop_cmd = (
         f"trap 'pkill -f iperf3; exit 0' TERM INT; "
         f"while true; do "
         f"UE_IP=$(ip addr show {IPERF_BIND_IF} 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1); "
         f"if [ -z \"$UE_IP\" ]; then sleep 5; continue; fi; "
+        f"timeout {IPERF_DURATION + 30} "
         f"iperf3 -c {EXT_DN_IP} -u -b {ue.bandwidth_mbps:.0f}M -R "
         f"-t {IPERF_DURATION} -p {ue.iperf_port} -B $UE_IP --forceflush; "
-        f"sleep 3; "
+        f"sleep 2; "
         f"done"
     )
     cmd = ["docker", "exec", ue.container, "sh", "-c", loop_cmd]
@@ -161,6 +182,8 @@ def start_iperf_client(ue: UEConfig) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        ue._last_rx_bytes = 0
+        ue._last_rx_check = time.time()
         log.info("iperf3 loop start: %s → %s:%d @ %.0fMbps",
                  ue.container, EXT_DN_IP, ue.iperf_port, ue.bandwidth_mbps)
         return True
@@ -224,10 +247,10 @@ def apply_ue_config(
 
     if new_bw is not None and abs(new_bw - ue.bandwidth_mbps) > 0.5:
         ue.bandwidth_mbps = new_bw
-        if ue._iperf_proc is None:
-            # iperf3 尚未啟動（第一個相位）→ 用新 BW 啟動
-            start_iperf_client(ue)
-        # iperf3 已在跑 → 只更新記錄，不殺不重啟，維持流量連續性
+        # BW 烘焙進 loop_cmd，必須重啟 loop 才能套用新值。
+        # stop_iperf_client 在 start_iperf_client 內部處理；
+        # 短暫 2~3s 的無流量期 DRL 可容忍，各 UE 間有 100ms 錯開。
+        start_iperf_client(ue)
         changed = True
 
     if changed:
@@ -311,8 +334,9 @@ def scenario_d_random(ues: list[UEConfig]) -> list[tuple[int, float]]:
     """
     # path_loss 表已壓縮至 0~25dB 安全範圍，所有 CQI 值皆可使用
     cqi_choices = list(range(1, 16))   # 1~15 完整覆蓋
-    # BW 最低 5 Mbps，最高 80 Mbps（接近 106 PRB MCS28 理論上限），每 5 Mbps 一個區間
-    bw_choices = [float(x) for x in range(5, 85, 5)]
+    # BW 最低 5 Mbps，最高 50 Mbps（106 PRB 兩 UE 共享上限約 40Mbps，50 留餘量）
+    # 超過 50Mbps 會讓 rfsim TCP buffer 滿載，導致 DU 排程延遲與 DL 路徑崩潰。
+    bw_choices = [float(x) for x in range(5, 55, 5)]
     configs = []
     for _ in ues:
         cqi = random.choice(cqi_choices)
@@ -413,17 +437,43 @@ def run_dynamic_scenario(
                 if ue._iperf_proc is None:
                     start_iperf_client(ue)
 
-            # 每 10 秒輪詢一次，只處理容器級別的失敗
-            # iperf3 崩潰由容器內 while loop 自動處理（3 秒重啟），不需外部介入
+            # 每 10 秒輪詢一次：
+            #   1. 容器級別失敗：docker exec 退出 → 重啟整個 loop
+            #   2. DL flow watchdog：oaitun_ue1 rx_bytes 30s 未增加 → pkill iperf3
+            #      （while loop 在容器內自行 sleep 2 後重啟新 session）
             deadline = time.time() + phase_duration
             while time.time() < deadline:
                 time.sleep(10)
+                now = time.time()
                 for ue in ues:
+                    # ── 容器級別失敗 ──────────────────────────────────────────
                     if ue._iperf_proc is not None and ue._iperf_proc.poll() is not None:
                         log.warning("iperf3 supervisor 退出 %s (rc=%d)，重啟 loop...",
                                     ue.container, ue._iperf_proc.returncode)
                         ue._iperf_proc = None
-                        start_iperf_client(ue)  # loop 內部自行等待 oaitun_ue1 就緒
+                        start_iperf_client(ue)
+                        continue
+                    # ── DL flow watchdog ──────────────────────────────────────
+                    if ue._iperf_proc is None:
+                        continue
+                    if now - ue._last_rx_check < FLOW_WATCHDOG_INTERVAL:
+                        continue
+                    rx = _get_oaitun_rx_bytes(ue.container)
+                    if ue._last_rx_bytes > 0 and rx == ue._last_rx_bytes:
+                        log.warning(
+                            "DL frozen: %s rx_bytes=%d 超過 %ds 未增加，強制重啟 iperf3 session",
+                            ue.container, rx, FLOW_WATCHDOG_INTERVAL,
+                        )
+                        try:
+                            subprocess.run(
+                                ["docker", "exec", ue.container,
+                                 "pkill", "-9", "-f", "iperf3"],
+                                capture_output=True, timeout=5,
+                            )
+                        except Exception as exc:
+                            log.warning("pkill iperf3 失敗 %s: %s", ue.container, exc)
+                    ue._last_rx_bytes = rx
+                    ue._last_rx_check = now
     except KeyboardInterrupt:
         log.info("收到中斷，停止動態場景（共執行 %d 個相位）", phase)
     finally:

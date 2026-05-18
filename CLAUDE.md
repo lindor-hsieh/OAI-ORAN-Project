@@ -36,7 +36,7 @@
       * **Non-RT Fine-tuning（秒/分鐘級）**：從 MongoDB 讀取歷史資料，執行本地模型微調，準備作為 Flower Client 參與聯邦學習聚合。
 3.  **Global xApp (PC 1)**：
     * **實作**：獨立的 Python Docker 容器。
-    * **職責**：毫秒級全域迴圈 (10ms)。具備「全域視野 (Global View)」，透過 ZeroMQ 接收全網 5 個 Node 的瞬時狀態，負責跨節點的巨觀調度推論（例如：動態介入 IAB 節點間的回傳鏈路 Backhaul 頻寬配額），以避免局部最優導致的全局壅塞。
+    * **職責**：毫秒級全域迴圈 (10ms)。具備「全域視野 (Global View)」，透過 ZeroMQ 接收全網 5 個 Node 的瞬時狀態，負責跨節點的巨觀調度。**核心機制（軟性回傳約束）**：RF Simulator 下每個 DU 各自有獨立 106 PRB，不符合 in-band IAB 頻譜共享；修改 OAI 底層代價太高，改以 Global xApp 模擬回傳瓶頸。具體邏輯：① 監控 Node1/Node2 xApp 對 MT3/MT4 各分配了多少 PRB（代表流量通過 Node1→Node3/4 或 Node2→Node4/5 的回傳容量）；② 將該 PRB 配額透過 ZeroMQ 下發給對應的 Node3/4/5 Local xApp；③ Node3/4/5 的 Local xApp 將可用 PRB 上限從 106 改為收到的配額值（`effective_prb = min(106, quota_from_global)`），以此在 xApp 層模擬 in-band IAB 的回傳瓶頸限制。
 4.  **Global rApp / Flower Server (PC 1)**：
     * **實作**：Python 程式 (部署於 Donor 端)。
     * **職責**：小時級 Non-RT 迴圈。強制 5 個 IAB Nodes 參與聚合，收集全網吞吐量與延遲，以計算 Jain's Fairness Index 為優化目標，進行聯邦學習全域權重聚合 (Aggregation) 後下發，完成階層式 AI 的學習閉環。
@@ -70,8 +70,22 @@
 * **穩定度測試**：讓 AI 取代 Hardcode 邏輯，觀察系統在高併發流量下的穩定度與收斂情況。⬜ 進行中
 
 ### 第五階段：Global 控制平面與聯邦學習整合 (待開發)
-* **Global xApp 開發**：建構全域 Python 容器，透過 ZeroMQ 收集全網狀態，實作跨節點的回傳鏈路頻寬限制或路由覆寫邏輯。
-* **Flower Server 啟動**：在 PC 1 啟動 Flower Server，實作自定義的 `aggregate_kpm_metrics` 以計算全網 Jain's Fairness。
+
+#### IAB 資源建模設計決策
+RF Simulator 環境下每個 DU 各自有獨立 106 PRB，接入層不受回傳瓶頸約束，不符合 in-band IAB 的頻譜共享特性。直接修改 OAI 底層（F1/MAC 調度器）代價太高，因此採用「**xApp 層軟性約束 (Soft Constraint)**」模擬回傳瓶頸，在不改動 OAI 的前提下實現 IAB 回傳限制語意。
+
+#### 論文對比架構
+| 架構 | 說明 |
+|------|------|
+| Baseline (PF) | OAI 預設排程器，無回傳約束感知 |
+| Local-only DRL | 5 個獨立 Local xApp，各自最佳化但忽略回傳限制 |
+| **Global+Local DRL** | Global xApp 傳回傳配額，Local 在約束內最佳化 |
+
+Global xApp 的差異化價值：跨層 IAB 回傳協調，Local-only 架構做不到。
+
+#### 開發項目
+* **Global xApp 開發**：建構全域 Python 容器，監控 Node1/Node2 對 MT 的 PRB 分配，計算 Node3/4/5 的回傳配額上限，透過 ZeroMQ PUB/SUB 或 PUSH/PULL 下發配額；Node3/4/5 Local xApp 收到配額後以 `min(106, quota)` 作為實際可用 PRB 上限。
+* **Flower Server 啟動**：在 PC 1 啟動 Flower Server，實作自定義的聚合策略以計算全網 Jain's Fairness Index 為優化目標。
 * **Local rApp 擴充為 Flower Client**：在第四階段 Local rApp 基礎上，實作 `train()` 方法將本地 Fine-tuning 結果上傳，並驗證 TCP 控制封包能穩定穿透實體 Backhaul 鏈路完成權重同步。
 
 ### 第六階段：實驗數據驗證與論文撰寫 (待開發)
@@ -122,7 +136,7 @@
 
 ## 7. 注意事項
 
-目前進行中為**第四階段**（DRL 閉環控制 + Local rApp）。開發 xApp 至少要修改以下這些檔案：
+目前進行中為**第四階段**（DRL 閉環控制 + Local rApp 訓練）並準備進入**第五階段**（Global xApp 設計）。第五階段開始前需等待 Local DRL 訓練資料量達 20000 筆以上確認收斂。開發 xApp 至少要修改以下這些檔案：
 
 **xApp 本體（每個 Node 各自獨立，共 5 份）**
 `~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node1.c`

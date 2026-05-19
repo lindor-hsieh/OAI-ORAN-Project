@@ -2885,6 +2885,12 @@ void configure_UE_BWP(gNB_MAC_INST *nr_mac,
       UE->pdsch_HARQ_ACK_Codebook = CellGroup->physicalCellGroupConfig->pdsch_HARQ_ACK_Codebook;
 
     // setting PDCCH related structures for sched_ctrl
+    // Without a dedicated BWP there are no ue_Specific SearchSpaces in the
+    // common list; fall back to common to avoid AssertFatal in get_searchspace().
+    if (bwpd == NULL && target_ss == NR_SearchSpace__searchSpaceType_PR_ue_Specific) {
+      LOG_W(NR_MAC, "UE %04x: no dedicated BWP, falling back to common SearchSpace\n", UE->rnti);
+      target_ss = NR_SearchSpace__searchSpaceType_PR_common;
+    }
     sched_ctrl->search_space = get_searchspace(scc, bwpd, target_ss);
     sched_ctrl->coreset = get_coreset(nr_mac, scc, bwpd, *sched_ctrl->search_space->controlResourceSetId);
 

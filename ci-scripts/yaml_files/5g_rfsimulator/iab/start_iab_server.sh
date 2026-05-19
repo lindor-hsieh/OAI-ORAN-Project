@@ -56,8 +56,10 @@ sudo ip link set $IFACE_NAME up
 sudo ip addr flush dev $IFACE_NAME 2>/dev/null || true
 
 # 建立 macvlan-br，並將 IP「唯一」綁定在虛擬網卡上
-sudo ip link add macvlan-br link $IFACE_NAME type macvlan mode bridge 2>/dev/null || true
-sudo ip addr add 192.168.88.1/24 dev macvlan-br 2>/dev/null || true
+# 先刪除舊介面（parent 重連或 kernel 移除後殘留），確保每次都重建
+sudo ip link del macvlan-br 2>/dev/null || true
+sudo ip link add macvlan-br link $IFACE_NAME type macvlan mode bridge
+sudo ip addr add 192.168.88.1/24 dev macvlan-br
 sudo ip link set macvlan-br mtu 1350
 sudo ip link set macvlan-br up
 

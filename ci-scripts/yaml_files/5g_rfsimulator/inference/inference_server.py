@@ -34,7 +34,7 @@ import numpy as np
 import pymongo
 import zmq
 
-from drl_agent import DRLAgent, MIN_TRAIN_EXPERIENCES, MAX_UE_COUNT
+from drl_agent import DRLAgent, MIN_TRAIN_EXPERIENCES, MAX_UE_COUNT, TRAIN_BATCH_SIZE
 from reward_calculator import compute_reward, compute_reward_breakdown
 
 # =============================================================================
@@ -263,22 +263,48 @@ class InferenceServer:
             )
             return
 
+        # ── Train / Test split（8:2）────────────────────────────────────────
+        # 測試集用於偵測 overfitting：train_loss 持續下降但 test_loss 回升時警告。
+        test_size  = max(TRAIN_BATCH_SIZE, int(n * 0.2))
+        test_idxs  = set(np.random.choice(n, test_size, replace=False).tolist())
+        train_exp  = [e for i, e in enumerate(experiences) if i not in test_idxs]
+        test_exp   = [e for i, e in enumerate(experiences) if i in test_idxs]
+
         last_metrics: dict = {}
         for epoch in range(TRAIN_EPOCHS_PER_ROUND):
-            m = self._agent.train_on_batch(experiences)
+            m = self._agent.train_on_batch(train_exp)
             if m:
                 last_metrics = m
+
         if last_metrics:
+            test_metrics = self._agent.evaluate_on_batch(test_exp)
             self._agent.save()
+
+            # overfitting 指標：test_actor_loss 比 train_actor_loss 高超過 0.3 時警告
+            t_aloss = test_metrics.get("test_actor_loss", 0.0)
+            tr_aloss = last_metrics.get("actor_loss", 0.0)
+            overfit_flag = ""
+            if test_metrics and (t_aloss - tr_aloss) > 0.3:
+                overfit_flag = " ⚠ OVERFIT"
+
             self._log.info(
-                "訓練完成 %d epochs | step=%d actor_loss=%.4f critic_loss=%.4f "
-                "entropy=%.4f mean_reward=%.4f | DRL/啟發式=%d/%d",
+                "訓練完成 %d epochs | step=%d "
+                "train[actor=%.4f critic=%.4f entropy=%.4f reward=%.4f] "
+                "test[actor=%.4f critic=%.4f entropy=%.4f reward=%.4f] "
+                "train_n=%d test_n=%d%s | DRL/啟發式=%d/%d",
                 TRAIN_EPOCHS_PER_ROUND,
                 last_metrics.get("train_step", 0),
-                last_metrics.get("actor_loss", 0),
+                tr_aloss,
                 last_metrics.get("critic_loss", 0),
                 last_metrics.get("entropy", 0),
                 last_metrics.get("mean_reward", 0),
+                t_aloss,
+                test_metrics.get("test_critic_loss", 0),
+                test_metrics.get("test_entropy", 0),
+                test_metrics.get("test_mean_reward", 0),
+                len(train_exp),
+                len(test_exp),
+                overfit_flag,
                 self._drl_inferences,
                 self._heuristic_inferences,
             )

@@ -420,6 +420,83 @@ class DRLAgent:
         )
         return metrics
 
+    def evaluate_on_batch(self, experiences: list[dict]) -> dict:
+        """
+        在測試集上計算 loss，不更新梯度（用於偵測 overfitting）。
+
+        Returns:
+            {"test_actor_loss", "test_critic_loss", "test_entropy", "test_mean_reward"}
+            或 {} 若資料不足。
+        """
+        if len(experiences) < TRAIN_BATCH_SIZE:
+            return {}
+
+        idxs  = np.random.choice(len(experiences), TRAIN_BATCH_SIZE, replace=False)
+        batch = [experiences[i] for i in idxs]
+
+        states = torch.tensor(
+            np.array([e["state_vec"]      for e in batch], dtype=np.float32),
+            device=self.device)
+        masks = torch.tensor(
+            np.array([e["mask_vec"]       for e in batch], dtype=bool),
+            device=self.device)
+        actions = torch.tensor(
+            np.array([e["action_ratios"]  for e in batch], dtype=np.float32),
+            device=self.device)
+        rewards = torch.tensor(
+            np.array([e["reward"]         for e in batch], dtype=np.float32),
+            device=self.device)
+        next_states = torch.tensor(
+            np.array([e["next_state_vec"] for e in batch], dtype=np.float32),
+            device=self.device)
+
+        self.actor.eval()
+        self.critic.eval()
+        with torch.no_grad():
+            current_values = self.critic(states)
+            next_values    = self.critic(next_states)
+            targets        = rewards + GAMMA * next_values
+            advantages     = targets - current_values
+            if advantages.std() > 1e-8:
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std() + 1e-8)
+
+            test_critic_loss = F.mse_loss(current_values, targets)
+
+            probs = self.actor(states, masks)
+            log_probs_list: list[torch.Tensor] = []
+            entropy_list:   list[torch.Tensor] = []
+            for i in range(len(batch)):
+                n_i = int(masks[i].sum().item())
+                if n_i == 0:
+                    log_probs_list.append(torch.tensor(0.0, device=self.device))
+                    entropy_list.append(torch.tensor(0.0, device=self.device))
+                    continue
+                alpha_i = torch.clamp(
+                    probs[i, :n_i] * DIRICHLET_CONCENTRATION, min=1e-3)
+                dist_i = torch.distributions.Dirichlet(alpha_i)
+                a_i    = actions[i, :n_i]
+                a_sum  = a_i.sum()
+                if a_sum < 1e-8:
+                    log_probs_list.append(torch.tensor(0.0, device=self.device))
+                    entropy_list.append(dist_i.entropy())
+                    continue
+                a_i = torch.clamp(a_i / a_sum, min=1e-6)
+                a_i = a_i / a_i.sum()
+                log_probs_list.append(dist_i.log_prob(a_i))
+                entropy_list.append(dist_i.entropy())
+
+            log_probs_t      = torch.stack(log_probs_list)
+            entropy_t        = torch.stack(entropy_list)
+            test_actor_loss  = -(advantages * log_probs_t).mean()
+
+        return {
+            "test_actor_loss":  float(test_actor_loss.item()),
+            "test_critic_loss": float(test_critic_loss.item()),
+            "test_entropy":     float(entropy_t.mean().item()),
+            "test_mean_reward": float(rewards.mean().item()),
+        }
+
     @property
     def is_trained(self) -> bool:
         """是否已完成至少一次訓練，可切換至 DRL 推論模式。"""

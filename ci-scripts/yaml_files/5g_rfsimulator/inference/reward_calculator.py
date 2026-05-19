@@ -118,7 +118,13 @@ def compute_reward_breakdown(
     if r_tp < 1e-9:
         return {"reward": 0.0, "r_throughput": 0.0, "r_fairness": 0.0, "r_delay": 0.0}
 
-    r_fair  = _jains_fairness(tp_arr)
+    # JFI 正規化：將自然值域 [1/n, 1.0] 線性縮放至 [0, 1]
+    # JFI([0, x]) 原本 = 0.5（固定，對 DRL 無梯度）→ 正規化後 = 0.0（明確懲罰）
+    # JFI([x, x]) = 1.0 → 正規化後 = 1.0（完全公平，最高獎勵）
+    n = len(tp_arr)
+    jfi_raw = _jains_fairness(tp_arr)
+    jfi_min = 1.0 / n if n > 1 else 1.0
+    r_fair  = float((jfi_raw - jfi_min) / (1.0 - jfi_min)) if n > 1 else jfi_raw
     r_delay = float(dp_arr.mean())
 
     reward = float(np.clip(

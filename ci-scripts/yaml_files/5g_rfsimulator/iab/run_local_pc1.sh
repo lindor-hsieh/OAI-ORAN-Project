@@ -92,14 +92,20 @@ for node in 1 2 3 4 5; do
     [ "$node" -lt 5 ] && sleep 3
 done
 
-# 更新所有 inference 容器的 reward_calculator.py（確保 all-idle guard 生效）
-log "  更新 inference 容器 reward_calculator.py..."
+# 更新所有 inference 容器的 Python 檔案（確保最新版 reward function 與 inference logic 生效）
+log "  更新 inference 容器 Python 檔案..."
 REWARD_SRC="$COMPOSE_DIR/inference/reward_calculator.py"
+INFER_SRC="$COMPOSE_DIR/inference/inference_server.py"
+AGENT_SRC="$COMPOSE_DIR/inference/drl_agent.py"
 for n in 1 2 3 4 5; do
-    docker cp "$REWARD_SRC" "inference-node${n}:/app/reward_calculator.py" 2>/dev/null \
-        && ok "inference-node${n} reward_calculator.py 已更新" \
-        || warn "inference-node${n} cp 失敗（容器可能尚未就緒）"
+    docker cp "$REWARD_SRC" "inference-node${n}:/app/reward_calculator.py" 2>/dev/null && \
+    docker cp "$INFER_SRC"  "inference-node${n}:/app/inference_server.py"  2>/dev/null && \
+    docker cp "$AGENT_SRC"  "inference-node${n}:/app/drl_agent.py"         2>/dev/null && \
+    docker restart "inference-node${n}" > /dev/null 2>&1 && \
+        ok "inference-node${n} 已更新並重啟" \
+        || warn "inference-node${n} 更新失敗（容器可能尚未就緒）"
 done
+sleep 5
 
 # 驗證 ZMQ
 sleep 2

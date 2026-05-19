@@ -7,6 +7,7 @@
 #   - 各 Node 推論伺服器最新狀態（啟發式 / DRL / actor_loss）
 #   - fallback 告警
 #   - channelmod telnet 連線狀態
+#   - xApp watchdog：ZMQ 凍結超過 FROZEN_THRESHOLD 輪自動重啟 xApp
 #
 # 使用方式：
 #   bash monitor_drl.sh          # 預設 15 秒刷新
@@ -14,10 +15,14 @@
 
 INTERVAL=${1:-15}
 
-# Node 3/4/5 的 channelmod telnetsrv 在 PC2 的容器內
+# ZMQ 凍結偵測：連續 N 輪 delta=0 → 自動重啟 xApp（N × INTERVAL ≈ 45s）
+FROZEN_THRESHOLD=3
+
 PC2_USER="lindor"
 PC2_IP="192.168.88.2"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=3 -o BatchMode=yes"
+
+INFERENCE_SRC=~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/inference/reward_calculator.py
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -37,7 +42,6 @@ check_zmq() {
     ls /tmp/zmq_node*_inference.ipc 2>/dev/null | wc -l
 }
 
-# 回傳 JSON：{n1:N, n2:N, ...}
 check_experiences() {
     docker exec mongodb mongosh --quiet iab_xapp --eval \
         'print(JSON.stringify({
@@ -49,7 +53,6 @@ check_experiences() {
         }))' 2>/dev/null | grep "^{" | tail -1
 }
 
-# 各 Node 推論 log 最後一條有意義的行
 check_inference_status() {
     local node=$1
     docker logs "inference-node${node}" 2>&1 \
@@ -57,14 +60,11 @@ check_inference_status() {
         | tail -1 2>/dev/null
 }
 
-# 累計 fallback 次數
 check_fallback() {
     local node=$1
     docker logs "xapp-node${node}" 2>&1 2>/dev/null | grep -c "fallback" || echo "0"
 }
 
-# channelmod 連線：只測試 TCP 能否連上，不等回應（避免 cat 卡住）
-# Node 1→9089, Node 2→9090, Node 3→9091, Node 4→9092, Node 5→9093
 check_channelmod() {
     local node=$1
     local port=$((9088 + node))
@@ -82,10 +82,31 @@ check_channelmod() {
     fi
 }
 
+# xApp watchdog：重啟所有 xApp 並補 reward_calculator.py
+restart_xapps() {
+    local reason=$1
+    echo -e "\n${RED}[WATCHDOG $(date '+%H:%M:%S')] ${reason}，重啟所有 xApp...${NC}"
+    for n in 1 2 3 4 5; do
+        docker restart "xapp-node${n}" >/dev/null 2>&1 && \
+            echo -e "  ${YELLOW}xapp-node${n} restarted${NC}" || \
+            echo -e "  ${RED}xapp-node${n} restart 失敗${NC}"
+    done
+    # FlexRIC 重啟後 inference 容器的 reward_calculator.py 會被 image 覆蓋，需重新 cp
+    sleep 3
+    for n in 1 2 3 4 5; do
+        docker cp "$INFERENCE_SRC" "inference-node${n}:/app/reward_calculator.py" >/dev/null 2>&1
+    done
+    echo -e "  ${GREEN}reward_calculator.py 已重新 cp 至所有 inference 容器${NC}"
+}
+
 # ── 主迴圈 ──────────────────────────────────────────────────
 
 PREV_EXP_FILE="/tmp/monitor_drl_prev_exp.json"
 echo "{}" > "$PREV_EXP_FILE"
+
+FROZEN_COUNT=0          # 連續凍結輪數
+WATCHDOG_MSG=""         # 最後一次 watchdog 觸發訊息
+LAST_RESTART_TIME=0     # 避免在 watchdog 觸發後馬上再觸發
 
 while true; do
     clear
@@ -115,31 +136,72 @@ while true; do
     echo -e "  E2 連線 : $(echo -e "$E2_STR")    ZMQ Socket : $(echo -e "$ZMQ_STR")"
     echo ""
 
-    # ── Experience 累積 ───────────────────────────────────────
+    # ── Experience 累積 + 凍結偵測 ──────────────────────────
     echo -e "${YELLOW}── Experience 累積 ──────────────────────────────────────────${NC}"
 
     EXP_JSON=$(check_experiences)
+    ALL_FROZEN=0
+
     if [ -n "$EXP_JSON" ]; then
-        echo "$EXP_JSON" | python3 -c "
+        DELTA_OUTPUT=$(echo "$EXP_JSON" | python3 -c "
 import json, sys
 try:
     data = json.loads(sys.stdin.read().strip())
     with open('$PREV_EXP_FILE') as f:
         prev = json.loads(f.read())
+    total_delta = 0
     for k in sorted(data.keys()):
         v = data[k]
         node_num = k[1]
         delta = v - prev.get(k, 0)
+        total_delta += delta
         delta_str = f'+{delta}' if delta >= 0 else str(delta)
         print(f'  Node{node_num}: {v:>7,} 筆  ({delta_str}/刷新)')
     with open('$PREV_EXP_FILE', 'w') as f:
         f.write(json.dumps(data))
+    # 輸出 total_delta 供 bash 判斷
+    print(f'__TOTAL_DELTA__:{total_delta}')
 except Exception as e:
     print(f'  (解析失敗: {e})')
-"
+    print('__TOTAL_DELTA__:-1')
+" 2>/dev/null)
+
+        # 擷取 total_delta
+        TOTAL_DELTA=$(echo "$DELTA_OUTPUT" | grep "__TOTAL_DELTA__" | cut -d: -f2)
+        echo "$DELTA_OUTPUT" | grep -v "__TOTAL_DELTA__"
+
+        # 凍結判斷：全部 delta=0 且 ZMQ socket 數量正常（確認 xApp 確實在跑）
+        NOW_TS=$(date +%s)
+        SINCE_RESTART=$((NOW_TS - LAST_RESTART_TIME))
+        if [ "${TOTAL_DELTA:-0}" -eq 0 ] && [ "$ZMQ" -ge 5 ] && [ "$SINCE_RESTART" -gt 60 ]; then
+            FROZEN_COUNT=$((FROZEN_COUNT + 1))
+            ALL_FROZEN=1
+        else
+            FROZEN_COUNT=0
+        fi
     else
         echo -e "  ${RED}(MongoDB 未回應，確認 mongodb 容器狀態)${NC}"
+        FROZEN_COUNT=0
     fi
+
+    # 凍結狀態顯示
+    if [ "$ALL_FROZEN" -eq 1 ]; then
+        REMAINING=$((FROZEN_THRESHOLD - FROZEN_COUNT))
+        if [ "$REMAINING" -le 0 ]; then
+            echo -e "  ${RED}⚠ ZMQ 凍結 $((FROZEN_COUNT * INTERVAL))s！${NC}"
+        else
+            echo -e "  ${YELLOW}⚠ ZMQ 凍結偵測中（${FROZEN_COUNT}/${FROZEN_THRESHOLD} 輪，再 $((REMAINING * INTERVAL))s 觸發重啟）${NC}"
+        fi
+    fi
+
+    # ── Watchdog 觸發 ────────────────────────────────────────
+    if [ "$FROZEN_COUNT" -ge "$FROZEN_THRESHOLD" ]; then
+        WATCHDOG_MSG="ZMQ 凍結 $((FROZEN_COUNT * INTERVAL))s（FlexRIC 可能重啟過）"
+        restart_xapps "$WATCHDOG_MSG"
+        FROZEN_COUNT=0
+        LAST_RESTART_TIME=$(date +%s)
+    fi
+
     echo ""
 
     # ── 推論狀態 ─────────────────────────────────────────────
@@ -148,7 +210,6 @@ except Exception as e:
         STATUS=$(check_inference_status $i)
         FB=$(check_fallback $i)
 
-        # 根據關鍵字著色
         if echo "$STATUS" | grep -qE "actor_loss|DRL 推論模式"; then
             STATUS_STR="${GREEN}${STATUS}${NC}"
         elif echo "$STATUS" | grep -q "啟發式"; then
@@ -181,9 +242,14 @@ except Exception as e:
     done
     echo ""
 
+    # ── Watchdog 歷史 ─────────────────────────────────────────
+    if [ -n "$WATCHDOG_MSG" ]; then
+        echo -e "${DIM}  [上次 watchdog] ${WATCHDOG_MSG}${NC}"
+    fi
+
     # ── 底部提示 ─────────────────────────────────────────────
     echo -e "${DIM}  刷新間隔：${INTERVAL}s | Ctrl+C 離開 | bash monitor_drl.sh [秒數] 可調整${NC}"
-    echo -e "${DIM}  $(date -d "+${INTERVAL} seconds" '+下次刷新：%H:%M:%S')${NC}"
+    echo -e "${DIM}  xApp watchdog：凍結 $((FROZEN_THRESHOLD * INTERVAL))s 自動重啟 | $(date -d "+${INTERVAL} seconds" '+下次刷新：%H:%M:%S')${NC}"
 
     sleep "$INTERVAL"
 done

@@ -92,6 +92,15 @@ for node in 1 2 3 4 5; do
     [ "$node" -lt 5 ] && sleep 3
 done
 
+# 更新所有 inference 容器的 reward_calculator.py（確保 all-idle guard 生效）
+log "  更新 inference 容器 reward_calculator.py..."
+REWARD_SRC="$COMPOSE_DIR/inference/reward_calculator.py"
+for n in 1 2 3 4 5; do
+    docker cp "$REWARD_SRC" "inference-node${n}:/app/reward_calculator.py" 2>/dev/null \
+        && ok "inference-node${n} reward_calculator.py 已更新" \
+        || warn "inference-node${n} cp 失敗（容器可能尚未就緒）"
+done
+
 # 驗證 ZMQ
 sleep 2
 ZMQ=$(ls /tmp/zmq_node*_inference.ipc 2>/dev/null | wc -l)

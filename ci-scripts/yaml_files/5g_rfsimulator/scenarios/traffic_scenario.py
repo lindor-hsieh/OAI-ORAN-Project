@@ -290,12 +290,12 @@ def scenario_a(ues: list[UEConfig], ctrls: dict[int, ChannelModController]) -> l
     每個 Node 內 UE 對比：CQI 15 vs CQI 5，流量相等。
     """
     return [
-        (15, 10.0),  # UE1 @ Node3: 好通道
-        (5,  10.0),  # UE2 @ Node3: 差通道
-        (15, 10.0),  # UE3 @ Node4: 好通道
-        (5,  10.0),  # UE4 @ Node4: 差通道
-        (15, 10.0),  # UE5 @ Node5: 好通道
-        (5,  10.0),  # UE6 @ Node5: 差通道
+        (15, 30.0),  # UE1 @ Node3: 好通道
+        (5,  30.0),  # UE2 @ Node3: 差通道
+        (15, 30.0),  # UE3 @ Node4: 好通道
+        (5,  30.0),  # UE4 @ Node4: 差通道
+        (15, 30.0),  # UE5 @ Node5: 好通道
+        (5,  30.0),  # UE6 @ Node5: 差通道
     ]
 
 
@@ -305,12 +305,12 @@ def scenario_b(ues: list[UEConfig], ctrls: dict[int, ChannelModController]) -> l
     目標：訓練 DRL 在相同 CQI 下公平分配 PRB，避免高流量 UE 飢餓低流量 UE。
     """
     return [
-        (12, 25.0),  # UE1 @ Node3: 高需求
-        (12,  5.0),  # UE2 @ Node3: 低需求
-        (12, 20.0),  # UE3 @ Node4: 高需求
-        (12,  4.0),  # UE4 @ Node4: 低需求
-        (12, 22.0),  # UE5 @ Node5: 高需求
-        (12,  3.0),  # UE6 @ Node5: 低需求
+        (12, 45.0),  # UE1 @ Node3: 高需求
+        (12, 25.0),  # UE2 @ Node3: 低需求（仍確保 bsr > 0）
+        (12, 45.0),  # UE3 @ Node4: 高需求
+        (12, 25.0),  # UE4 @ Node4: 低需求
+        (12, 45.0),  # UE5 @ Node5: 高需求
+        (12, 25.0),  # UE6 @ Node5: 低需求
     ]
 
 
@@ -320,12 +320,12 @@ def scenario_c(ues: list[UEConfig], ctrls: dict[int, ChannelModController]) -> l
     目標：讓 DRL 學習在「頻譜效率低但需求大」的 UE 與「效率高但需求小」的 UE 間取得平衡。
     """
     return [
-        (4,  25.0),  # UE1 @ Node3: 差通道高需求 ← 挑戰排程器
-        (14,  3.0),  # UE2 @ Node3: 好通道低需求
-        (4,  20.0),  # UE3 @ Node4: 差通道高需求
-        (13,  4.0),  # UE4 @ Node4: 好通道低需求
-        (5,  22.0),  # UE5 @ Node5: 差通道高需求
-        (14,  2.0),  # UE6 @ Node5: 好通道低需求
+        (4,  50.0),  # UE1 @ Node3: 差通道高需求 ← 挑戰排程器
+        (14, 25.0),  # UE2 @ Node3: 好通道低需求（仍確保 bsr > 0）
+        (4,  50.0),  # UE3 @ Node4: 差通道高需求
+        (13, 25.0),  # UE4 @ Node4: 好通道低需求
+        (5,  50.0),  # UE5 @ Node5: 差通道高需求
+        (14, 25.0),  # UE6 @ Node5: 好通道低需求
     ]
 
 
@@ -336,9 +336,11 @@ def scenario_d_random(ues: list[UEConfig]) -> list[tuple[int, float]]:
     """
     # path_loss 表已壓縮至 0~25dB 安全範圍，所有 CQI 值皆可使用
     cqi_choices = list(range(1, 16))   # 1~15 完整覆蓋
-    # BW 最低 5 Mbps，最高 50 Mbps（106 PRB 兩 UE 共享上限約 40Mbps，50 留餘量）
-    # 超過 50Mbps 會讓 rfsim TCP buffer 滿載，導致 DU 排程延遲與 DL 路徑崩潰。
-    bw_choices = [float(x) for x in range(5, 55, 5)]
+    # BW 最低 25 Mbps，最高 50 Mbps。
+    # 下限 25 Mbps：確保每個 UE 的 iperf3 需求超過 DU 在 100ms 窗口能服務的量，
+    # 使 DL buffer 持續有資料（bsr 恆 > 0），消除 bsr=0 帶來的 idle 噪訊。
+    # 上限 50 Mbps：超過此值會讓 rfsim TCP buffer 滿載，導致 DU 排程延遲與 DL 路徑崩潰。
+    bw_choices = [float(x) for x in range(25, 55, 5)]
     configs = []
     for _ in ues:
         cqi = random.choice(cqi_choices)

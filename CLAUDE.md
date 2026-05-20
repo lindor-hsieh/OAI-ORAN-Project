@@ -161,6 +161,31 @@ Global xApp 的差異化價值：跨層 IAB 回傳協調，Local-only 架構做�
 
 > **規則**：刪除整份檔案需經過授權。所有修改先在 PC 1 完成，再將修改好的檔案傳給 PC 2。
 
+### 狀態觀測窗口（100ms）與 MAX_BSR 正規化
+
+C xApp 的 Rate Limiter 每 10 個 10ms MAC callback 才觸發一次 ZMQ，因此每筆 State 的 `bsr` 欄位實際上是 **100ms 累積的 `delta_dl_aggr_tbs`（bytes）**，而非單一 10ms 窗口值。對應的正規化常數：
+
+```
+MAX_BSR = 1,000,000 bytes/100ms ≈ 80 Mbps（106 PRB × MCS28 峰值）
+```
+
+`reward_calculator.py` 中的所有吞吐量計算均以此為分母。若未來修改 Rate Limiter 的觸發間隔，MAX_BSR 必須同步調整。
+
+### FlexRIC 崩潰規律與重啟流程
+
+**現象**：每次執行 `run_local_pc1.sh` 後，累積約 **2000 筆** experience 時 FlexRIC 容器會崩潰（E2 connection 中斷，xApp 停止收到 MAC indication）。
+
+**恢復流程**：
+1. 重新執行完整腳本（FlexRIC 須先於 DU 啟動）：
+   ```bash
+   # PC1
+   bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc1.sh
+   # PC2（等 PC1 FlexRIC healthy 後）
+   bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc2.sh
+   ```
+2. `inference_server.py` 啟動時會自動從 `/app/models/model_nodeX.pt` 載入 checkpoint，**訓練進度與 MongoDB experience 不會丟失**，直接從上次停止點繼續。
+3. 啟動順序強制要求：**FlexRIC → DU → xApp**，單獨重啟 FlexRIC 無效（DU 未重啟則無法重建 E2 連線）。
+
 ---
 
 ## 8. 實驗基準數據 (PF Scheduler Baseline)

@@ -27,14 +27,15 @@ import numpy as np
 # =============================================================================
 
 # 獎勵權重（三項總計 1.0）
-W_THROUGHPUT: float = 0.4   # 吞吐量最大化
-W_FAIRNESS:   float = 0.4   # Jain's Fairness 公平性（與吞吐量並重）
-W_DELAY:      float = 0.2   # PRB 效率懲罰（間接延遲代理）
+W_THROUGHPUT: float = 0.6   # 吞吐量最大化（主要目標：超越 PF）
+W_FAIRNESS:   float = 0.3   # Jain's Fairness 公平性（次要目標）
+W_DELAY:      float = 0.1   # PRB 效率懲罰（間接延遲代理）
 
 # delta_tbs 正規化參考值 (bytes/100ms)
 # C xApp rate limiter 每 10 個 MAC callback 才送一次 ZMQ，測量窗口為 100ms。
-# 106 PRB × MCS28 ≈ 80 Mbps = 1,000,000 bytes per 100ms（峰值上限）
-MAX_BSR: float = 1_000_000.0
+# 實測 106 PRB 高負載下 delta_tbs 可達 1~2.5M bytes/100ms（80~200 Mbps），
+# 設為 2,000,000 確保 r_throughput 在實際範圍內有完整梯度，不被截斷。
+MAX_BSR: float = 2_000_000.0
 
 
 # =============================================================================

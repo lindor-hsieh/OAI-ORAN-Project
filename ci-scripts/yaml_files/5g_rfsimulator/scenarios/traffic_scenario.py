@@ -194,22 +194,7 @@ def start_iperf_client(ue: UEConfig) -> bool:
 
 def stop_iperf_client(ue: UEConfig) -> None:
     """停止 UE 容器中的 iperf3 loop（先殺容器內程序，再終止 docker exec）。"""
-    # 用 SIGKILL（-9）直接殺，避免 SIGTERM trap handler 慢速執行造成 race condition：
-    # SIGTERM 會觸發 sh loop 的 trap，trap 內又 pkill，導致 stop_iperf_client.wait(5) timeout，
-    # wait timeout 後只 kill docker exec（PC 端），容器內 sh loop 仍殘存 → 多 loop 並發。
-    # SIGKILL 則立即終止，不給 trap 機會，確保容器內只有一個 loop。
-    try:
-        subprocess.run(
-            ["docker", "exec", ue.container, "sh", "-c",
-             "pkill -9 -f iperf3 2>/dev/null; pkill -9 -f 'while true' 2>/dev/null; true"],
-            capture_output=True, timeout=5,
-        )
-        time.sleep(0.3)   # 給 kernel 時間清理進程，避免 Popen 啟動時舊 loop 仍存在
-    except subprocess.TimeoutExpired:
-        log.warning("stop_iperf_client: %s docker exec 超時（容器可能重啟中），跳過 pkill",
-                    ue.container)
-    except Exception as exc:
-        log.warning("stop_iperf_client: %s 異常: %s", ue.container, exc)
+    # Step 1：終止 docker exec wrapper（讓 Python supervisor 不再持有舊 Popen）
     if ue._iperf_proc:
         try:
             ue._iperf_proc.terminate()
@@ -218,6 +203,35 @@ def stop_iperf_client(ue: UEConfig) -> None:
             ue._iperf_proc.kill()
             ue._iperf_proc.wait()
         ue._iperf_proc = None
+
+    # Step 2：第一次 pkill：殺容器內的 iperf3 + while loop sh
+    try:
+        subprocess.run(
+            ["docker", "exec", ue.container, "sh", "-c",
+             "pkill -9 -f iperf3 2>/dev/null; pkill -9 -f 'while true' 2>/dev/null; true"],
+            capture_output=True, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("stop_iperf_client: %s 第一次 pkill 超時", ue.container)
+    except Exception as exc:
+        log.warning("stop_iperf_client: %s 異常: %s", ue.container, exc)
+
+    time.sleep(0.8)  # 等 while loop 停止後不再重啟新 iperf3
+
+    # Step 3：第二次 pkill：清除 while loop 在 sleep 期間重啟的 iperf3
+    try:
+        subprocess.run(
+            ["docker", "exec", ue.container, "pkill", "-9", "-f", "iperf3"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+    # Step 4：等待 iperf3 server 偵測 RST + while loop sleep 1s 後重啟
+    # iperf3 server 設定：while true; do iperf3 -s; sleep 1; done
+    # client killed → server RST → server iperf3 exit → sleep 1 → restart
+    # 必須等這個 cycle 完成，否則新 client 連進來 server 仍 "busy"
+    time.sleep(1.5)
 
 
 def stop_all_iperf(ues: list[UEConfig]) -> None:

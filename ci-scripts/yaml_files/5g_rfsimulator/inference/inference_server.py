@@ -514,10 +514,14 @@ class InferenceServer:
                         self._log.info("STATE[%d] %s", self._total_inferences, ue_summary)
 
                     # ── 計算上一步的獎勵並寫入 MongoDB ────────────────────
+                    # 跳過 xApp 重連後 delta_tbs 全為 0 的空白 state，
+                    # 避免 reward≈0 的無效 experience 污染訓練資料。
+                    _total_delta = sum(u.get("bsr", 0) for u in ues)
                     if (
                         self._prev_ues is not None
                         and self._prev_allocations is not None
                         and len(ues) > 0
+                        and _total_delta > 0
                     ):
                         exp_doc = self._build_rl_experience(
                             prev_ues=self._prev_ues,

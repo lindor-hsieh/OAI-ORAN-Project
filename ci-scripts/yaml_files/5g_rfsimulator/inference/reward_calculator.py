@@ -2,6 +2,7 @@
 reward_calculator.py — PRB DRL 複合獎勵函數
 
 Reward = W_THROUGHPUT × R_tp + W_FAIRNESS × R_fair - W_DELAY × R_delay
+         (W=0.5/0.4/0.1，提高公平性權重防止 policy monopoly collapse)
 
 三項組成：
   R_throughput : 各 UE 實際 DL 吞吐量平均值（delta_dl_aggr_tbs 正規化）∈ [0, 1]
@@ -27,8 +28,8 @@ import numpy as np
 # =============================================================================
 
 # 獎勵權重（三項總計 1.0）
-W_THROUGHPUT: float = 0.6   # 吞吐量最大化（主要目標：超越 PF）
-W_FAIRNESS:   float = 0.3   # Jain's Fairness 公平性（次要目標）
+W_THROUGHPUT: float = 0.5   # 吞吐量最大化（主要目標：超越 PF）
+W_FAIRNESS:   float = 0.4   # Jain's Fairness 公平性（提高至 0.4 防止壟斷 policy collapse）
 W_DELAY:      float = 0.1   # PRB 效率懲罰（間接延遲代理）
 
 # delta_tbs 正規化參考值 (bytes/100ms)

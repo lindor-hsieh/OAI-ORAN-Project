@@ -68,6 +68,7 @@
 * **Reward 設計**：撰寫複合獎勵函數，結合 Throughput 最大化、Delay 懲罰與 Fairness 補償。✅ 已完成
 * **Local rApp 開發**：與 Local xApp 推論伺服器運行於**同一 Python 進程、共享 DRL 模型**。從 MongoDB 讀取歷史 State/Action/Reward，執行本地模型 Fine-tuning，為第五階段 Flower Client 整合做準備。✅ 已完成（`inference_server.py` 背景訓練執行緒）
 * **穩定度測試**：讓 AI 取代 Hardcode 邏輯，觀察系統在高併發流量下的穩定度與收斂情況。⬜ 進行中
+* **DRL vs PF 吞吐量驗證**：使用 Scenario A/B/C（訓練用 D，測試用 A/B/C 驗證泛化能力）作為測試條件。流程：① PC2 先跑 `traffic_scenario.py --scenario A`（設好 CQI）② `drl_report.py --iters 3` 接管 iperf3 量測（CQI 設定保留在 DU）③ 停 xApp 後以相同 scenario CQI 重量 PF baseline，存入 `drl_report.py` 的 `PF_PER_UE`。**TCP-DL、UDP-DL 吞吐量與 Jain's Fairness Index 三項在 A/B/C 三個場景下須全部優於對應 PF Baseline 才算完成本階段**（延遲允許小幅劣化）。⬜ 待驗證
 
 ### 第五階段：Global 控制平面與聯邦學習整合 (待開發)
 
@@ -136,7 +137,7 @@ Global xApp 的差異化價值：跨層 IAB 回傳協調，Local-only 架構做�
 
 ## 7. 注意事項
 
-目前進行中為**第四階段**（DRL 閉環控制 + Local rApp 訓練）並準備進入**第五階段**（Global xApp 設計）。第五階段開始前需等待 Local DRL 訓練資料量達 20000 筆以上確認收斂。開發 xApp 至少要修改以下這些檔案：
+目前進行中為**第四階段**（DRL 閉環控制 + Local rApp 訓練）並準備進入**第五階段**（Global xApp 設計）。第五階段開始前需等待 Local DRL 訓練確認收斂。開發 xApp 至少要修改以下這些檔案：
 
 **xApp 本體（每個 Node 各自獨立，共 5 份）**
 `~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node1.c`
@@ -171,7 +172,7 @@ MAX_BSR = 2,000,000 bytes/100ms（實測高負載下 delta_tbs 可達 1~2.5M byt
 
 `reward_calculator.py` 中的所有吞吐量計算均以此為分母。若未來修改 Rate Limiter 的觸發間隔，MAX_BSR 必須同步調整。
 
-獎勵權重（`reward_calculator.py`）：W_THROUGHPUT=**0.6**、W_FAIRNESS=**0.3**、W_DELAY=**0.1**（主要目標為吞吐量超越 PF，公平性為次要目標）。
+獎勵權重（`reward_calculator.py`）：W_THROUGHPUT=**0.5**、W_FAIRNESS=**0.4**、W_DELAY=**0.1**（提高公平性權重至 0.4 以防止 2-UE policy monopoly collapse；吞吐量仍為主要目標）。
 
 ### FlexRIC 崩潰規律與重啟流程
 

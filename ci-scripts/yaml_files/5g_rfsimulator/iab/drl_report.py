@@ -70,7 +70,7 @@ SSH_BASE    = ["ssh", "-o", "StrictHostKeyChecking=no",
 UPF_DN_IP   = "192.168.72.135"   # ext-dn iperf3 server
 MONGO_URI   = "mongodb://localhost:27017/"
 UE_NAMES    = [f"rfsim5g-end-ue-{i}" for i in range(1, 7)]
-IPERF_DURATION = 5               # 每次 iperf3 測試秒數
+IPERF_DURATION = 2               # 每次 iperf3 測試秒數（對齊 PF baseline iab_perf_test.sh 的 -t 2）
 
 
 # ── 工具函式 ──────────────────────────────────────────────────────────────────
@@ -97,11 +97,11 @@ def parse_iperf_mbps(raw: str) -> Optional[float]:
             continue
         parts = line.split()
         for i, p in enumerate(parts):
-            if p in ("Mbps", "Gbps", "Kbps") and i > 0:
+            if p in ("Mbps", "Gbps", "Kbps", "Mbits/sec", "Gbits/sec", "Kbits/sec") and i > 0:
                 try:
                     v = float(parts[i - 1])
-                    if p == "Gbps": v *= 1000.0
-                    if p == "Kbps": v /= 1000.0
+                    if p in ("Gbps", "Gbits/sec"): v *= 1000.0
+                    if p in ("Kbps", "Kbits/sec"): v /= 1000.0
                     return v
                 except ValueError:
                     pass

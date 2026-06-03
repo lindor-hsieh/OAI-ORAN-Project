@@ -149,34 +149,31 @@ def _get_ue_ip(container: str) -> Optional[str]:
 
 def start_iperf_client(ue: UEConfig) -> bool:
     """
-    在 UE 容器內以 while loop 持續執行 iperf3 TCP 下行客戶端（-R reverse mode）。
+    在 UE 容器內執行單次 iperf3 TCP 下行客戶端（-R reverse mode）。
 
-    不使用 docker exec -d（detached）：-d 會讓 docker exec 立刻以 rc=0 返回，
-    導致 _iperf_proc.poll() 馬上非 None，watchdog 誤判死亡並不斷重啟。
-
-    改為前台執行 sh -c "while true; do iperf3 ...; sleep 2; done"：
-    - docker exec 持續存活，poll() 恆為 None → watchdog 不誤觸發
-    - loop 每次迭代前動態查詢 oaitun_ue1 的 IP：UE 暫時斷線重連後可自動恢復
-    - 若介面尚未就緒（IP 為空），每 5 秒輪詢一次，待 IP 出現後立即重啟 iperf3
-    - 使用 TCP 而非 UDP：TCP 擁塞控制可自適應 DRL PRB 震盪，不因 TCP 控制通道中斷而斷線
+    不使用 while loop：shell loop 在容器內被 SIGKILL 時，其子進程（iperf3）
+    被 container PID 1 接管而繼續存活，導致多個 iperf3 並發搶同一 server port。
+    改為單次 iperf3，由 Python supervisor（watchdog loop 的 poll()）負責重啟，
+    stop = kill docker exec，docker exec 退出時 iperf3 是其直接子進程，一起終止。
     """
-    # timeout {IPERF_DURATION+30} 確保即使 iperf3 卡死也會被強制結束，
-    # 避免 while loop 永遠等不到下一次迭代。
-    loop_cmd = (
-        f"trap 'pkill -f iperf3; exit 0' TERM INT; "
-        f"while true; do "
-        f"UE_IP=$(ip addr show {IPERF_BIND_IF} 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1); "
-        f"if [ -z \"$UE_IP\" ]; then sleep 5; continue; fi; "
-        f"timeout {IPERF_DURATION + 30} "
-        f"iperf3 -c {EXT_DN_IP} -b {ue.bandwidth_mbps:.0f}M -R "
-        f"-t {IPERF_DURATION} -p {ue.iperf_port} -B $UE_IP --forceflush; "
-        f"sleep 2; "
-        f"done"
-    )
-    cmd = ["docker", "exec", ue.container, "sh", "-c", loop_cmd]
+    stop_iperf_client(ue)
 
+    ue_ip = _get_ue_ip(ue.container)
+    if not ue_ip:
+        log.warning("%s: oaitun_ue1 IP 尚未就緒，等下次 watchdog 重試", ue.container)
+        return False
+
+    cmd = [
+        "docker", "exec", ue.container,
+        "timeout", str(IPERF_DURATION + 30),
+        "iperf3", "-c", EXT_DN_IP,
+        "-b", f"{ue.bandwidth_mbps:.0f}M",
+        "-R", "-t", str(IPERF_DURATION),
+        "-p", str(ue.iperf_port),
+        "-B", ue_ip,
+        "--forceflush",
+    ]
     try:
-        stop_iperf_client(ue)
         ue._iperf_proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -184,8 +181,8 @@ def start_iperf_client(ue: UEConfig) -> bool:
         )
         ue._last_rx_bytes = 0
         ue._last_rx_check = time.time()
-        log.info("iperf3 loop start: %s → %s:%d @ %.0fMbps",
-                 ue.container, EXT_DN_IP, ue.iperf_port, ue.bandwidth_mbps)
+        log.info("iperf3 start: %s → %s:%d @ %.0fMbps (bind=%s)",
+                 ue.container, EXT_DN_IP, ue.iperf_port, ue.bandwidth_mbps, ue_ip)
         return True
     except FileNotFoundError:
         log.error("找不到 docker 指令")
@@ -193,44 +190,27 @@ def start_iperf_client(ue: UEConfig) -> bool:
 
 
 def stop_iperf_client(ue: UEConfig) -> None:
-    """停止 UE 容器中的 iperf3 loop（先殺容器內程序，再終止 docker exec）。"""
-    # Step 1：終止 docker exec wrapper（讓 Python supervisor 不再持有舊 Popen）
+    """終止 docker exec wrapper 並殺掉容器內的 iperf3 進程。"""
+    # Step 1：終止 docker exec wrapper
     if ue._iperf_proc:
         try:
-            ue._iperf_proc.terminate()
-            ue._iperf_proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
             ue._iperf_proc.kill()
-            ue._iperf_proc.wait()
+            ue._iperf_proc.wait(timeout=3)
+        except Exception:
+            pass
         ue._iperf_proc = None
 
-    # Step 2：第一次 pkill：殺容器內的 iperf3 + while loop sh
+    # Step 2：殺容器內殘留的 iperf3（按 port 精確匹配）
     try:
         subprocess.run(
-            ["docker", "exec", ue.container, "sh", "-c",
-             "pkill -9 -f iperf3 2>/dev/null; pkill -9 -f 'while true' 2>/dev/null; true"],
-            capture_output=True, timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        log.warning("stop_iperf_client: %s 第一次 pkill 超時", ue.container)
-    except Exception as exc:
-        log.warning("stop_iperf_client: %s 異常: %s", ue.container, exc)
-
-    time.sleep(0.8)  # 等 while loop 停止後不再重啟新 iperf3
-
-    # Step 3：第二次 pkill：清除 while loop 在 sleep 期間重啟的 iperf3
-    try:
-        subprocess.run(
-            ["docker", "exec", ue.container, "pkill", "-9", "-f", "iperf3"],
+            ["docker", "exec", ue.container, "pkill", "-9", "-f",
+             f"iperf3.*-p {ue.iperf_port}"],
             capture_output=True, timeout=5,
         )
     except Exception:
         pass
 
-    # Step 4：等待 iperf3 server 偵測 RST + while loop sleep 1s 後重啟
-    # iperf3 server 設定：while true; do iperf3 -s; sleep 1; done
-    # client killed → server RST → server iperf3 exit → sleep 1 → restart
-    # 必須等這個 cycle 完成，否則新 client 連進來 server 仍 "busy"
+    # 等待 server 端重置 TCP 連線後重啟，避免新 client 遇到 "server is busy"
     time.sleep(1.5)
 
 

@@ -68,7 +68,54 @@
 * **Reward 設計**：撰寫複合獎勵函數，結合 Throughput 最大化、Delay 懲罰與 Fairness 補償。✅ 已完成
 * **Local rApp 開發**：與 Local xApp 推論伺服器運行於**同一 Python 進程、共享 DRL 模型**。從 MongoDB 讀取歷史 State/Action/Reward，執行本地模型 Fine-tuning，為第五階段 Flower Client 整合做準備。✅ 已完成（`inference_server.py` 背景訓練執行緒）
 * **穩定度測試**：讓 AI 取代 Hardcode 邏輯，觀察系統在高併發流量下的穩定度與收斂情況。⬜ 進行中
-* **DRL vs PF 吞吐量驗證**：使用 Scenario A/B/C（訓練用 D，測試用 A/B/C 驗證泛化能力）作為測試條件。流程：① PC2 先跑 `traffic_scenario.py --scenario A`（設好 CQI）② `drl_report.py --iters 3` 接管 iperf3 量測（CQI 設定保留在 DU）③ 停 xApp 後以相同 scenario CQI 重量 PF baseline，存入 `drl_report.py` 的 `PF_PER_UE`。**TCP-DL、UDP-DL 吞吐量與 Jain's Fairness Index 三項在 A/B/C 三個場景下須全部優於對應 PF Baseline 才算完成本階段**（延遲允許小幅劣化）。⬜ 待驗證
+* **DRL vs PF 吞吐量驗證**：使用 Scenario A/B/C（訓練用 D，測試用 A/B/C 驗證泛化能力）作為測試條件。**TCP-DL 吞吐量與 Jain's Fairness Index 兩項在 A/B/C 三個場景下須全部優於對應 PF Baseline 才算完成本階段**（延遲允許小幅劣化）。⬜ 進行中（A✓ B✗ C✓）
+
+#### DRL vs PF 標準量測流程
+
+> **重要**：PF baseline 必須在相同場景 CQI 條件下現場量測，不得使用 4/20 舊 baseline（無 scenario CQI）
+
+```bash
+# Step 1：在 PC2 啟動場景（設定 CQI 並開始競爭流量）
+ssh lindor@192.168.88.2 'bash -s' << 'EOF'
+setsid python3 ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/scenarios/traffic_scenario.py \
+  --scenario B --duration 900 > /tmp/scenario_b.log 2>&1 < /dev/null &
+disown $!
+sleep 8 && tail -20 /tmp/scenario_b.log
+EOF
+# 確認 6 個 UE 的 iperf3 loop start 均已出現後繼續
+
+# Step 2：量測 DRL 效能（xApp 運行中）
+cd ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator
+python3 iab/drl_report.py --iters 3
+
+# Step 3：停止所有 xApp（切換至 OAI PF 排程器）
+docker stop xapp-node1 xapp-node2 xapp-node3 xapp-node4 xapp-node5
+
+# Step 4：量測 PF 效能（同一場景 CQI，scenario 仍在跑維持 CQI 設定）
+python3 iab/drl_report.py --iters 3
+
+# Step 5：重啟 xApp 恢復 DRL 模式
+docker start xapp-node1 xapp-node2 xapp-node3 xapp-node4 xapp-node5
+```
+
+**注意事項：**
+- Step 2 的「DRL」欄位 = 實測 DRL 數據
+- Step 4 的「DRL」欄位 = 實測 PF 數據（腳本 label 固定為 DRL，忽略即可）
+- `drl_report.py` 的 `PF_PER_UE` hardcode 是舊 4/20 數據，報告中的 PF Baseline 欄位**不可信**，以現場量測為準
+- 量測前確認 data plane 正常：`docker exec rfsim5g-donor-cu ping -c 2 12.1.1.9`
+- **每次量測完成後，將 per-UE 原始數據與對比結果補記至 `/home/lindor/drl_report/scenario_comparison_2026-05-23.md`**
+
+#### 當前量測結果（2026-05-23）
+
+完整數據見 `/home/lindor/drl_report/scenario_comparison_2026-05-23.md`
+
+| Scenario | DRL avg TCP-DL | PF avg TCP-DL | DRL JFI | PF JFI | 吞吐量 | JFI | 通過 |
+|----------|---------------|---------------|---------|--------|--------|-----|------|
+| A | 7.34 Mbps | 6.95 Mbps | 0.859 | 0.860 | ✓ +5.6% | ~ | ✓ |
+| B | 4.34 Mbps | 5.43 Mbps | 0.814 | 0.898 | **✗ −20%** | ✗ | **✗** |
+| C | 4.86 Mbps | 4.35 Mbps | 0.808 | 0.817 | ✓ +12% | ~ | ✓ |
+
+**Scenario B blocker**：Node3 recent reward = −0.197（policy degradation），UE1/2（Node3 管轄）PRB 飢餓，avg 僅 1.4–2.45 Mbps。
 
 ### 第五階段：Global 控制平面與聯邦學習整合 (待開發)
 

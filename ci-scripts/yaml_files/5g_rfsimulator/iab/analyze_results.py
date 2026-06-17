@@ -39,18 +39,29 @@ MARKER_EVERY = 20   # thin out markers on CDF curves
 # ─── iperf3 parser ─────────────────────────────────────────────────────────
 
 def parse_iperf_json(path: Path) -> float:
-    """Return receiver throughput in Mbps from an iperf3 -J output file."""
+    """Return UDP throughput in Mbps from an iperf3 -J output file.
+
+    With downlink -R mode: UE is the receiver → sum_received is valid locally.
+    Fallback: sum_sent × (1 - lost_percent/100) for any remaining edge cases.
+    """
     try:
         with open(path) as f:
             data = json.load(f)
-        # iperf3 UDP: receiver bits_per_second is in end.sum (server side)
-        # Try end.sum_received first, fallback to end.sum
         end = data.get("end", {})
-        for key in ("sum_received", "sum"):
-            s = end.get(key)
-            if s and s.get("bits_per_second", 0) > 0:
-                return s["bits_per_second"] / 1e6
-        # Fallback: last interval receiver
+
+        # 1. Server-side received stats (only available with --get-server-output)
+        sr = end.get("sum_received", {})
+        if sr and sr.get("bits_per_second", 0) > 0:
+            return sr["bits_per_second"] / 1e6
+
+        # 2. Sender-side stats — adjust for packet loss
+        ss = end.get("sum_sent", {})
+        if ss and ss.get("bits_per_second", 0) > 0:
+            bps      = ss["bits_per_second"]
+            loss_pct = ss.get("lost_percent", 0)
+            return bps * (1.0 - loss_pct / 100.0) / 1e6
+
+        # 3. Fallback: last interval sum
         intervals = data.get("intervals", [])
         if intervals:
             last = intervals[-1].get("sum", {})
@@ -61,15 +72,27 @@ def parse_iperf_json(path: Path) -> float:
 
 
 def total_throughput_mbps(policy: str) -> float:
-    """Sum receiver throughput across 6 UEs for a policy (Mbps)."""
+    """Sum average receiver throughput across 6 UEs and all phases (Mbps).
+
+    Supports both single-file (iperf_ue{i}.json) and per-phase
+    (iperf_ue{i}_ph{1-3}.json) naming conventions.
+    """
     total = 0.0
     for i in range(1, 7):
-        p = RESULTS_DIR / policy / f"iperf_ue{i}.json"
-        if p.exists():
-            mbps = parse_iperf_json(p)
-            total += mbps
+        # rglob: 相容 results/<policy>/iperf_*.json 和 results/<policy>/<policy>/iperf_*.json
+        phase_files = sorted((RESULTS_DIR / policy).rglob(f"iperf_ue{i}_ep*.json"))
+        if not phase_files:
+            phase_files = sorted((RESULTS_DIR / policy).rglob(f"iperf_ue{i}_ph*.json"))
+        if phase_files:
+            vals = [parse_iperf_json(p) for p in phase_files]
+            vals = [v for v in vals if v > 0]
+            total += float(np.mean(vals)) if vals else 0.0
         else:
-            print(f"  [warn] missing {p}")
+            p = RESULTS_DIR / policy / f"iperf_ue{i}.json"
+            if p.exists():
+                total += parse_iperf_json(p)
+            else:
+                print(f"  [warn] no iperf file for ue{i} policy={policy}")
     return total
 
 # ─── ping parser ──────────────────────────────────────────────────────────
@@ -88,14 +111,14 @@ def parse_ping_rtts(path: Path) -> list:
 
 
 def all_rtts(policy: str) -> list:
-    """Aggregate all UE RTTs for a policy."""
+    """Aggregate all UE RTTs for a policy (rglob handles nested dir structure)."""
     rtts = []
     for i in range(1, 7):
-        p = RESULTS_DIR / policy / f"ping_ue{i}.txt"
-        if p.exists():
-            rtts.extend(parse_ping_rtts(p))
+        files = list((RESULTS_DIR / policy).rglob(f"ping_ue{i}.txt"))
+        if files:
+            rtts.extend(parse_ping_rtts(files[0]))
         else:
-            print(f"  [warn] missing {p}")
+            print(f"  [warn] missing ping_ue{i}.txt for policy={policy}")
     return rtts
 
 # ─── CPU parser ───────────────────────────────────────────────────────────

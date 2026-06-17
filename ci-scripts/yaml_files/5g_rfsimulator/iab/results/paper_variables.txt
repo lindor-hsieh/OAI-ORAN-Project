@@ -1,0 +1,33 @@
+============================================================
+Paper Variables — Fill into LaTeX template
+============================================================
+
+--- Throughput (Section VI.B) ---
+  X_{50/50} = 25.80 Mbps
+  X_{30/70} = 28.91 Mbps
+  X_{10/90} = 29.71 Mbps
+  X_{dyn} = 29.85 Mbps
+  X_{PF} = 29.52 Mbps
+
+--- Mean Latency L (Section VI.C) ---
+  L_{50/50} = 3890.45 ms
+  L_{30/70} = 3294.47 ms
+  L_{10/90} = 2975.71 ms
+  L_{dyn} = 2897.11 ms
+  L_{PF} = 3288.03 ms
+
+--- 95th-pct Latency P (Section VI.C) ---
+  P_{50/50} = 15693.85 ms
+  P_{30/70} = 15159.65 ms
+  P_{10/90} = 14564.30 ms
+  P_{dyn} = 14438.55 ms
+  P_{PF} = 14529.30 ms
+
+--- CPU Utilisation (Section VI.D) ---
+  fixed50   : 0.0%
+  fixed30   : 0.0%
+  fixed10   : 0.0%
+  adaptive  : 0.0%
+  pf        : 0.0%
+
+============================================================

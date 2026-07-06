@@ -1,10 +1,20 @@
 """
-reward_calculator.py — PRB DRL 複合獎勵函數
+reward_calculator.py — PRB DRL 獎勵函數（純 Throughput Ablation 設定）
 
 Reward = W_THROUGHPUT × R_tp + W_FAIRNESS × R_fair - W_DELAY × R_delay
-         (W=0.5/0.4/0.1，提高公平性權重防止 policy monopoly collapse)
+         (W=1.0/0.0/0.0 —— 純 throughput ablation：只用吞吐量驅動 reward，
+          不再用 fairness/delay 校正。目的是直接跟 PF baseline 比 sum
+          throughput，不受 fairness 項稀釋。)
 
-三項組成：
+**已知風險（刻意接受，見 CLAUDE.md §7）**：W_FAIRNESS 先前是從低權重提高到
+0.4，用來防止 2-UE policy monopoly collapse（Scenario B 的 Node3 policy
+degradation 就是這個問題的殘留案例）。拿掉 fairness 項後，policy 很可能
+再次收斂成「把 PRB 全部給通道最好的 UE」的 max-C/I 排程，JFI 可能低於
+PF baseline——這是本次 ablation 預期會觀察到、甚至想拿來佐證原本複合
+reward 設計必要性的現象，不是程式錯誤。
+
+三項組成（r_fairness／r_delay 仍會算出並寫入 MongoDB 供監控/事後分析，
+只是目前權重掛零，不影響 reward 純量本身）：
   R_throughput : 各 UE 實際 DL 吞吐量平均值（delta_dl_aggr_tbs 正規化）∈ [0, 1]
   R_fairness   : Jain's Fairness Index，衡量各 UE 吞吐量的公平程度 ∈ [0, 1]
   R_delay      : PRB 效率懲罰（PRB 浪費程度），∈ [0, 1]
@@ -27,10 +37,11 @@ import numpy as np
 # 超參數
 # =============================================================================
 
-# 獎勵權重（三項總計 1.0）
-W_THROUGHPUT: float = 0.5   # 吞吐量最大化（主要目標：超越 PF）
-W_FAIRNESS:   float = 0.4   # Jain's Fairness 公平性（提高至 0.4 防止壟斷 policy collapse）
-W_DELAY:      float = 0.1   # PRB 效率懲罰（間接延遲代理）
+# 獎勵權重 —— 純 Throughput Ablation：只用吞吐量驅動，fairness/delay 掛零
+# （歷史值 0.5/0.4/0.1 見 git 歷史與 CLAUDE.md §7，含 policy collapse 的教訓）
+W_THROUGHPUT: float = 1.0   # 吞吐量最大化（唯一目標：直接對比 PF 的 sum throughput）
+W_FAIRNESS:   float = 0.0   # 停用——刻意觀察拿掉公平性校正後 policy 會怎麼收斂
+W_DELAY:      float = 0.0   # 停用——同上
 
 # delta_tbs 正規化參考值 (bytes/100ms)
 # C xApp rate limiter 每 10 個 MAC callback 才送一次 ZMQ，測量窗口為 100ms。

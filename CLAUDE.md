@@ -232,7 +232,7 @@ MAX_BSR = 2,000,000 bytes/100ms（實測高負載下 delta_tbs 可達 1~2.5M byt
 
 `reward_calculator.py` 中的所有吞吐量計算均以此為分母。若未來修改 Rate Limiter 的觸發間隔，MAX_BSR 必須同步調整。
 
-獎勵權重（`reward_calculator.py`）：W_THROUGHPUT=**0.5**、W_FAIRNESS=**0.4**、W_DELAY=**0.1**（提高公平性權重至 0.4 以防止 2-UE policy monopoly collapse；吞吐量仍為主要目標）。
+獎勵權重（`reward_calculator.py`）：**目前為純 Throughput Ablation** W_THROUGHPUT=**1.0**、W_FAIRNESS=**0.0**、W_DELAY=**0.0**（2026-07-06 起）——刻意拿掉公平性校正，直接對比 PF 的 sum throughput。歷史值 W_THROUGHPUT=0.5、W_FAIRNESS=0.4、W_DELAY=0.1（提高公平性權重至 0.4 是為了防止 2-UE policy monopoly collapse）。**已知風險**：拿掉 fairness 項後 policy 很可能重新收斂成 max-C/I 排程，JFI 可能低於 PF baseline（甚至比 Scenario B 的 Node3 policy degradation 更明顯）——此為本次 ablation 預期會觀察到、用來佐證原複合 reward 設計必要性的現象，非程式錯誤。切換前已清空 MongoDB `node{1-5}_experiences` 與模型 checkpoint，從隨機初始化重新訓練，避免新舊 reward 語意混在同一批訓練資料裡。
 
 ### FlexRIC 崩潰規律與重啟流程
 

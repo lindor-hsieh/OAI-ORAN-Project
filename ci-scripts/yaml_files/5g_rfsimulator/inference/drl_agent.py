@@ -23,6 +23,7 @@ Action Space：
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -507,8 +508,16 @@ class DRLAgent:
     # -------------------------------------------------------------------------
 
     def save(self) -> None:
-        """將 Actor + Critic 的權重與優化器狀態存至磁碟。"""
+        """
+        將 Actor + Critic 的權重與優化器狀態原子性存至磁碟。
+
+        先寫入同目錄下的臨時檔，再用 os.replace()（同檔案系統上為原子操作）
+        覆蓋正式檔名，確保任何讀者（本進程的近即時執行緒、或跨進程的
+        FL ClientApp/InferenceServer 熱重載執行緒）永遠只會讀到完整的舊檔
+        或完整的新檔，不會讀到寫一半的損毀檔案。
+        """
         path = self.model_dir / f"model_node{self.node_id}.pt"
+        tmp_path = path.with_suffix(f".pt.tmp.{os.getpid()}")
         torch.save(
             {
                 "actor":       self.actor.state_dict(),
@@ -517,8 +526,9 @@ class DRLAgent:
                 "critic_opt":  self.critic_opt.state_dict(),
                 "train_steps": self._train_steps,
             },
-            path,
+            tmp_path,
         )
+        os.replace(tmp_path, path)
         self._log.info("模型已儲存至 %s (訓練步數: %d)", path, self._train_steps)
 
     def load(self) -> bool:

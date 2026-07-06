@@ -160,6 +160,160 @@ services:
         command: ["python3", "main.py"]
         restart: on-failure
 
+    # ==========================================================
+    # 0-c. Phase 5：Flower ServerApp/ClientApp 聯邦學習控制平面
+    # （ServerApp/ClientApp + flwr run，取代已 deprecated 的
+    #  fl.server.start_server()/fl.client.start_numpy_client()）
+    # ==========================================================
+    flower-superlink:
+        image: local-xapp-inference:latest
+        container_name: flower-superlink
+        network_mode: "host"
+        restart: on-failure
+        environment:
+            PYTHONPATH: "/app"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            # Global rApp 聚合完成後要把結果廣播寫回全部 5 個節點的 checkpoint，
+            # 所以這裡要掛全部 5 個 volume，而不是只有自己那一份
+            MODEL_DIR_NODE1: "/app/models_node1"
+            MODEL_DIR_NODE2: "/app/models_node2"
+            MODEL_DIR_NODE3: "/app/models_node3"
+            MODEL_DIR_NODE4: "/app/models_node4"
+            MODEL_DIR_NODE5: "/app/models_node5"
+        volumes:
+            - inference_models_node1:/app/models_node1
+            - inference_models_node2:/app/models_node2
+            - inference_models_node3:/app/models_node3
+            - inference_models_node4:/app/models_node4
+            - inference_models_node5:/app/models_node5
+        command: ["flower-superlink", "--insecure"]
+
+    flower-supernode-node1:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node1
+        network_mode: "host"
+        depends_on: [flower-superlink]
+        environment:
+            PYTHONPATH: "/app"
+            NODE_ID: "1"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node1:/app/models
+        command:
+            - flower-supernode
+            - --insecure
+            - --superlink=127.0.0.1:9092
+            - --clientappio-api-address=127.0.0.1:9101
+            - --node-config=node-id=1
+        restart: on-failure
+
+    flower-supernode-node2:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node2
+        network_mode: "host"
+        depends_on: [flower-superlink]
+        environment:
+            PYTHONPATH: "/app"
+            NODE_ID: "2"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node2:/app/models
+        command:
+            - flower-supernode
+            - --insecure
+            - --superlink=127.0.0.1:9092
+            - --clientappio-api-address=127.0.0.1:9102
+            - --node-config=node-id=2
+        restart: on-failure
+
+    flower-supernode-node3:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node3
+        network_mode: "host"
+        depends_on: [flower-superlink]
+        environment:
+            PYTHONPATH: "/app"
+            NODE_ID: "3"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node3:/app/models
+        command:
+            # 現況 Node3 的 xApp/rApp 容器仍在 PC1（見 CLAUDE.md §5 注意事項），
+            # --superlink 用 127.0.0.1；未來真的搬去 PC2 時改成 192.168.88.1:9092
+            - flower-supernode
+            - --insecure
+            - --superlink=127.0.0.1:9092
+            - --clientappio-api-address=127.0.0.1:9103
+            - --node-config=node-id=3
+        restart: on-failure
+
+    flower-supernode-node4:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node4
+        network_mode: "host"
+        depends_on: [flower-superlink]
+        environment:
+            PYTHONPATH: "/app"
+            NODE_ID: "4"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node4:/app/models
+        command:
+            - flower-supernode
+            - --insecure
+            - --superlink=127.0.0.1:9092
+            - --clientappio-api-address=127.0.0.1:9104
+            - --node-config=node-id=4
+        restart: on-failure
+
+    flower-supernode-node5:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node5
+        network_mode: "host"
+        depends_on: [flower-superlink]
+        environment:
+            PYTHONPATH: "/app"
+            NODE_ID: "5"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node5:/app/models
+        command:
+            - flower-supernode
+            - --insecure
+            - --superlink=127.0.0.1:9092
+            - --clientappio-api-address=127.0.0.1:9105
+            - --node-config=node-id=5
+        restart: on-failure
+
+    flower-scheduler:
+        image: local-xapp-inference:latest
+        container_name: flower-scheduler
+        network_mode: "host"
+        depends_on:
+            - flower-superlink
+            - flower-supernode-node1
+            - flower-supernode-node2
+            - flower-supernode-node3
+            - flower-supernode-node4
+            - flower-supernode-node5
+        environment:
+            FL_ROUND_INTERVAL_S: "3600"
+            FL_FEDERATION: "local-deployment"
+            FL_APP_PATH: "/app/flower-app"
+        command: ["bash", "flower-app/run_hourly.sh"]
+        restart: on-failure
+
     node1-l-xapp:
         image: custom-oai-runtime:24.04
         container_name: xapp-node1

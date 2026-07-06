@@ -28,14 +28,16 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 import pymongo
 import zmq
 
-from drl_agent import DRLAgent, MIN_TRAIN_EXPERIENCES, MAX_UE_COUNT, TRAIN_BATCH_SIZE
+from drl_agent import DRLAgent, MAX_UE_COUNT
 from reward_calculator import compute_reward, compute_reward_breakdown
+from training_pipeline import run_training_round
 
 # =============================================================================
 # 全域常數
@@ -50,6 +52,7 @@ TRAIN_INTERVAL_S: float = 60.0      # DRL 背景訓練間隔（秒）
 TRAIN_FETCH_LIMIT: int = 2000       # 每次從 MongoDB 讀取的最多筆數
 TRAIN_EPOCHS_PER_ROUND: int = 10    # 每輪訓練的梯度更新次數
 EXPLORE_PROB: float = 0.30          # 啟發式階段 Dirichlet 隨機探索的比例
+RELOAD_POLL_INTERVAL_S: float = 30.0  # 檢查磁碟 checkpoint 是否被 FL ClientApp 更新的輪詢間隔
 
 
 # =============================================================================
@@ -99,6 +102,7 @@ class InferenceServer:
         self._write_lock = threading.Lock()
         self._flush_thread: Optional[threading.Thread] = None
         self._train_thread: Optional[threading.Thread] = None
+        self._reload_thread: Optional[threading.Thread] = None
 
         # DRL Agent（每個節點獨立實例）
         self._agent = DRLAgent(
@@ -106,6 +110,14 @@ class InferenceServer:
             model_dir=model_dir,
             total_prb=total_prb,
         )
+
+        # 模型鎖：保護 agent 的 forward pass（ZMQ 主迴圈）、梯度更新
+        # （_train_worker）、與磁碟熱重載（_reload_worker，Phase 5 FL ClientApp
+        # 是獨立 subprocess，跟本進程只透過磁碟 checkpoint 同步，不共用記憶體）
+        # 三方對同一組 actor/critic 權重的存取。刻意不把 MongoDB I/O 包進鎖裡，
+        # 確保鎖持有時間維持在毫秒級，不影響 ZMQ 的 5ms 回應預算。
+        self._model_lock = threading.Lock()
+        self._last_ckpt_mtime: float = 0.0
 
         # RL 狀態轉移暫存（用於計算 R(S_{t-1}, A_{t-1}, S_t)）
         self._prev_ues: Optional[list[dict]] = None
@@ -215,7 +227,8 @@ class InferenceServer:
             time.sleep(TRAIN_INTERVAL_S)
 
     def _run_training_round(self) -> None:
-        """執行一輪訓練：讀取 MongoDB → 訓練 → 儲存模型。"""
+        """執行一輪訓練：讀取 MongoDB → 訓練 → 儲存模型（訓練迴圈委派給 training_pipeline，
+        與 Phase 5 FL ClientApp 共用同一份邏輯，見 training_pipeline.py）。"""
         if self._mongo_col is None:
             return
 
@@ -233,81 +246,86 @@ class InferenceServer:
             return
         self._last_train_mongo_count = current_count
 
-        # 查詢含完整 RL 欄位的文件
-        try:
-            cursor = (
-                self._mongo_col
-                .find(
-                    {"reward": {"$exists": True}, "next_state_vec": {"$exists": True}},
-                    projection={
-                        "state_vec": 1, "mask_vec": 1, "action_ratios": 1,
-                        "reward": 1, "next_state_vec": 1, "next_mask_vec": 1,
-                        "_id": 0,
-                    },
-                )
-                .sort("timestamp", pymongo.DESCENDING)
-                .limit(TRAIN_FETCH_LIMIT)
-            )
-            experiences = list(cursor)
-        except pymongo.errors.PyMongoError as exc:
-            self._log.warning("讀取訓練資料失敗: %s", exc)
+        # 訓練/評估委派給共用函式；lock 只包住實際碰觸權重的段落（MongoDB
+        # 讀取在鎖外進行），確保不影響 ZMQ 主迴圈的 5ms 回應預算。
+        metrics = run_training_round(
+            self._agent,
+            self._mongo_col,
+            epochs=TRAIN_EPOCHS_PER_ROUND,
+            fetch_limit=TRAIN_FETCH_LIMIT,
+            log=self._log,
+            lock=self._model_lock,
+        )
+        if not metrics:
             return
 
-        n = len(experiences)
-        self._log.info("讀取到 %d 筆 RL 經驗，準備訓練", n)
-
-        if n < MIN_TRAIN_EXPERIENCES:
-            self._log.info(
-                "經驗數量不足 (需 %d 筆)，等待更多資料累積...",
-                MIN_TRAIN_EXPERIENCES,
-            )
-            return
-
-        # ── Train / Test split（8:2）────────────────────────────────────────
-        # 測試集用於偵測 overfitting：train_loss 持續下降但 test_loss 回升時警告。
-        test_size  = max(TRAIN_BATCH_SIZE, int(n * 0.2))
-        test_idxs  = set(np.random.choice(n, test_size, replace=False).tolist())
-        train_exp  = [e for i, e in enumerate(experiences) if i not in test_idxs]
-        test_exp   = [e for i, e in enumerate(experiences) if i in test_idxs]
-
-        last_metrics: dict = {}
-        for epoch in range(TRAIN_EPOCHS_PER_ROUND):
-            m = self._agent.train_on_batch(train_exp)
-            if m:
-                last_metrics = m
-
-        if last_metrics:
-            test_metrics = self._agent.evaluate_on_batch(test_exp)
+        with self._model_lock:
             self._agent.save()
+        self._touch_ckpt_mtime()
 
-            # overfitting 指標：test_actor_loss 比 train_actor_loss 高超過 0.3 時警告
-            t_aloss = test_metrics.get("test_actor_loss", 0.0)
-            tr_aloss = last_metrics.get("actor_loss", 0.0)
-            overfit_flag = ""
-            if test_metrics and (t_aloss - tr_aloss) > 0.3:
-                overfit_flag = " ⚠ OVERFIT"
+        # overfitting 指標：test_actor_loss 比 train_actor_loss 高超過 0.3 時警告
+        t_aloss = metrics.get("test_actor_loss", 0.0)
+        tr_aloss = metrics.get("actor_loss", 0.0)
+        overfit_flag = ""
+        if "test_actor_loss" in metrics and (t_aloss - tr_aloss) > 0.3:
+            overfit_flag = " ⚠ OVERFIT"
 
-            self._log.info(
-                "訓練完成 %d epochs | step=%d "
-                "train[actor=%.4f critic=%.4f entropy=%.4f reward=%.4f] "
-                "test[actor=%.4f critic=%.4f entropy=%.4f reward=%.4f] "
-                "train_n=%d test_n=%d%s | DRL/啟發式=%d/%d",
-                TRAIN_EPOCHS_PER_ROUND,
-                last_metrics.get("train_step", 0),
-                tr_aloss,
-                last_metrics.get("critic_loss", 0),
-                last_metrics.get("entropy", 0),
-                last_metrics.get("mean_reward", 0),
-                t_aloss,
-                test_metrics.get("test_critic_loss", 0),
-                test_metrics.get("test_entropy", 0),
-                test_metrics.get("test_mean_reward", 0),
-                len(train_exp),
-                len(test_exp),
-                overfit_flag,
-                self._drl_inferences,
-                self._heuristic_inferences,
-            )
+        self._log.info(
+            "訓練完成 %d epochs | step=%d "
+            "train[actor=%.4f critic=%.4f entropy=%.4f reward=%.4f] "
+            "test[actor=%.4f critic=%.4f entropy=%.4f reward=%.4f] "
+            "train_n=%d test_n=%d%s | DRL/啟發式=%d/%d",
+            TRAIN_EPOCHS_PER_ROUND,
+            metrics.get("train_step", 0),
+            tr_aloss,
+            metrics.get("critic_loss", 0),
+            metrics.get("entropy", 0),
+            metrics.get("mean_reward", 0),
+            t_aloss,
+            metrics.get("test_critic_loss", 0),
+            metrics.get("test_entropy", 0),
+            metrics.get("test_mean_reward", 0),
+            metrics.get("n_train", 0),
+            metrics.get("n_test", 0),
+            overfit_flag,
+            self._drl_inferences,
+            self._heuristic_inferences,
+        )
+
+    # -------------------------------------------------------------------------
+    # 磁碟 checkpoint 熱重載（背景執行緒，Phase 5：接收 FL ClientApp 聚合後權重）
+    # -------------------------------------------------------------------------
+
+    def _ckpt_path(self) -> Path:
+        return self._agent.model_dir / f"model_node{self.node_id}.pt"
+
+    def _touch_ckpt_mtime(self) -> None:
+        """記錄目前 checkpoint 的 mtime，避免 _reload_worker 重複載入本進程自己剛寫的檔案。"""
+        try:
+            self._last_ckpt_mtime = self._ckpt_path().stat().st_mtime
+        except FileNotFoundError:
+            pass
+
+    def _reload_worker(self) -> None:
+        """背景執行緒：每 RELOAD_POLL_INTERVAL_S 秒檢查 checkpoint 是否被外部
+        process（Phase 5 的 flower-supernode ClientApp subprocess）更新過。"""
+        while self._running:
+            time.sleep(RELOAD_POLL_INTERVAL_S)
+            self._maybe_reload_checkpoint()
+
+    def _maybe_reload_checkpoint(self) -> None:
+        try:
+            mtime = self._ckpt_path().stat().st_mtime
+        except FileNotFoundError:
+            return
+        if mtime <= self._last_ckpt_mtime:
+            return
+        with self._model_lock:
+            if self._agent.load():
+                self._last_ckpt_mtime = mtime
+                self._log.info(
+                    "已從磁碟熱重載模型 (mtime=%.0f)，可能來自 Phase 5 FL 聚合", mtime
+                )
 
     # -------------------------------------------------------------------------
     # 推論邏輯
@@ -388,7 +406,8 @@ class InferenceServer:
 
         if use_drl:
             try:
-                allocations, action_ratios = self._agent.infer(ues)
+                with self._model_lock:
+                    allocations, action_ratios = self._agent.infer(ues)
                 self._drl_inferences += 1
                 return allocations, action_ratios
             except Exception as exc:
@@ -462,6 +481,7 @@ class InferenceServer:
 
         # 嘗試載入預存模型（讓重啟後不從頭訓練）
         self._agent.load()
+        self._touch_ckpt_mtime()  # 避免 _reload_worker 把剛載入的檔案當成外部更新重複載入
 
         self._running = True
 
@@ -480,6 +500,14 @@ class InferenceServer:
             name=f"drl-train-node{self.node_id}",
         )
         self._train_thread.start()
+
+        # 背景執行緒 3：磁碟 checkpoint 熱重載（Phase 5，接收 FL ClientApp 的聚合結果）
+        self._reload_thread = threading.Thread(
+            target=self._reload_worker,
+            daemon=True,
+            name=f"ckpt-reload-node{self.node_id}",
+        )
+        self._reload_thread.start()
 
         self._log.info(
             "Node %d 推論伺服器啟動 | 初始模式: %s | 等待 C xApp 請求...",
@@ -621,7 +649,8 @@ class InferenceServer:
         # 關閉前儲存模型（保留訓練進度）
         if self._agent.is_trained:
             try:
-                self._agent.save()
+                with self._model_lock:
+                    self._agent.save()
             except Exception as exc:
                 self._log.warning("關閉時模型儲存失敗: %s", exc)
 

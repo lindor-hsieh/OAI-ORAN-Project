@@ -4,3 +4,6 @@ numpy>=1.26
 # CPU-only PyTorch，避免在容器內安裝不必要的 CUDA 驅動
 # MLP 推論時間 <0.1ms，CPU 已足夠滿足 5ms 實時性要求
 torch>=2.2.0
+# 注意：flwr（Phase 5 Flower ServerApp/ClientApp）不在這裡安裝，
+# 而是從 vendor/ 目錄本機 editable install（見 Dockerfile），
+# 不是從 PyPI 拉取，方便之後直接修改框架原始碼

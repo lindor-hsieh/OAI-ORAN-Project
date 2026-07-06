@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iab-fl-app"
+version = "0.1.0"
+description = "O-RAN IAB Global rApp (ServerApp) / Local rApp Flower Client (ClientApp)"
+license = "Apache-2.0"
+dependencies = [
+    "torch>=2.2.0",
+    "pymongo>=4.6",
+    "numpy>=1.26",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["iab_fl"]
+
+[tool.flwr.app]
+publisher = "iab-thesis"
+
+[tool.flwr.app.components]
+serverapp = "iab_fl.server_app:app"
+clientapp = "iab_fl.client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 1
+local-epochs = 10
+
+# TOML 不支援 ${VAR} shell 展開，所以固定寫兩組 federation：
+# local-deployment 給現況（Node1~5 全部在 PC1）用；pc1-remote 預留給
+# 之後 Node3/4/5 真的搬去 PC2 時、PC2 上的 scheduler 要打 PC1 位址用。
+# 選哪一組純粹由 `flwr run <app> <federation-name>` 的命令列參數決定。
+
+#######################################################################
+# CONFIGURATION MIGRATION NOTICE:
+#
+# What was previously called "federation config" for SuperLink
+# connections in pyproject.toml has been renamed and moved.
+#
+# These settings are now **SuperLink connection configuration**
+# and are defined in the Flower configuration file.
+#
+# The entries below are commented out intentionally and are kept
+# only as a migration reference.
+#
+# Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
+#######################################################################
+
+# [tool.flwr.federations]
+# default = "local-deployment"
+
+# [tool.flwr.federations.local-deployment]
+# address = "127.0.0.1:9093"
+# insecure = true
+
+# [tool.flwr.federations.pc1-remote]
+# address = "192.168.88.1:9093"
+# insecure = true

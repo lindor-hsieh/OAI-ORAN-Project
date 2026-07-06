@@ -12,7 +12,7 @@
 - Phase 2: C 語言 xApp 控制權驗證 ✅  
 - Phase 3: 獨立 xApp + ZeroMQ IPC ✅
 - Phase 4: Local DRL 閉環控制 🔄（當前）
-- Phase 5: Global xApp + Flower FL ⏳
+- Phase 5: Global xApp + Global rApp (Flower Server) + Local rApp→Flower Client ⏳
 - Phase 6: 論文數據驗證 ⏳
 
 回報格式：目前進度摘要 + 下一步建議行動。

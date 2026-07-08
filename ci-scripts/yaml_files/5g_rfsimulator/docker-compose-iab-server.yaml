@@ -67,6 +67,19 @@ services:
             start_period: 20s
 
     # ==========================================================
+    # 0-a2. Phase 5 Global xApp 回傳配額橋接
+    # （橋接 Node1/2 relay PUB tcp://127.0.0.1:5561/5562 →
+    #  Node3/4/5 access SUB tcp://127.0.0.1:5560，見 global_xapp_bridge.py）
+    # ==========================================================
+    global-xapp-bridge:
+        image: local-xapp-inference:latest
+        container_name: global-xapp-bridge
+        network_mode: "host"
+        depends_on: [inference-node1, inference-node2]
+        command: ["python3", "global_xapp_bridge.py"]
+        restart: on-failure
+
+    # ==========================================================
     # 0-b. Python 推論伺服器 (Near-RT 閉環 AI 推論)
     # ==========================================================
     inference-node1:

@@ -1,12 +1,19 @@
 """
-global_xapp.py — Phase 5 Global xApp
+global_xapp.py — Phase 5 Global xApp（compute_quotas() 為現行架構共用，main() 已被取代）
 
-職責：
+**本檔案的 main()／create_push_sockets()／IPC PUSH 機制已被
+global_xapp_bridge.py 取代，不再是實際運作的 Global xApp 進程。**
+inference_server.py 現在的 relay/access 節點是直接用 ZMQ PUB/SUB
+（Node1/2 PUB 自己的分配、Node3/4/5 SUB 訂閱配額），不再透過本檔案的
+「輪詢 MongoDB → IPC PUSH」路徑。保留本檔案是因為 compute_quotas() 這個
+配額計算函式仍被 global_xapp_bridge.py 直接 import 重用，不是死碼。
+
+以下是舊架構（未實際部署）的職責描述，僅供歷史參考：
   - 全域視野：每 200ms 從 MongoDB 讀取 Node1/Node2 最新動作記錄
   - 計算 Node3/4/5 的 PRB 回傳配額（模擬 in-band IAB 回傳瓶頸）
   - 透過 ZMQ PUSH 將配額下發給 Node3/4/5 C xApp
 
-配額計算邏輯：
+配額計算邏輯（compute_quotas()，現行架構仍在用）：
   Node1 服務 MT3 (→ Node3) 與 MT4 (→ Node4)，按 RNTI 排序分配：
     - quota_node3 = Node1 第一個 UE (低 RNTI) 的 prb_abs
     - quota_node4 = Node1 第二個 UE (高 RNTI) 的 prb_abs
@@ -15,10 +22,15 @@ global_xapp.py — Phase 5 Global xApp
     - quota_node5 = Node2 所有 UE prb_abs 之和
   若 Node1/2 超過 DATA_STALE_S 秒無新資料，配額退回 106（全頻寬）。
 
-ZMQ 端點（Global xApp BIND PUSH，C xApp CONNECT PULL）：
+舊版 ZMQ 端點（Global xApp BIND PUSH，C xApp CONNECT PULL，已不使用）：
   - ipc:///tmp/zmq_node3_quota.ipc
   - ipc:///tmp/zmq_node4_quota.ipc
   - ipc:///tmp/zmq_node5_quota.ipc
+
+現行架構的 ZMQ 端點（見 global_xapp_bridge.py）：
+  Node1 PUB tcp://127.0.0.1:5561 ─┐
+                                   ├─→ global_xapp_bridge.py SUB → compute_quotas() → PUB tcp://127.0.0.1:5560 → Node3/4/5 SUB
+  Node2 PUB tcp://127.0.0.1:5562 ─┘
 """
 
 from __future__ import annotations
@@ -181,6 +193,8 @@ def send_quota(sock: zmq.Socket, quota: int, node_id: int) -> None:
 # =============================================================================
 
 def main() -> None:
+    """[已被取代] 見檔頭說明——實際部署請用 global_xapp_bridge.py，本函式不再被任何
+    docker-compose 服務呼叫，保留僅供參考。"""
     db = connect_mongo()
     if db is None:
         log.error("無法連線 MongoDB，程式退出")

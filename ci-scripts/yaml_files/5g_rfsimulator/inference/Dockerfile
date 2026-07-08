@@ -37,10 +37,19 @@ COPY training_pipeline.py .
 COPY inference_server.py .
 COPY main.py .
 
+# Phase 5 Global xApp 回傳配額橋接（見 global_xapp_bridge.py 檔頭說明）
+COPY global_xapp.py .
+COPY global_xapp_bridge.py .
+
 # 複製 Phase 5 Flower App 套件（ServerApp/ClientApp + 排程 wrapper）
 # 目錄名不能有底線（flwr build/run 會驗證 FAB 根目錄名稱，只允許字母/數字/連字號）
 COPY flower-app/ flower-app/
 RUN chmod +x flower-app/run_hourly.sh
+
+# Flower CLI 全域設定（SuperLink 連線位址）烤進 image，避免每個一次性容器
+# 都要重新觸發脆弱的 pyproject.toml 自動遷移機制（見 flwr_config.toml 說明）
+RUN mkdir -p /root/.flwr
+COPY flwr_config.toml /root/.flwr/config.toml
 
 # 建立模型儲存目錄（可透過 volume 掛載以持久化）
 RUN mkdir -p /app/models

@@ -35,8 +35,9 @@
       * **Near-RT 推論（毫秒級）**：接收 Local xApp 的 ZeroMQ 請求，執行 DRL Actor 網路 forward pass，回傳 PRB 權重陣列，並將 State/Action/Reward 非同步寫入 MongoDB。
       * **Non-RT Fine-tuning（秒/分鐘級）**：從 MongoDB 讀取歷史資料，執行本地模型微調，準備作為 Flower Client 參與聯邦學習聚合。
 3.  **Global xApp (PC 1)**：
-    * **實作**：獨立的 Python Docker 容器。
-    * **職責**：毫秒級全域迴圈 (10ms)。具備「全域視野 (Global View)」，透過 ZeroMQ 接收全網 5 個 Node 的瞬時狀態，負責跨節點的巨觀調度。**核心機制（軟性回傳約束）**：RF Simulator 下每個 DU 各自有獨立 106 PRB，不符合 in-band IAB 頻譜共享；修改 OAI 底層代價太高，改以 Global xApp 模擬回傳瓶頸。具體邏輯：① 監控 Node1/Node2 xApp 對 MT3/MT4 各分配了多少 PRB（代表流量通過 Node1→Node3/4 或 Node2→Node4/5 的回傳容量）；② 將該 PRB 配額透過 ZeroMQ 下發給對應的 Node3/4/5 Local xApp；③ Node3/4/5 的 Local xApp 將可用 PRB 上限從 106 改為收到的配額值（`effective_prb = min(106, quota_from_global)`），以此在 xApp 層模擬 in-band IAB 的回傳瓶頸限制。
+    * **實作**：直接內建在 `inference_server.py`（relay/access 兩側的 ZMQ PUB/SUB 端點）+ 獨立橋接 process `global_xapp_bridge.py`（訂閱 relay、算配額、發布給 access）。**不是**獨立的 Global 容器監控全網 10ms 迴圈，也不經過 MongoDB 中轉。
+    * **職責**：具備「全域視野」，負責跨節點的巨觀調度。**核心機制（軟性回傳約束）**：RF Simulator 下每個 DU 各自有獨立 106 PRB，不符合 in-band IAB 頻譜共享；修改 OAI 底層代價太高，改以此機制模擬回傳瓶頸。具體邏輯：① `inference_server.py` 裡 Node1/2（relay）在每次推論後把自己的 PRB 分配結果透過 ZMQ **PUB** 廣播出去（`tcp://127.0.0.1:5561`／`5562`）；② `global_xapp_bridge.py` 同時 **SUB** 訂閱 Node1/2 兩個 PUB endpoint，用 `compute_quotas()`（沿用 `global_xapp.py` 既有邏輯，見下方）算出 Node3/4/5 各自的配額，統一 **PUB** 到 `tcp://127.0.0.1:5560`；③ `inference_server.py` 裡 Node3/4/5（access）**SUB** 這個固定 port（各自訂閱 `node{id}` topic），把可用 PRB 上限從 106 改為收到的配額值（`effective_prb = min(106, quota_from_global)`），並在 ZMQ 主迴圈裡依比例裁切超額分配。
+    * **開發沿革註記**：這條 PUB/SUB 資料流最早是直接內建在 `inference_server.py`（2026-06-17 build 的 Docker image 裡就有），但當時漏了 relay 端 bind 的 port（5561/5562）跟 access 端固定 SUB 的 port（5560）中間的橋接，這段程式碼從沒真的跑通過、也沒有進版本控制；直到 2026-07-06 才發現、補上 `global_xapp_bridge.py` 這個橋接 process 使其完整可用。`global_xapp.py` 目前只保留 `compute_quotas()` 供橋接 process 重用，其 `main()`（輪詢 MongoDB + IPC PUSH/PULL）已被取代、不再運作。
 4.  **Global rApp / Flower Server (PC 1)**：
     * **實作**：`flower-app/iab_fl/server_app.py`（`ServerApp` + `flwr run`，透過 SuperLink + SuperNode 部署，取代已 deprecated 的 `fl.server.start_server()` 舊寫法）。
     * **職責**：小時級 Non-RT 迴圈（由外部排程 wrapper `flower-app/run_hourly.sh` 每小時提交一次 `flwr run`）。強制 5 個 IAB Nodes 參與聚合（`min_train_nodes=min_evaluate_nodes=min_available_nodes=5`），聚合策略為 `IABFedAvg`（繼承 `flwr.serverapp.strategy.FedAvg`，依各節點本輪 `num-examples` 加權平均 Actor/Critic 權重）。聚合完成後把最終權重廣播寫回全部 5 個節點的 checkpoint（不只是種子節點），完成階層式 AI 的學習閉環。**目前實作現況**：`IABFedAvg.aggregate_train()` 會在每輪聚合完成後，從 MongoDB 讀取各節點最近 100 筆 reward 均值計算全網 Jain's Fairness Index，但**僅用於 log 監控，並未實際回饋進聚合權重**——聚合本身仍是純樣本數加權的標準 FedAvg，尚未做到「以 JFI 為優化目標」的真正 JFI-guided aggregation。若論文要主張後者，`aggregate_train()` 需改為依各節點 JFI 貢獻度動態調整聚合權重，屬於待開發項目。
@@ -117,6 +118,39 @@ docker start xapp-node1 xapp-node2 xapp-node3 xapp-node4 xapp-node5
 
 **Scenario B blocker**：Node3 recent reward = −0.197（policy degradation），UE1/2（Node3 管轄）PRB 飢餓，avg 僅 1.4–2.45 Mbps。
 
+#### 純 Throughput Reward Ablation 量測結果（2026-07-06）
+
+`reward_calculator.py` 改為 W_THROUGHPUT=1.0、W_FAIRNESS=0.0、W_DELAY=0.0（拿掉公平性/延遲校正，見上方獎勵權重章節），MongoDB 經驗與模型 checkpoint 全部清空、從隨機初始化重新訓練。以下數字量測當下訓練僅約 40 分鐘–1 小時（各節點近 200 筆平均 reward 0.01–0.2 左右），**尚未收斂**，僅供早期趨勢參考。完整數據見 `/home/lindor/drl_report/scenario_comparison_2026-05-23.md`
+
+| Scenario | DRL avg TCP-DL | PF avg TCP-DL | DRL JFI | PF JFI | 吞吐量 | JFI | 通過 |
+|----------|---------------|---------------|---------|--------|--------|-----|------|
+| A | 5.15 Mbps | 7.89 Mbps | 0.872 | 0.942 | **✗ −34.7%** | ✗ | **✗** |
+| B | 5.91 Mbps | 4.95 Mbps | 0.815 | 0.736 | ✓ +19.4% | ✓ | ✓ |
+| C | 6.91 Mbps | 5.58 Mbps | 0.936 | 0.848 | ✓ +23.8% | ✓ | ✓ |
+
+**Scenario A blocker**：跟舊 reward（0.5/0.4/0.1）的驗收結果互補——舊 reward 卡在 Scenario B，這次純 throughput ablation 卡在 Scenario A。Scenario A 是「CQI 差異化、流量需求相同」的純粹情境，拿掉 fairness 校正後最容易誘發「無腦倒向好通道 UE」的退化；Scenario B/C 都帶有流量需求差異，purely-greedy 策略客觀上仍有機會跟公平分配方向一致，未必出現預期中的全面崩壞。
+
+**已知可能原因**：
+1. 訓練仍非常早期，模型幾乎沒看過 Scenario A 這類「同流量、CQI 差異化」的分佈（訓練場景為 Scenario D，A/B/C 僅用於泛化測試）。
+2. `drl_agent.py` 的 `DIRICHLET_CONCENTRATION=5.0` 是寫死常數，即使 policy 已收斂，`infer()` 實際下發的 PRB 分配仍是從 `Dirichlet(probs × 5)` 隨機抽樣、非確定性輸出，這在 Scenario A 這種分配精準度影響大的情境會直接拖累實測吞吐量，且跟訓練是否收斂無關。待評估方案：讓集中度隨訓練步數退火升高（類似 entropy_coeff 退火），或訓練收斂後改用確定性輸出。
+
+#### Global+Local DRL 三場景量測結果（2026-07-08）
+
+Global xApp（relay PUB → bridge → access SUB 回傳配額，見 `PHASE5_GLOBAL_DEV_LOG.md`）在這次量測時**第一次真正生效**——上面 2026-07-06 那批數字實際上都是 Local-only DRL（Global xApp 當時還沒修好，Node3/4/5 從沒真的收到配額限制）。這次是三個場景第一次做 **PF vs Local-only DRL vs Global+Local DRL** 三方對比，訓練約 2 天（各節點近 200 筆平均 reward 0.02–0.15），**仍未收斂**。完整數據見 `/home/lindor/drl_report/scenario_comparison_2026-05-23.md`
+
+| Scenario | PF TCP-DL | Local-only TCP-DL | Global+Local TCP-DL | PF JFI | Local-only JFI | Global+Local JFI | Global vs Local-only |
+|----------|-----------|--------------------|-----------------------|--------|------------------|---------------------|----------------------|
+| A | 6.15 Mbps | 5.15 Mbps | 5.93 Mbps | 0.750 | 0.872 | 0.683 | 吞吐量 +15.1% ／ JFI **−21.7%** |
+| B | 5.75 Mbps | 5.91 Mbps | 6.79 Mbps | 0.723 | 0.815 | 0.790 | 吞吐量 **+14.9%** ／ JFI −3.1% |
+| C | 6.51 Mbps | 6.91 Mbps | 6.69 Mbps | 0.816 | 0.936 | 0.794 | 吞吐量 −3.2% ／ JFI **−15.2%** |
+
+**Global xApp 的效果不是單純「加了就變好」，而是場景依賴（scenario-dependent）的 trade-off**：
+- **Scenario B**（等 CQI、不等流量）：淨賺，吞吐量大幅提升、JFI 幾乎沒退步，三場景中效果最好。
+- **Scenario A**（同流量、只差 CQI）：明顯用 fairness 換 throughput，JFI 大幅退步且是唯一低於 PF 的場景——回傳配額限制疊加在本來就容易「無腦倒向好通道」的情境上，風險被放大。
+- **Scenario C**（CQI 與流量需求同向）：反而略微變差，兩項指標都略輸 Local-only——這個場景 Local-only DRL 本來就表現最好（JFI 0.936），Global 端的額外限制沒有額外助益。
+
+**注意**：這次的 Local-only 基準（2026-07-06）與 Global+Local 新量測（2026-07-08）都是訓練早期數字，兩者訓練進度不完全對齊，這裡看的是**方向**而非絕對數值，待雙方訓練都 confirm 收斂後應重新量測確認場景依賴性是否持續存在。
+
 ### 第五階段：Global 控制平面與聯邦學習整合 (待開發)
 
 #### IAB 資源建模設計決策
@@ -132,11 +166,13 @@ RF Simulator 環境下每個 DU 各自有獨立 106 PRB，接入層不受回傳�
 Global xApp 的差異化價值：跨層 IAB 回傳協調，Local-only 架構做不到。
 
 #### 開發項目
-* **Global xApp 開發**：建構全域 Python 容器，監控 Node1/Node2 對 MT 的 PRB 分配，計算 Node3/4/5 的回傳配額上限，透過 ZeroMQ PUB/SUB 或 PUSH/PULL 下發配額；Node3/4/5 Local xApp 收到配額後以 `min(106, quota)` 作為實際可用 PRB 上限。
-* **Global rApp 開發（Flower Server）**：✅ 已完成，見 `inference/flower-app/`：
+* **Global xApp 開發**：✅ 已完成（2026-07-06），見 `inference/inference_server.py`（relay PUB / access SUB 端點，`_quota_sub_worker()` 執行緒 + 主迴圈的 Phase 5a/5b 邏輯）+ `inference/global_xapp_bridge.py`（獨立橋接 process，SUB Node1/2、算配額、PUB 給 Node3/4/5，重用 `global_xapp.py` 的 `compute_quotas()`）。部署為 docker-compose 的 `global-xapp-bridge` 服務（`network_mode: host`，依賴 `inference-node1`/`inference-node2`）。
+* **Global rApp 開發（Flower Server）**：✅ 已完成，**且已在 PC1 正式環境跑通完整 5-node FL round**（2026-07-06），見 `inference/flower-app/`：
   1. **架構**：`flwr` 1.28.0 現版建議的 `ServerApp`/`ClientApp` + `flwr run` 架構（透過 SuperLink + SuperNode 部署，非 Simulation Engine——5 個節點是實體分散的 process，不是模擬的虛擬 client）。舊版 `fl.server.start_server()`/`fl.client.start_numpy_client()` 在 1.28.0 已標記 deprecated（`flwr/compat/*`），`inference/flower_server.py` 是用舊 API 的草稿，已被 `flower-app/iab_fl/server_app.py` 取代，僅保留 `compute_global_jfi()` 邏輯參考。
-  2. **依賴來源**：`flwr` 從 `inference/vendor/flwr`（複製自 `~/flower/framework/py/flwr`）本機 editable install，不是從 PyPI 拉取，方便之後直接修改框架原始碼（例如真正實作 JFI-guided aggregation）。
+  2. **依賴來源**：`flwr` 從 `inference/vendor/flwr`（複製自 `~/flower/framework/py/flwr`）本機 editable install，不是從 PyPI 拉取，方便之後直接修改框架原始碼（例如真正實作 JFI-guided aggregation）。`vendor/pyproject.toml` 的依賴版本**直接對齊官方 `~/flower/framework/uv.lock` 已測試過的組合**（不用寬鬆 range）——曾經因為寬鬆 range 讓 pip 解到 `protobuf 6.33.6` + `grpcio-health-checking 1.82.0`，兩者 gencode/runtime 不相容，`flower-superlink` 啟動直接 crash。
   3. **部署拓樸**：`flower-superlink`（PC1，`--insecure`，Fleet API `:9092`／Control API `:9093`／ServerAppIo API `:9091`）+ 5 個 `flower-supernode-nodeN`（各自 dial 出去連 SuperLink，`--clientappio-api-address` 需給 5 個不同 port 9101~9105，否則預設值 `0.0.0.0:9094` 全部撞在一起）+ `flower-scheduler`（跑 `flower-app/run_hourly.sh`，每小時提交一次 `flwr run`，SuperLink/SuperNode 本身是常駐服務，`flwr run` 只是週期性送出一組有限輪數的 job）。
+  4. **Flower CLI 全域設定**：SuperLink 連線位址（`local-deployment`/`pc1-remote`）現在放在 `inference/flwr_config.toml`，Dockerfile 直接 COPY 到 `/root/.flwr/config.toml` 烤進 image。**不要**依賴 `flwr run` 的 pyproject.toml 自動遷移機制——該機制會直接改寫 `flower-app/pyproject.toml`（把 `[tool.flwr.federations]` 註解掉搬到 `~/.flwr/config.toml`），對一次性的 `docker compose run --rm` 容器不管用（每個新容器 `$HOME` 都是全新的），且已經真的把 git 裡的 pyproject.toml 改壞過一次。
+  5. **已驗證（2026-07-06）**：`docker compose run --rm flower-scheduler bash -c "cd /app/flower-app && flwr run . local-deployment"` 在 5 個真實訓練中的節點上完整跑完一輪 train→evaluate→聚合→廣播，確認全部 5 個節點的 checkpoint mtime 同步更新、`train_steps` 正確保留（760/840，未被重置）、且 `inference_server.py` 的 `_reload_worker` 在 30 秒內偵測到並熱重載聚合後權重。
   4. **`server_app.py`**：啟動時嘗試載入 Node1 現有 checkpoint 當作第一輪種子；`IABFedAvg`（繼承 `FedAvg`，override `aggregate_train`——1.28.0 API 把舊版 `aggregate_fit` 改名了）強制 5 節點全部參與（`min_train_nodes=min_evaluate_nodes=min_available_nodes=5`）；聚合完成後把最終權重寫回全部 5 個節點的 checkpoint（`flower-superlink` 容器把 5 個 `inference_models_nodeN` volume 都掛進去），不是只寫種子節點——否則 FedAvg 平均後的效果不會真正傳播到 5 個節點。
 * **Local rApp 擴充為 Flower Client**：✅ 已完成，見 `inference/flower-app/iab_fl/client_app.py`：
   1. **進程模型（跟原規劃不同，是重要修正）**：`flower-supernode` 預設以**獨立 subprocess** 執行 `ClientApp`（`--isolation subprocess`），跟 `inference_server.py` **不是同一個 OS process**，無法共用記憶體中的 `DRLAgent` 實例。改成透過**同一份磁碟 checkpoint 檔案**（`model_node{N}.pt`，經 docker volume 掛載共用）同步：`client_app.py` 收到全域權重、以及本地微調完成後都會 `agent.save()`；`inference_server.py` 新增的背景執行緒 `_reload_worker` 每 30 秒偵測這個檔案的 mtime，偵測到外部寫入就在 `self._model_lock` 保護下 `agent.load()` 熱重載。

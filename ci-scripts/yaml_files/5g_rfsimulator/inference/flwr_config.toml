@@ -1,0 +1,24 @@
+# Flower CLI 全域設定（$FLWR_HOME/config.toml，預設 $HOME/.flwr/config.toml）
+#
+# 1.26.0 起 SuperLink 連線設定從 pyproject.toml 的 [tool.flwr.federations]
+# 搬到這裡（[superlink]/[superlink.<name>]）。直接把這份檔案烤進 image、
+# COPY 到 /root/.flwr/config.toml，避免依賴 flwr 的自動遷移機制——
+# 該機制會直接改寫 pyproject.toml（把舊區塊註解掉），對一次性的
+# `docker compose run --rm` 容器不管用（每個新容器的 $HOME 都是全新的，
+# 沒有機會先跑過一次遷移）。
+#
+# local-deployment：現況（Node1~5 全部在 PC1）用，SuperLink Control API
+#   在同一台主機，用 loopback。
+# pc1-remote：預留給之後 Node3/4/5 真的搬去 PC2 時、PC2 上的 scheduler
+#   要打 PC1 位址用。
+
+[superlink]
+default = "local-deployment"
+
+[superlink.local-deployment]
+address = "127.0.0.1:9093"
+insecure = true
+
+[superlink.pc1-remote]
+address = "192.168.88.1:9093"
+insecure = true

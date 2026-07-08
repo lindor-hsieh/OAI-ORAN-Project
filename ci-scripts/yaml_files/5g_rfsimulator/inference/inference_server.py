@@ -131,6 +131,18 @@ class InferenceServer:
         self._drl_inferences: int = 0
         self._heuristic_inferences: int = 0
 
+        # Phase 5: Global xApp 整合（IAB 回傳配額軟性約束）。
+        # Node1/2（relay）將自己的 PRB 分配透過 ZMQ PUB 廣播出去；
+        # Node3/4/5（access）SUB 一個由獨立 bridge process（見
+        # global_xapp_bridge.py）彙整 Node1/2 分配後算出的配額，
+        # 以 effective_prb = min(106, quota) 限制自己實際可用的 PRB。
+        self._is_relay: bool = node_id in (1, 2)
+        self._alloc_pub_sock: Optional[zmq.Socket] = None   # Node1/2: publish allocs
+        self._quota_sub_sock: Optional[zmq.Socket] = None   # Node3/4/5: receive quota
+        self._prb_quota: int = total_prb                    # default: no restriction
+        self._quota_lock = threading.Lock()
+        self._quota_thread: Optional[threading.Thread] = None
+
         # 訓練保護：記錄上一輪訓練時的 MongoDB 筆數，無新資料則跳過
         self._last_train_mongo_count: int = 0
 
@@ -154,6 +166,22 @@ class InferenceServer:
         self._zmq_sock.bind(self.zmq_endpoint)
         self._log.info("ZMQ REP socket 已綁定至 %s", self.zmq_endpoint)
 
+        # Phase 5: relay nodes publish allocations; access nodes receive quota
+        if self._is_relay:
+            alloc_port = 5560 + self.node_id  # Node1→5561, Node2→5562
+            self._alloc_pub_sock = self._zmq_ctx.socket(zmq.PUB)
+            self._alloc_pub_sock.setsockopt(zmq.LINGER, 0)
+            self._alloc_pub_sock.setsockopt(zmq.SNDHWM, 5)
+            self._alloc_pub_sock.bind(f"tcp://127.0.0.1:{alloc_port}")
+            self._log.info("[Global] Alloc PUB bound: tcp://127.0.0.1:%d", alloc_port)
+        else:
+            self._quota_sub_sock = self._zmq_ctx.socket(zmq.SUB)
+            self._quota_sub_sock.setsockopt(zmq.LINGER, 0)
+            self._quota_sub_sock.setsockopt(zmq.RCVTIMEO, 500)
+            self._quota_sub_sock.setsockopt_string(zmq.SUBSCRIBE, f"node{self.node_id}")
+            self._quota_sub_sock.connect("tcp://127.0.0.1:5560")
+            self._log.info("[Global] Quota SUB connected: topic=node%d", self.node_id)
+
     def _init_mongo(self) -> None:
         """建立 MongoDB 連線；失敗時降級為不持久化模式。"""
         try:
@@ -174,6 +202,36 @@ class InferenceServer:
         except pymongo.errors.PyMongoError as exc:
             self._log.warning("MongoDB 連線失敗 (%s)，資料將不會持久化", exc)
             self._mongo_col = None
+
+    # -------------------------------------------------------------------------
+    # Phase 5: Global xApp quota 接收執行緒
+    # -------------------------------------------------------------------------
+
+    def _quota_sub_worker(self) -> None:
+        """背景執行緒：接收 Global xApp bridge 算出的 PRB 配額（僅 access nodes）。"""
+        assert self._quota_sub_sock is not None
+        self._log.info("[Global] Quota receive thread started (Node%d)", self.node_id)
+        while self._running:
+            try:
+                msg = self._quota_sub_sock.recv_string()
+                # Format: "node{id} {json}" e.g. "node3 {"quota":40}"
+                parts = msg.split(" ", 1)
+                if len(parts) == 2:
+                    data = json.loads(parts[1])
+                    quota = int(data.get("quota", self.total_prb))
+                    quota = max(5, min(self.total_prb, quota))
+                    with self._quota_lock:
+                        old = self._prb_quota
+                        self._prb_quota = quota
+                    if quota != old:
+                        self._log.info("[Global] PRB quota updated: %d → %d", old, quota)
+            except zmq.Again:
+                pass  # timeout, keep looping
+            except (json.JSONDecodeError, ValueError):
+                pass
+            except Exception as exc:
+                if self._running:
+                    self._log.debug("[Global] Quota thread error: %s", exc)
 
     # -------------------------------------------------------------------------
     # MongoDB 批次寫入（背景執行緒）
@@ -509,6 +567,15 @@ class InferenceServer:
         )
         self._reload_thread.start()
 
+        # 背景執行緒 4：Global xApp 配額接收（access nodes only）
+        if not self._is_relay and self._quota_sub_sock is not None:
+            self._quota_thread = threading.Thread(
+                target=self._quota_sub_worker,
+                daemon=True,
+                name=f"quota-sub-node{self.node_id}",
+            )
+            self._quota_thread.start()
+
         self._log.info(
             "Node %d 推論伺服器啟動 | 初始模式: %s | 等待 C xApp 請求...",
             self.node_id,
@@ -564,6 +631,42 @@ class InferenceServer:
                     # ── 執行推論 ──────────────────────────────────────────
                     allocations, action_ratios = self._infer(ues)
                     self._total_inferences += 1
+
+                    # ── Phase 5a: 回傳限制配額（access nodes only）────────
+                    if not self._is_relay and allocations:
+                        with self._quota_lock:
+                            quota = self._prb_quota
+                        if quota < self.total_prb:
+                            total_alloc = sum(a["prb_abs"] for a in allocations)
+                            if total_alloc > quota and total_alloc > 0:
+                                n_alloc = len(allocations)
+                                remaining = quota
+                                capped = []
+                                for idx, a in enumerate(allocations):
+                                    if idx == n_alloc - 1:
+                                        prb = max(1, remaining)
+                                    else:
+                                        prb = max(1, int(a["prb_abs"] * quota / total_alloc))
+                                        remaining -= prb
+                                    capped.append({"rnti": a["rnti"], "prb_abs": prb})
+                                allocations = capped
+                                # Recompute action_ratios to reflect actual execution
+                                action_ratios = np.array(
+                                    [a["prb_abs"] / self.total_prb for a in allocations]
+                                    + [0.0] * (MAX_UE_COUNT - len(allocations)),
+                                    dtype=np.float32,
+                                )
+
+                    # ── Phase 5b: 發布分配給 Global xApp bridge（relay nodes only）
+                    if self._is_relay and self._alloc_pub_sock is not None:
+                        try:
+                            pub_msg = json.dumps(
+                                {"node_id": self.node_id, "allocations": allocations},
+                                separators=(",", ":"),
+                            )
+                            self._alloc_pub_sock.send_string(pub_msg, zmq.NOBLOCK)
+                        except Exception:
+                            pass
 
                     # ── 暫存本步狀態（下一步計算獎勵用）─────────────────
                     if ues and allocations:
@@ -654,6 +757,10 @@ class InferenceServer:
             except Exception as exc:
                 self._log.warning("關閉時模型儲存失敗: %s", exc)
 
+        if self._alloc_pub_sock is not None:
+            self._alloc_pub_sock.close()
+        if self._quota_sub_sock is not None:
+            self._quota_sub_sock.close()
         if self._zmq_sock is not None:
             self._zmq_sock.close()
         if self._zmq_ctx is not None:

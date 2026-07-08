@@ -97,10 +97,14 @@ log "  更新 inference 容器 Python 檔案..."
 REWARD_SRC="$COMPOSE_DIR/inference/reward_calculator.py"
 INFER_SRC="$COMPOSE_DIR/inference/inference_server.py"
 AGENT_SRC="$COMPOSE_DIR/inference/drl_agent.py"
+# Phase 5 把 inference_server.py 的訓練迴圈抽成共用模組，inference_server.py
+# 現在會 import training_pipeline，沒一起複製進容器會導致 ModuleNotFoundError crash loop。
+TRAINP_SRC="$COMPOSE_DIR/inference/training_pipeline.py"
 for n in 1 2 3 4 5; do
     docker cp "$REWARD_SRC" "inference-node${n}:/app/reward_calculator.py" 2>/dev/null && \
     docker cp "$INFER_SRC"  "inference-node${n}:/app/inference_server.py"  2>/dev/null && \
     docker cp "$AGENT_SRC"  "inference-node${n}:/app/drl_agent.py"         2>/dev/null && \
+    docker cp "$TRAINP_SRC" "inference-node${n}:/app/training_pipeline.py" 2>/dev/null && \
     docker restart "inference-node${n}" > /dev/null 2>&1 && \
         ok "inference-node${n} 已更新並重啟" \
         || warn "inference-node${n} 更新失敗（容器可能尚未就緒）"

@@ -36,7 +36,7 @@ import pymongo
 import zmq
 
 from drl_agent import DRLAgent, MAX_UE_COUNT
-from reward_calculator import compute_reward, compute_reward_breakdown
+from reward_calculator import compute_lagrangian_reward
 from training_pipeline import run_training_round
 
 # =============================================================================
@@ -114,8 +114,12 @@ class InferenceServer:
         # 模型鎖：保護 agent 的 forward pass（ZMQ 主迴圈）、梯度更新
         # （_train_worker）、與磁碟熱重載（_reload_worker，Phase 5 FL ClientApp
         # 是獨立 subprocess，跟本進程只透過磁碟 checkpoint 同步，不共用記憶體）
-        # 三方對同一組 actor/critic 權重的存取。刻意不把 MongoDB I/O 包進鎖裡，
-        # 確保鎖持有時間維持在毫秒級，不影響 ZMQ 的 5ms 回應預算。
+        # 三方對同一組 actor/critic 權重的存取。刻意不把 MongoDB I/O 包進鎖裡。
+        # ZMQ 主迴圈這一側單次持有仍是毫秒級；_train_worker 這一側自 2026-07-09
+        # GRU 改版起，training_pipeline.run_training_round() 把鎖拆成「每個
+        # epoch 各自取得/釋放」（而非整個 epochs 迴圈共用一個鎖），因為 GRU
+        # 的 BPTT 一次 epoch 就要數百毫秒，整段鎖住會讓 infer() 卡到數秒、
+        # 遠超 ZMQ 的 5ms 回應預算（詳見 training_pipeline.py 的說明）。
         self._model_lock = threading.Lock()
         self._last_ckpt_mtime: float = 0.0
 
@@ -233,6 +237,22 @@ class InferenceServer:
                 if self._running:
                     self._log.debug("[Global] Quota thread error: %s", exc)
 
+    def _current_quota_ratio(self) -> float:
+        """
+        回傳目前有效的回傳配額比例，作為 encode_state()/infer() 的
+        全域配額 state 特徵（見 drl_agent.py 的 prb_quota_ratio 參數）。
+
+        relay nodes（Node1/2）不受配額限制，恆為 1.0；access nodes
+        （Node3/4/5）依 _quota_sub_worker() 收到的最新配額換算比例，
+        讓 Actor 在輸出分配「之前」就能感知配額緊繃程度，而不只是
+        像 Phase 5a 那樣事後被裁切。
+        """
+        if self._is_relay:
+            return 1.0
+        with self._quota_lock:
+            quota = self._prb_quota
+        return quota / self.total_prb
+
     # -------------------------------------------------------------------------
     # MongoDB 批次寫入（背景執行緒）
     # -------------------------------------------------------------------------
@@ -343,8 +363,8 @@ class InferenceServer:
             metrics.get("test_critic_loss", 0),
             metrics.get("test_entropy", 0),
             metrics.get("test_mean_reward", 0),
-            metrics.get("n_train", 0),
-            metrics.get("n_test", 0),
+            metrics.get("n_train_seq", 0),
+            metrics.get("n_test_seq", 0),
             overfit_flag,
             self._drl_inferences,
             self._heuristic_inferences,
@@ -464,8 +484,9 @@ class InferenceServer:
 
         if use_drl:
             try:
+                quota_ratio = self._current_quota_ratio()
                 with self._model_lock:
-                    allocations, action_ratios = self._agent.infer(ues)
+                    allocations, action_ratios = self._agent.infer(ues, prb_quota_ratio=quota_ratio)
                 self._drl_inferences += 1
                 return allocations, action_ratios
             except Exception as exc:
@@ -492,18 +513,21 @@ class InferenceServer:
         reward 以上一步的 (state, action) 與當前 state 計算，
         實現 one-step TD 結構。
         """
-        # 計算獎勵：R(A_{t-1}, S_t)
+        # 計算獎勵：R(A_{t-1}, S_t)（Lagrangian 限制式，見 reward_calculator.py）
         # 使用 curr_ues（S_t）而非 prev_ues（S_{t-1}）：
         # S_t.delta_tbs 反映的是 A_{t-1} 排程後的 DL 吞吐量，
         # 才是 A_{t-1} 真正造成的結果。
-        reward = compute_reward(curr_ues, prev_allocations, self.total_prb)
+        result = compute_lagrangian_reward(
+            curr_ues, prev_allocations,
+            lambda_val=self._agent.lambda_,
+            total_prb=self.total_prb,
+        )
+        reward = result["reward"]
+        is_idle = result["r_throughput"] < 1e-9
 
         # 編碼當前狀態 S_t（作為 S' ）
-        next_state_vec, next_mask_vec = self._agent.encode_state(curr_ues)
-
-        # 獎勵細節（用於 MongoDB 監控）
-        breakdown = compute_reward_breakdown(
-            curr_ues, prev_allocations, self.total_prb
+        next_state_vec, next_mask_vec = self._agent.encode_state(
+            curr_ues, prb_quota_ratio=self._current_quota_ratio()
         )
 
         doc: dict[str, Any] = {
@@ -519,10 +543,16 @@ class InferenceServer:
             "reward":        reward,
             "next_state_vec": next_state_vec.tolist(),
             "next_mask_vec":  next_mask_vec.tolist(),
-            # 獎勵分解（監控用）
-            "r_throughput":  breakdown["r_throughput"],
-            "r_fairness":    breakdown["r_fairness"],
-            "r_delay":       breakdown["r_delay"],
+            # 獎勵分解（監控用；jfi_raw 供 DRLAgent.train_on_batch() 更新 lambda 用）
+            "r_throughput":  result["r_throughput"],
+            "jfi_raw":       result["jfi_raw"],
+            "r_fairness":    result["r_fairness"],
+            "r_delay":       result["r_delay"],
+            "lambda_applied": result["lambda_applied"],
+            # 閒置轉換標記（r_throughput≈0，2026-07-09 起閒置轉換也會寫入
+            # MongoDB，讓 GRU 訓練資料分佈與推論時實際遇到的分佈一致；
+            # training_pipeline.py 用這個欄位排除閒置樣本不計入 JFI 平均）
+            "is_idle":       is_idle,
             # 推論模式（供事後分析）
             "used_drl":      self._agent.is_trained,
         }
@@ -609,14 +639,16 @@ class InferenceServer:
                         self._log.info("STATE[%d] %s", self._total_inferences, ue_summary)
 
                     # ── 計算上一步的獎勵並寫入 MongoDB ────────────────────
-                    # 跳過 xApp 重連後 delta_tbs 全為 0 的空白 state，
-                    # 避免 reward≈0 的無效 experience 污染訓練資料。
-                    _total_delta = sum(u.get("bsr", 0) for u in ues)
+                    # 閒置轉換（delta_tbs 全為 0，例如 P_IDLE 造成的無流量
+                    # 期間）也要寫入，讓 GRU 訓練資料的序列分佈跟推論時
+                    # _actor_hidden 實際會連續經歷的分佈一致（見
+                    # DRL_DESIGN.md／snuggly-weaving-twilight 計畫）；
+                    # 只在 UE 完全消失（xApp 重連後的空白 state）時才跳過，
+                    # 這種情況下 prev/curr 不是同一組 UE，reward 沒有意義。
                     if (
                         self._prev_ues is not None
                         and self._prev_allocations is not None
                         and len(ues) > 0
-                        and _total_delta > 0
                     ):
                         exp_doc = self._build_rl_experience(
                             prev_ues=self._prev_ues,
@@ -673,13 +705,19 @@ class InferenceServer:
                         self._prev_ues = ues
                         self._prev_allocations = allocations
                         self._prev_state_vec, self._prev_mask_vec = (
-                            self._agent.encode_state(ues)
+                            self._agent.encode_state(
+                                ues, prb_quota_ratio=self._current_quota_ratio()
+                            )
                         )
                         self._prev_action_ratios = action_ratios
                     else:
-                        # 無活躍 UE 時清除暫存，避免跨不同 UE 組合計算獎勵
+                        # 無活躍 UE 時清除暫存，避免跨不同 UE 組合計算獎勵。
+                        # 這是真正的 UE 斷線（而非流量閒置——閒置時 ues 仍
+                        # 非空，C xApp 持續送請求），才重置 GRU 隱藏狀態，
+                        # 避免舊 UE 組合的記憶污染下一組完全不同的 UE。
                         self._prev_ues = None
                         self._prev_allocations = None
+                        self._agent.reset_hidden()
 
                     # ── 回傳結果（必須在 5ms 內完成）────────────────────
                     response = json.dumps(

@@ -28,7 +28,8 @@
 
 1.  **Local xApp (PC 1 & PC 2)**：
     * **實作**：純 C 語言 FlexRIC 程式。
-    * **職責**：局部控制迴圈（實際 **100ms**，C xApp 設有 Rate Limiter：每 10 個 10ms MAC callback 才觸發一次 ZMQ，以避免 FlexRIC pending event queue 滿載崩潰）。**只負責 PRB 分配這一個動作**：透過 E2SM-MAC 擷取所屬 Node 的 **Δ DL TBS 與 MCS**（OAI RF Simulator 的 `wb_cqi` 與 `dl_buffer_info` 在模擬環境下恆為 0，以 `dl_aggr_tbs` 差分值作為吞吐量代理、`dl_mcs1` 作為通道品質代理），將 JSON 狀態透過 ZeroMQ REQ 送給 Local rApp Python 端，收回 PRB 權重陣列後立即寫回 OAI MAC 層。C 語言端不含任何 AI 邏輯。
+    * **職責**：局部控制迴圈（實際 **100ms**，C xApp 設有 Rate Limiter：每 10 個 10ms MAC callback 才觸發一次 ZMQ，以避免 FlexRIC pending event queue 滿載崩潰）。**只負責 PRB 分配這一個動作**：透過 E2SM-MAC 擷取所屬 Node 的 **Δ DL TBS、MCS、DL Buffer Occupancy**（OAI RF Simulator 的真 3GPP `wb_cqi` 恆為 0，是模擬器本身不計算真實通道傳播的限制；但 `dl_buffer_info`——真實 RLC 佇列位元組數——**沒有**恆為 0，這是 2026-07-09 查證後修正的錯誤認知，見下方 xApp 開發沿革註記，以 `dl_aggr_tbs` 差分值作為吞吐量代理、`dl_mcs1` 作為通道品質代理、`dl_buffer_info` 作為不受排程與否影響的需求代理），將 JSON 狀態透過 ZeroMQ REQ 送給 Local rApp Python 端，收回 PRB 權重陣列後立即寫回 OAI MAC 層。C 語言端不含任何 AI 邏輯。
+    * **xApp 開發沿革註記（2026-07-09）**：舊版文件誤認為 `dl_buffer_info` 在模擬環境下恆為 0，因此 state 長期只用 `dl_aggr_tbs` 差分與 `dl_mcs1` 兩個欄位——但這兩者在 UE 的 RLC buffer 為空時會被 OAI 排程器（`gNB_scheduler_dlsch.c`）直接跳過、同時凍結在舊值，無法區分「無資料可傳」與「有資料但通道差/PRB 不足」。實際查證 OAI C 端原始碼發現 `dl_buffer_info`（`sched_ctrl->num_total_bytes`）已完整打通 E2SM-MAC 的 encode/decode pipeline，只是 xApp 端（`xapp_node1.c`~`xapp_node5.c`）的 JSON 序列化沒有把它抓出來送給 Python——補上一行 `cJSON_AddNumberToObject` 後現場驗證：UE 真閒置時 99% 讀到 0，有資料排隊時讀到有意義的非零值。State 維度因此從 33 維擴充為 49 維（`drl_agent.py` 的 `encode_state()`），這是破壞性變更，已清空 MongoDB 經驗與所有 checkpoint、從隨機初始化重新訓練。詳見 `inference/DRL_DESIGN.md` §2。
 2.  **Local rApp / Flower Client (PC 1 & PC 2)**：
     * **實作**：Python ZeroMQ REP 伺服器（部署於 5 個獨立容器，`inference_server.py`）。Phase 5 的 Flower ClientApp（`flower-app/iab_fl/client_app.py`）是 `flower-supernode` 另開的**獨立 subprocess**，兩者不共用記憶體中的 DRLAgent 實例，而是共用同一份磁碟 checkpoint（`model_node{N}.pt`，經 volume 掛載共用）：ClientApp 收到全域聚合權重與完成本地微調後都會存檔，`inference_server.py` 有一個背景執行緒（`_reload_worker`）每 30 秒偵測這個檔案的 mtime 變化，偵測到外部寫入就熱重載，讓近即時推論撿到 FL 聚合後的權重。
     * **職責（雙重角色）**：
@@ -258,32 +259,37 @@ Global xApp 的差異化價值：跨層 IAB 回傳協調，Local-only 架構做�
 
 > **規則**：刪除整份檔案需經過授權。所有修改先在 PC 1 完成，再將修改好的檔案傳給 PC 2。
 
-### 狀態觀測窗口（100ms）與 MAX_BSR 正規化
+### 狀態觀測窗口（100ms）與 MAX_BSR／MAX_BUF_INFO 正規化
 
 C xApp 的 Rate Limiter 每 10 個 10ms MAC callback 才觸發一次 ZMQ，因此每筆 State 的 `bsr` 欄位實際上是 **100ms 累積的 `delta_dl_aggr_tbs`（bytes）**，而非單一 10ms 窗口值。對應的正規化常數：
 
 ```
-MAX_BSR = 2,000,000 bytes/100ms（實測高負載下 delta_tbs 可達 1~2.5M bytes）
+MAX_BSR = 2,000,000 bytes/100ms（reward_calculator.py，實測高負載下 delta_tbs 可達 1~2.5M bytes）
+MAX_BSR = 1,000,000 bytes/100ms（drl_agent.py，state 編碼用，刻意設較保守的上限，見 DRL_DESIGN.md §5.1）
+MAX_BUF_INFO = 2,000,000 bytes（drl_agent.py，dl_buffer_info 正規化，2026-07-09 現場實測 node3/5
+最大值約 2,147,000 訂出來的，見下方 xApp 開發沿革註記）
 ```
 
-`reward_calculator.py` 中的所有吞吐量計算均以此為分母。若未來修改 Rate Limiter 的觸發間隔，MAX_BSR 必須同步調整。
+`reward_calculator.py` 中的所有吞吐量計算均以其 `MAX_BSR` 為分母；`drl_agent.py` 的 state 編碼另有一組獨立常數。若未來修改 Rate Limiter 的觸發間隔，這些常數必須同步調整。
 
 獎勵權重（`reward_calculator.py`）：**目前為純 Throughput Ablation** W_THROUGHPUT=**1.0**、W_FAIRNESS=**0.0**、W_DELAY=**0.0**（2026-07-06 起）——刻意拿掉公平性校正，直接對比 PF 的 sum throughput。歷史值 W_THROUGHPUT=0.5、W_FAIRNESS=0.4、W_DELAY=0.1（提高公平性權重至 0.4 是為了防止 2-UE policy monopoly collapse）。**已知風險**：拿掉 fairness 項後 policy 很可能重新收斂成 max-C/I 排程，JFI 可能低於 PF baseline（甚至比 Scenario B 的 Node3 policy degradation 更明顯）——此為本次 ablation 預期會觀察到、用來佐證原複合 reward 設計必要性的現象，非程式錯誤。切換前已清空 MongoDB `node{1-5}_experiences` 與模型 checkpoint，從隨機初始化重新訓練，避免新舊 reward 語意混在同一批訓練資料裡。
 
 ### FlexRIC 崩潰規律與重啟流程
 
-**現象**：每次執行 `run_local_pc1.sh` 後，累積約 **2000 筆** experience 時 FlexRIC 容器會崩潰（E2 connection 中斷，xApp 停止收到 MAC indication）。
+**現象一（xApp 端）**：每次執行 `run_local_pc1.sh` 後，累積約 **2000 筆** experience 時 FlexRIC 容器會崩潰（E2 connection 中斷，xApp 停止收到 MAC indication），log 顯示 `[NEAR-RIC]: WARNING: Pending event timeout. Disarming timer.`，xApp 端持續 `Resending Setup Request after timeout`。長時間運行（曾觀察到 32 小時）後 pending event queue 塞滿也會觸發同樣症狀。
+
+**現象二（DU 端，2026-07-09 新發現）**：在現象一發生後，若只單獨重啟 xApp/DU 而不動 FlexRIC 本身，DU 容器會在啟動後數秒內以 `assoc_rb_tree_extract: Assertion 'z_node != tree->dummy...' failed`（`assoc_rb_tree.c:457`）反覆崩潰（`Exited (139)`，SIGSEGV），**每次重啟都在同一點崩潰，不是偶發競爭條件**。這是 DU 內建的 E2 Agent 在協議關聯追蹤上的 bug，推測跟 FlexRIC 端殘留的壞狀態互動有關——單獨重啟 DU 無法清掉，必須連同 FlexRIC 一起做完整乾淨重啟才會恢復正常。
 
 **恢復流程**：
-1. 重新執行完整腳本（FlexRIC 須先於 DU 啟動）：
+1. 重新執行完整腳本（FlexRIC 須先於 DU 啟動，兩台機器都要重新跑，不能只重啟其中一邊）：
    ```bash
    # PC1
    bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc1.sh
    # PC2（等 PC1 FlexRIC healthy 後）
    bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc2.sh
    ```
-2. `inference_server.py` 啟動時會自動從 `/app/models/model_nodeX.pt` 載入 checkpoint，**訓練進度與 MongoDB experience 不會丟失**，直接從上次停止點繼續。
-3. 啟動順序強制要求：**FlexRIC → DU → xApp**，單獨重啟 FlexRIC 無效（DU 未重啟則無法重建 E2 連線）。
+2. `inference_server.py` 啟動時會自動從 `/app/models/model_nodeX.pt` 載入 checkpoint，**訓練進度與 MongoDB experience 不會丟失**，直接從上次停止點繼續（除非是刻意的破壞性重訓，見 DRL_DESIGN.md 相關章節）。
+3. 啟動順序強制要求：**FlexRIC → DU → xApp**，單獨重啟 FlexRIC 或單獨重啟 DU 都無效（現象二已驗證：只重啟 DU 3/4/5 兩次，都以同樣的 assertion 重現崩潰；連同 FlexRIC 一起做完整乾淨重啟後才恢復穩定）。
 
 ---
 

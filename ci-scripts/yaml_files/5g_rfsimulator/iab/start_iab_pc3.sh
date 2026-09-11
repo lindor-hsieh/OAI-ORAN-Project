@@ -1,9 +1,12 @@
 #!/bin/bash
-# PC 3: IAB Client Script — Node3,4 (relay) + Node9,10,11,12 (access) + UE9~17
+# PC 3: IAB Client Script — Node9,10,11,12 (access) + UE9~16
 #
-# UE17 是額外那顆直接掛在 Node4(relay)底下的 UE，不經過任何 access node，
-# 也不需要 DNAT trap（relay 的 DU 位址就是 MT 自己的 tunnel IP，PC1 端的
-# start_iab_server.sh 已經處理好路由，PC3 這邊只要正常啟動 UE17 容器即可）。
+# 三主機版沿革（見 HISTORY.md 2026-09-12 條目）：
+#   Node3,4(relay，含直連 UE17) 已搬到 PC2（PC3 CPU 資源競爭導致 relay MT
+#   反覆斷線重連）。PC3 現在只剩 4 個 access 節點 + 它們的 UE，全部 access
+#   MT 都跨主機連到 PC2 的 relay DU（透過 macvlan，機制跟 relay 跨主機連
+#   Donor 完全相同——access MT 的 rfsimulator serveraddr 本來就是網段共用的
+#   macvlan IP，不因為 parent relay 實際跑在哪台主機而改變，不需要額外設定）。
 
 COMPOSE_FILE="docker-compose-iab-pc3.yaml"
 IFACE_NAME="enxc84d4427aa8f"
@@ -21,8 +24,14 @@ declare -A ACCESS_DU_IP=( [9]="192.168.75.20" [10]="192.168.75.21" [11]="192.168
 declare -A ACCESS_MT_NAME=( [9]="rfsim5g-iab-mt-9" [10]="rfsim5g-iab-mt-10" [11]="rfsim5g-iab-mt-11" [12]="rfsim5g-iab-mt-12" )
 declare -A ACCESS_DU_NAME=( [9]="rfsim5g-iab-du-9" [10]="rfsim5g-iab-du-10" [11]="rfsim5g-iab-du-11" [12]="rfsim5g-iab-du-12" )
 
+# 這 4 個 access 節點的 parent relay（Node3, Node4）現在跑在 PC2，
+# 啟動前要先確認它們在 PC2 上已經穩定運作，不能只靠本機檢查。
+declare -A PARENT_RELAY_OF=( [9]="rfsim5g-iab-du-3" [10]="rfsim5g-iab-du-3" [11]="rfsim5g-iab-du-4" [12]="rfsim5g-iab-du-4" )
+
 PC1_USER="lindor"
 PC1_IP="192.168.88.1"
+PC2_USER="mcalab"
+PC2_IP="192.168.88.2"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes"
 
 if docker compose version &> /dev/null; then DOCKER_COMPOSE="docker compose"; else DOCKER_COMPOSE="docker-compose"; fi
@@ -32,7 +41,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; NC
 SSH_AVAILABLE=false
 CU_MAGIC_COMMANDS="docker exec -u 0 rfsim5g-donor-cu iptables -t nat -F OUTPUT"
 
-echo -e "${CYAN}[0/7] Loading Kernel Modules & Macvlan Prep...${NC}"
+echo -e "${CYAN}[0/6] Loading Kernel Modules & Macvlan Prep...${NC}"
 sudo modprobe sctp
 sudo modprobe nf_conntrack_sctp 2>/dev/null || sudo modprobe nf_conntrack_proto_sctp 2>/dev/null
 
@@ -80,28 +89,18 @@ if ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; then
     echo -e "${GREEN}[SSH] PC1 CU 已就緒${NC}"
 fi
 
-configure_and_start_relay() {
-    local N=$1
-    local MT_NAME="rfsim5g-iab-mt-${N}"
-    local DU_NAME="rfsim5g-iab-du-${N}"
-
-    echo -e "\n${GREEN}[Action] relay Node${N}: 等待 MT tunnel IP...${NC}"
-    local MT_TUNNEL_IP=""
-    local COUNT=0
-    while [ -z "$MT_TUNNEL_IP" ]; do
-        MT_TUNNEL_IP=$(docker exec $MT_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-        [ -z "$MT_TUNNEL_IP" ] && { sleep 2; COUNT=$((COUNT+1)); }
-        [ $COUNT -ge 60 ] && { echo -e "${RED}逾時${NC}"; return 1; }
-    done
-    echo -e "  Node${N} tunnel IP: ${GREEN}${MT_TUNNEL_IP}${NC}"
-
-    docker exec -u 0 $MT_NAME iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null
-
-    sed -i "s|local_n_address = \"[0-9.]*\"|local_n_address = \"$MT_TUNNEL_IP\"|" ./conf/iab_du_node${N}.conf
-    echo "   -> [Docker] Starting DU: $DU_NAME"
-    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d --force-recreate $DU_NAME
-    sleep 5
-}
+echo -e "${CYAN}[SSH] 等待 PC2 的 relay Node3,4 就緒（parent relay 現在跑在 PC2）...${NC}"
+_wait=0
+until ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} \
+    "docker inspect -f '{{.State.Status}}' rfsim5g-iab-du-3 rfsim5g-iab-du-4 2>/dev/null | grep -qv running && exit 1 || exit 0" 2>/dev/null; do
+    sleep 5; _wait=$((_wait+5))
+    echo -ne "\r  等待 PC2 relay Node3,4... ${_wait}s"
+    if [ $_wait -ge 180 ]; then
+        echo -e "\n${YELLOW}[SSH] 等待逾時，PC2 的 relay 可能還沒就緒，access 節點啟動後可能要多花時間才能附著${NC}"
+        break
+    fi
+done
+echo -e "${GREEN}  PC2 relay Node3,4 檢查完成${NC}"
 
 configure_and_start_access_du() {
     local MT_NAME=$1
@@ -204,49 +203,33 @@ wait_for_ue() {
 # ==========================================
 # 主流程
 # ==========================================
-echo -e "${CYAN}[1/7] Host Network Prep...${NC}"
+echo -e "${CYAN}[1/6] Host Network Prep...${NC}"
 sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
 $DOCKER_COMPOSE -f $COMPOSE_FILE down
 
-echo -e "${CYAN}[2/7] Launching Relay Node3, Node4 (直連 Donor)...${NC}"
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-3 rfsim5g-iab-mt-4
-configure_and_start_relay 3
-configure_and_start_relay 4
-echo -e "${YELLOW}Waiting 10s for relay DU F1AP stability...${NC}"
-sleep 10
-
-echo -e "${CYAN}[3/7] Launching Access MTs (Node9,10,11,12)...${NC}"
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-9 rfsim5g-iab-mt-10 rfsim5g-iab-mt-11 rfsim5g-iab-mt-12
-
-echo -e "${CYAN}[4/7] Deploying Access DUs Sequentially...${NC}"
-DONE=(0 0 0 0); NODES=(9 10 11 12)
-COUNT=0
-while [ $COUNT -lt 60 ]; do
-    all_done=true
-    for i in 0 1 2 3; do
-        n=${NODES[$i]}
-        if [ ${DONE[$i]} -eq 0 ]; then
-            if docker exec ${ACCESS_MT_NAME[$n]} ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
-                configure_and_start_access_du "${ACCESS_MT_NAME[$n]}" "${ACCESS_DU_NAME[$n]}" "${ACCESS_DU_IP[$n]}"
-                DONE[$i]=1
-            else
-                all_done=false
-            fi
-        fi
+echo -e "${CYAN}[2/6] Launching + Deploying Access Nodes 9,10,11,12（一個一個依序，parent relay 跨主機在 PC2）...${NC}"
+for n in 9 10 11 12; do
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "${ACCESS_MT_NAME[$n]}"
+    COUNT=0
+    while ! docker exec "${ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; do
+        sleep 5; COUNT=$((COUNT+1))
+        [ $COUNT -ge 24 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(120s)，跳過${NC}"; break; }
     done
-    $all_done && break
-    sleep 5; COUNT=$((COUNT+1))
+    if docker exec "${ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
+        configure_and_start_access_du "${ACCESS_MT_NAME[$n]}" "${ACCESS_DU_NAME[$n]}" "${ACCESS_DU_IP[$n]}"
+    fi
 done
 
 echo -e "${CYAN}Finalizing Control Plane, waiting 15s...${NC}"
 sleep 15
 reapply_dnat_rules
 
-echo -e "\n${CYAN}[5/7] Launching End-UEs 9~16 (access) + UE17 (直連 Node4)...${NC}"
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-end-ue-9 rfsim5g-end-ue-10 rfsim5g-end-ue-11 rfsim5g-end-ue-12 \
-    rfsim5g-end-ue-13 rfsim5g-end-ue-14 rfsim5g-end-ue-15 rfsim5g-end-ue-16 rfsim5g-end-ue-17
-for i in 9 10 11 12 13 14 15 16 17; do wait_for_ue "rfsim5g-end-ue-$i"; done
+echo -e "\n${CYAN}[3/6] Launching End-UEs 9~16（一個一個依序啟動）...${NC}"
+for i in 9 10 11 12 13 14 15 16; do
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "rfsim5g-end-ue-$i"
+    wait_for_ue "rfsim5g-end-ue-$i"
+done
 
 reapply_dnat_rules
 
@@ -258,4 +241,4 @@ else
     echo -e "${CYAN}$(echo -e "$CU_MAGIC_COMMANDS")${NC}"
 fi
 echo -e "${YELLOW}====================================================${NC}"
-echo -e "\n${GREEN}IAB PC3 - Node3,4(relay) + Node9,10,11,12(access) + UE9~17 Ready!${NC}"
+echo -e "\n${GREEN}IAB PC3 - Node9,10,11,12(access) + UE9~16 Ready!${NC}"

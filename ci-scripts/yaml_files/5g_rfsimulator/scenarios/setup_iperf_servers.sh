@@ -5,10 +5,11 @@
 #   bash setup_iperf_servers.sh
 #
 # ext-dn 容器：rfsim5g-oai-ext-dn
-# 監聽 port 5201~5206，對應 UE1~UE6 的下行流量
+# 監聽 port 5201~5217，對應 UE1~UE17 的下行流量（一個 iperf3 server 同時支援
+# TCP 與 UDP client，不需要為協定混合場景另外開 UDP-only server）
 
 CONTAINER="rfsim5g-oai-ext-dn"
-PORTS=(5201 5202 5203 5204 5205 5206)
+PORTS=($(seq 5201 5217))
 
 echo "[setup] 確認 ${CONTAINER} 容器狀態..."
 if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
@@ -24,7 +25,7 @@ echo "[setup] 停止舊的 iperf3 server 進程（含 while-loop）..."
 docker exec "${CONTAINER}" sh -c "pkill -9 -f iperf3 2>/dev/null; pkill -9 -f 'while true' 2>/dev/null; true"
 sleep 1
 
-echo "[setup] 啟動 iperf3 server，port 5201~5206（含自動重啟 loop）..."
+echo "[setup] 啟動 iperf3 server，port 5201~5217（含自動重啟 loop）..."
 # 每個 server 包在 while loop + timeout 400s 裡：
 #   - client session 最長 330s（IPERF_DURATION 300 + timeout grace 30）
 #   - server timeout 400s > client timeout，確保 client 先死並送 RST
@@ -42,4 +43,5 @@ docker exec "${CONTAINER}" sh -c "ss -tlnp 2>/dev/null | grep iperf3 || netstat 
 
 echo ""
 echo "[setup] 完成！ext-dn iperf3 server 已就緒"
-echo "        請在 PC 2 執行：python3 traffic_scenario.py --scenario D"
+echo "        請在 PC 2 執行：python3 traffic_scenario.py --scenario R --seed <N> --host pc2"
+echo "        並在 PC 3 執行：python3 traffic_scenario.py --scenario R --seed <N> --host pc3（同一個 --seed）"

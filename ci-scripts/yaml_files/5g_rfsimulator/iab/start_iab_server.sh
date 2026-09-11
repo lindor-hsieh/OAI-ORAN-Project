@@ -16,7 +16,7 @@ PC2_IP="192.168.88.2"
 PC3_IP="192.168.88.3"
 UPF_IP="192.168.88.134"
 UE_TUNNEL_SUBNET="12.1.1.0/24"
-PC2_INTERNAL_SUBNET="192.168.74.0/24"   # Node5~8 (access, PC2)
+PC2_INTERNAL_SUBNET="192.168.74.0/24"   # Node5,6 (access, PC2)
 PC3_INTERNAL_SUBNET="192.168.75.0/24"   # Node9~12 (access, PC3)
 DN_CONTAINER="rfsim5g-oai-ext-dn"
 
@@ -90,6 +90,162 @@ sleep 15
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-donor-du
 
 # ==========================================
+# 3.5 本機 RAN 節點：Node2(relay) + Node7,8(access) + UE5~8
+#   2026-09-12 因 PC2 CPU 資源競爭導致 relay MT 反覆斷線重連（見
+#   HISTORY.md），把這組子樹從 PC2 搬來 PC1 分擔負載。跟 PC2/PC3 的
+#   configure_and_start_relay()/configure_and_start_access_du() 邏輯完全
+#   相同，差別只在於 CU 就在本機，所有原本要 SSH 過去下的指令改成直接
+#   本機執行，不需要 SSH。
+# ==========================================
+echo -e "${CYAN}[3.5/7] Launching Local RAN Nodes: Node2(relay) + Node7,8(access) + UE5~8...${NC}"
+
+configure_and_start_local_relay() {
+    local N=$1
+    local MACVLAN_IP=$2
+    local MT_NAME="rfsim5g-iab-mt-${N}"
+    local DU_NAME="rfsim5g-iab-du-${N}"
+
+    echo -e "\n${GREEN}[Action] relay Node${N}: 等待 MT tunnel IP...${NC}"
+    local MT_TUNNEL_IP=""
+    local COUNT=0
+    while [ -z "$MT_TUNNEL_IP" ]; do
+        MT_TUNNEL_IP=$(docker exec $MT_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        [ -z "$MT_TUNNEL_IP" ] && { sleep 2; COUNT=$((COUNT+1)); }
+        [ $COUNT -ge 60 ] && { echo -e "${RED}逾時${NC}"; return 1; }
+    done
+    echo -e "  Node${N} tunnel IP: ${GREEN}${MT_TUNNEL_IP}${NC}"
+
+    docker exec -u 0 $MT_NAME iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null
+
+    sed -i "s|local_n_address = \"[0-9.]*\"|local_n_address = \"$MT_TUNNEL_IP\"|" ./conf/iab_du_node${N}.conf
+    echo "   -> [Docker] Starting DU: $DU_NAME"
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d --force-recreate $DU_NAME
+    sleep 5
+
+    # CU 就在本機，直接下路由指令，不需要 SSH 通知
+    sudo ip route replace ${MT_TUNNEL_IP} via ${MACVLAN_IP} dev macvlan-br 2>/dev/null \
+        && echo -e "   ${GREEN}本機路由已更新：${MT_TUNNEL_IP} via ${MACVLAN_IP}${NC}"
+}
+
+configure_and_start_local_access_du() {
+    local MT_NAME=$1
+    local DU_NAME=$2
+    local DU_DOCKER_IP=$3
+
+    echo -e "\n${GREEN}[Action] Setting up network for $DU_NAME ($DU_DOCKER_IP)${NC}"
+
+    local MT_TUNNEL_IP=$(docker exec $MT_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+
+    # CU 就在本機，直接下 DNAT 指令，不需要 SSH 通知
+    docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP \
+        && echo -e "   ${GREEN}CU DNAT rule applied: $DU_DOCKER_IP → $MT_TUNNEL_IP${NC}"
+
+    docker exec -u 0 $MT_NAME sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    docker exec -u 0 $MT_NAME iptables -t nat -F PREROUTING
+    docker exec -u 0 $MT_NAME iptables -t nat -F POSTROUTING
+    docker exec -u 0 $MT_NAME conntrack -F 2>/dev/null || true
+    docker exec -u 0 $MT_NAME iptables -t nat -A POSTROUTING -s $DU_DOCKER_IP -o oaitun_ue1 -j MASQUERADE
+    docker exec -u 0 $MT_NAME iptables -t nat -A PREROUTING -i oaitun_ue1 -p sctp -j DNAT --to-destination $DU_DOCKER_IP
+    docker exec -u 0 $MT_NAME iptables -t nat -A PREROUTING -i oaitun_ue1 -p udp --dport 2152 -j DNAT --to-destination $DU_DOCKER_IP
+
+    docker exec -u 0 $MT_NAME ip route replace 192.168.71.0/24 via 12.1.1.1 dev oaitun_ue1
+    docker exec -u 0 $MT_NAME ip route replace 192.168.72.0/24 via 12.1.1.1 dev oaitun_ue1
+
+    docker exec -u 0 $MT_NAME ethtool -K oaitun_ue1 tx off 2>/dev/null || true
+    docker exec -u 0 $MT_NAME ip link set oaitun_ue1 mtu 1300 2>/dev/null
+
+    docker exec -u 0 $MT_NAME ip route del default 2>/dev/null || true
+    docker exec -u 0 $MT_NAME ip route add default via 12.1.1.1 dev oaitun_ue1
+
+    echo "   -> [Docker] Starting DU: $DU_NAME"
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d --force-recreate $DU_NAME
+
+    local _wait=0
+    until docker exec -u 0 "$DU_NAME" true 2>/dev/null; do
+        sleep 1; _wait=$((_wait+1))
+        [ $_wait -ge 20 ] && { echo -e "   ${RED}警告：$DU_NAME 等待逾時${NC}"; break; }
+    done
+
+    local MT_INTERNAL_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' $MT_NAME | grep '192.168.76' | head -n 1 | xargs)
+
+    docker exec -u 0 $DU_NAME ip route replace 192.168.88.1 via 192.168.76.1 2>/dev/null
+    docker exec -u 0 $DU_NAME ip route replace 192.168.71.0/24 via $MT_INTERNAL_IP 2>/dev/null
+    docker exec -u 0 $DU_NAME ip route replace 192.168.72.0/24 via $MT_INTERNAL_IP 2>/dev/null
+    docker exec -u 0 $DU_NAME ip route replace 12.1.1.0/24 via $MT_INTERNAL_IP 2>/dev/null
+
+    echo -e "${YELLOW} Waiting 10s for CU F1AP stability...${NC}"
+    sleep 10
+}
+
+wait_for_local_relay_du_healthy() {
+    local DU_NAME=$1
+    local COUNT=0
+    while [ $COUNT -lt 20 ]; do
+        local STATUS=$(docker inspect -f '{{.State.Status}}' "$DU_NAME" 2>/dev/null)
+        local RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$DU_NAME" 2>/dev/null)
+        if [ "$STATUS" = "running" ]; then
+            sleep 3
+            local STATUS2=$(docker inspect -f '{{.State.Status}}' "$DU_NAME" 2>/dev/null)
+            local RESTARTS2=$(docker inspect -f '{{.RestartCount}}' "$DU_NAME" 2>/dev/null)
+            if [ "$STATUS2" = "running" ] && [ "$RESTARTS" = "$RESTARTS2" ]; then
+                echo -e "   ${GREEN}$DU_NAME 已穩定運作（RestartCount=$RESTARTS2）${NC}"
+                return 0
+            fi
+        fi
+        echo -e "   ${YELLOW}$DU_NAME 尚未穩定（status=$STATUS, restarts=$RESTARTS），等待中...${NC}"
+        sleep 3
+        COUNT=$((COUNT+1))
+    done
+    echo -e "   ${RED}$DU_NAME 逾時仍未穩定，access node 可能連不上，請檢查${NC}"
+    return 1
+}
+
+wait_for_local_ue() {
+    local UE_NAME=$1
+    echo -n "   -> Checking $UE_NAME... "
+    local IP=""; local COUNT=0
+    while [ -z "$IP" ]; do
+        sleep 2
+        IP=$(docker exec $UE_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        echo -n "."
+        COUNT=$((COUNT+1))
+        [ $COUNT -ge 30 ] && break
+    done
+    if [ ! -z "$IP" ]; then
+        echo -e "${GREEN} Attached! ($IP)${NC}"
+        docker exec -u 0 $UE_NAME ip link set oaitun_ue1 mtu 1200 2>/dev/null
+        docker exec -u 0 $UE_NAME ip route replace default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+    else
+        echo -e "${RED} Not Found${NC}"
+    fi
+}
+
+$DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-2
+configure_and_start_local_relay 2 192.168.88.151
+wait_for_local_relay_du_healthy rfsim5g-iab-du-2
+
+declare -A LOCAL_ACCESS_DU_IP=( [7]="192.168.76.12" [8]="192.168.76.13" )
+declare -A LOCAL_ACCESS_MT_NAME=( [7]="rfsim5g-iab-mt-7" [8]="rfsim5g-iab-mt-8" )
+declare -A LOCAL_ACCESS_DU_NAME=( [7]="rfsim5g-iab-du-7" [8]="rfsim5g-iab-du-8" )
+
+for n in 7 8; do
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "${LOCAL_ACCESS_MT_NAME[$n]}"
+    COUNT=0
+    while ! docker exec "${LOCAL_ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; do
+        sleep 5; COUNT=$((COUNT+1))
+        [ $COUNT -ge 24 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(120s)，跳過${NC}"; break; }
+    done
+    if docker exec "${LOCAL_ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
+        configure_and_start_local_access_du "${LOCAL_ACCESS_MT_NAME[$n]}" "${LOCAL_ACCESS_DU_NAME[$n]}" "${LOCAL_ACCESS_DU_IP[$n]}"
+    fi
+done
+
+for i in 5 6 7 8; do
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "rfsim5g-end-ue-$i"
+    wait_for_local_ue "rfsim5g-end-ue-$i"
+done
+
+# ==========================================
 # 4. 啟動 Python 推論伺服器 (Node 1~12，全部集中在 PC1)
 # ==========================================
 echo -e "${CYAN}[4/7] Starting Inference Servers (Node 1~12)...${NC}"
@@ -113,40 +269,13 @@ done
 #   Node1~4 的 MT 容器在 PC2/PC3 上，取得的 12.1.1.x tunnel IP 是動態的，
 #   Donor CU（在 PC1、host network）要能把 F1/GTP 封包送到這個 tunnel IP，
 #   需要在 PC1 本機路由表加一條「tunnel IP 經由該 relay 的 macvlan IP」。
-#   relay 的 macvlan IP 本身是固定的（.150~.153），可以直接用；
-#   tunnel IP 要 SSH 去對應主機查詢。
+#
+#   這條路由改成由 PC2/PC3 的 configure_and_start_relay()「主動推送」
+#   （拿到 tunnel IP 的當下透過 SSH 通知 PC1，見該腳本），不再由 PC1 這裡
+#   反過來被動輪詢猜 PC2/PC3 什麼時候準備好——舊做法會在 PC2/PC3 還沒啟動
+#   時卡住最多 4 個節點 × 180s = 12 分鐘的無意義等待。PC1 這裡不需要再做
+#   任何事，繼續往下執行即可。
 # ==========================================
-echo -e "${CYAN}[5/7] Resolving Relay Node Tunnel IPs (cross-host)...${NC}"
-
-declare -A RELAY_MACVLAN=( [1]="192.168.88.150" [2]="192.168.88.151" [3]="192.168.88.152" [4]="192.168.88.153" )
-declare -A RELAY_HOST=( [1]="$PC2_USER@$PC2_IP" [2]="$PC2_USER@$PC2_IP" [3]="$PC3_USER@$PC3_IP" [4]="$PC3_USER@$PC3_IP" )
-
-wait_relay_tunnel_ip() {
-    local N=$1
-    local HOST=${RELAY_HOST[$N]}
-    local IP=""
-    echo -n "  Node${N} tunnel IP (via $HOST)..."
-    local COUNT=0
-    while [ -z "$IP" ]; do
-        IP=$(ssh $SSH_OPTS $HOST "docker exec rfsim5g-iab-mt-${N} ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}'" 2>/dev/null)
-        if [ -z "$IP" ]; then
-            echo -n "."
-            sleep 3
-            COUNT=$((COUNT+1))
-            if [ $COUNT -ge 60 ]; then
-                echo -e " ${RED}逾時(180s)，跳過${NC}"
-                return 1
-            fi
-        fi
-    done
-    echo -e " ${GREEN}$IP${NC}"
-    sudo ip route replace $IP via ${RELAY_MACVLAN[$N]} dev macvlan-br
-    echo "$IP"
-}
-
-for n in 1 2 3 4; do
-    wait_relay_tunnel_ip $n
-done
 
 # ==========================================
 # 6. 最後路由與 UPF/FlexRIC 修正
@@ -157,9 +286,11 @@ docker exec -u 0 rfsim5g-oai-upf bash -c "sysctl -w net.ipv4.ip_forward=1 && ipt
 sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
 sudo ip route replace $UE_TUNNEL_SUBNET via $UPF_IP dev macvlan-br 2>/dev/null
 
-# FlexRIC 回程路由：兩條 internal 子網都要能回得去
+# FlexRIC 回程路由：三條 internal 子網都要能回得去（PC2/PC3 各自的，
+# 加上 PC1 本機新增的 Node7,8 internal 子網 192.168.76.0/24）
 docker exec -u 0 flexric ip route add $PC2_INTERNAL_SUBNET via 192.168.88.1 2>/dev/null || true
 docker exec -u 0 flexric ip route add $PC3_INTERNAL_SUBNET via 192.168.88.1 2>/dev/null || true
+docker exec -u 0 flexric ip route add 192.168.76.0/24 via 192.168.88.1 2>/dev/null || true
 
 echo -e "${YELLOW}Setting up iperf3 server in $DN_CONTAINER...${NC}"
 docker start $DN_CONTAINER 2>/dev/null

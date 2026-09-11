@@ -1,8 +1,8 @@
 """
 server_app.py — Phase 5 Global rApp / Flower ServerApp
 
-取代已 deprecated 的 `fl.server.start_server()` 寫法（見 ../../flower_server.py，
-僅保留 compute_global_jfi() 邏輯參考，本檔案是實際運作版本）。用新版
+取代已 deprecated 的 `fl.server.start_server()` 寫法（舊草稿 flower_server.py 已刪除，
+compute_global_jfi() 邏輯已搬進本檔案，本檔案是實際運作版本）。用新版
 ServerApp + `flwr run` 部署，透過 SuperLink + SuperNode（非 Simulation
 Engine，5 個節點是實體分散的 process，不是模擬的虛擬 client）。
 

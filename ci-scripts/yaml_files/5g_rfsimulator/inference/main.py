@@ -1,8 +1,8 @@
 """
 main.py — Local xApp Python 推論伺服器入口 (Phase 4 DRL 版本)
 
-透過環境變數決定節點，5 個容器共用同一個 image：
-  NODE_ID   : IAB Node 編號 (1~5)，必填
+透過環境變數決定節點，12 個容器共用同一個 image：
+  NODE_ID   : IAB Node 編號 (1~12)，必填
   MONGO_URI : MongoDB 連線位址，預設 mongodb://localhost:27017
   MONGO_DB  : MongoDB 資料庫名稱，預設 iab_xapp
   MODEL_DIR : DRL 模型儲存目錄，預設 /app/models
@@ -26,7 +26,7 @@ def main() -> None:
 
     try:
         node_id = int(raw_id)
-        assert 1 <= node_id <= 5, f"NODE_ID 必須在 1~5 之間，收到 {node_id}"
+        assert 1 <= node_id <= 12, f"NODE_ID 必須在 1~12 之間，收到 {node_id}"
     except (ValueError, AssertionError) as exc:
         print(f"[main] 錯誤：NODE_ID 無效 — {exc}")
         sys.exit(1)

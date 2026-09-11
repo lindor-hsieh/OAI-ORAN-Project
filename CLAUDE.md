@@ -2,16 +2,65 @@
 
 ## 1. 實驗實體環境與網路拓撲設置
 
-本研究採用**雙主機 (Dual-host) 實體部署**，以模擬真實 O-RAN IAB 網路中的實體隔離與傳輸延遲。底層 IAB 架構採用 **MT + DU 串接模式** (無 BAP 層)，所有跨節點傳輸皆透過標準 5G Uu 介面與 Linux IP Routing 進行轉發。
+**2026-09-11 起改用三主機 (Tri-host) 實體部署**（原為雙主機，見下方「歷史沿革」），擴展成 **1 donor + 4 relay + 8 access + 17 UE** 的對稱四層樹狀拓樸，以更貼近論文要模擬的實體回傳延遲（donor→relay 這一跳現在一定跨主機）。底層 IAB 架構仍是 **MT + DU 串接模式** (無 BAP 層)，所有跨節點傳輸皆透過標準 5G Uu 介面與 Linux IP Routing 進行轉發；三台主機透過各自的 USB3.0→RJ45 轉接卡共接同一台 switch，組成單一 `192.168.88.0/24` L2 網段（見 `iab/setup_lab_net.sh`）。
+
+### 拓樸與節點編號（全新編號，取代舊的 Node1~5）
+
+舊拓樸是非對稱的（Node1 帶 2 個 access、Node2 只帶 1 個）；新拓樸對稱 4×2×2，全新連續編號：
+
+```
+Donor (PC1)
+├── Node1 (relay, PC2) ── Node5 (access, PC2) ── UE1, UE2
+│                     └── Node6 (access, PC2) ── UE3, UE4
+├── Node2 (relay, PC2) ── Node7 (access, PC2) ── UE5, UE6
+│                     └── Node8 (access, PC2) ── UE7, UE8
+├── Node3 (relay, PC3) ── Node9  (access, PC3) ── UE9,  UE10
+│                     └── Node10 (access, PC3) ── UE11, UE12
+└── Node4 (relay, PC3) ── Node11 (access, PC3) ── UE13, UE14
+                      ├── Node12 (access, PC3) ── UE15, UE16
+                      └── UE17（直接掛在 Node4 的 DU，不經過 access 層）
+```
+
+Donor→Relay→Access→UE 仍是 3-hop（深度沒變，只是變寬）；UE17→Node4 是 2-hop。
 
 ### 硬體與節點配置表
 
 | 實體主機 | 部署元件 | 網路角色 | 備註說明 |
 | :--- | :--- | :--- | :--- |
-| **PC 1** | 5G Core (CN5G)<br>FlexRIC Server<br>Donor Node<br>IAB Node 1, 2 | 核心網與全域控制中心<br>Relay Nodes (骨幹轉發) | FlexRIC 綁定實體 IP，接受跨主機 E2 連線。Node 1, 2 負責上下游流量調度。 |
-| **PC 2** | IAB Node 3, 4, 5<br>UE 1 ~ 6 | Access Nodes (邊緣存取)<br>終端使用者 | 透過實體網路與 PC 1 連線。Node 3, 4, 5 各自獨立運行專屬的 Local xApp 容器。 |
+| **PC 1** (192.168.88.1, lindor) | CN5G、FlexRIC Server、MongoDB、Donor CU/DU、**全部 12 組** `xapp-nodeN`+`inference-nodeN` 容器 | 核心網與全域控制中心（不放任何 IAB node 的 RAN 容器） | xApp(C)+inference(Python) **刻意集中在 PC1**（不是技術債，是本輪的設計選擇，見下方說明），MongoDB 對外監聽 `27017`。 |
+| **PC 2** (192.168.88.2, **mcalab**) | Node1,2 (relay) + Node5,6,7,8 (access) + UE1~8 | RAN 資料面 | 純資料面，無 xApp/inference 容器。全新機器，Ubuntu 20.04。 |
+| **PC 3** (192.168.88.3, lindor) | Node3,4 (relay) + Node9,10,11,12 (access) + UE9~17（含 UE17） | RAN 資料面 | 純資料面，無 xApp/inference 容器。Ubuntu 24.04。 |
 
-> **開發進度註記**：目前已確認 PC 1 的 FlexRIC Server 能夠成功與所有 6 個節點 (Donor + 5 IAB Nodes) 建立 SCTP/E2AP 連線，並且驗證了 OAI MAC 層確實開放 PRB 控制權給 xApp 進行覆寫，已開發 Node 1 到 Node 5 各自獨立的 Local xApp 程式碼。
+**xApp/inference 集中在 PC1 的理由**：xApp(C) 與 inference(Python) 之間走 `ipc://` Unix domain socket（見第 2 節），兩者必須同一台主機；若要「真正分散到 PC2/PC3」，ZMQ 要改走 TCP，5ms timeout 預算要多扛一段跨主機網路延遲，風險換來的好處不大——經評估後決定維持集中，`MONGO_URI` 因此**不需要**因為這次擴容而修改（所有 inference 容器仍是 `mongodb://localhost:27017`，因為它們仍跟 MongoDB 同一台主機）。RAN 節點（MT/DU/UE）則必須物理分散到 PC2/PC3，因為這就是這次擴容的目的。
+
+### IP / ID 配置表
+
+| 項目 | Donor | Node1~4（relay） | Node5~12（access） | UE1~17 |
+|---|---|---|---|---|
+| `gNB_ID`/`gNB_DU_ID` | `0xe00` | `0xe01`~`0xe04` | `0xe05`~`0xe0c` | — |
+| `nr_cellid` | `12345678` | `12345679`~`12345682` | `12345683`~`12345690` | — |
+| `physCellId` | `0` | `1`~`4` | `5`~`12` | — |
+| E2 `TARGET_NODE_ID`（xApp .c，= gNB_ID 十進位） | — | `3585`~`3588` | `3589`~`3596` | — |
+| `rfsimulator.serverport` | `4043` | `4044`~`4047` | `4048`~`4055` | — |
+| FlexRIC telnet debug port | — | `9089`~`9092` | `9093`~`9100` | — |
+| IMSI (`208990100001xxx`) | — | 尾碼 `100`~`103` | 尾碼 `104`~`111` | 尾碼 `200`~`216`（跟 MT 區段刻意拉開） |
+| macvlan IP | `.144`（DU）| Node1=`.150`,Node2=`.151`（PC2）; Node3=`.152`,Node4=`.153`（PC3）—— MT/DU 共用同一 netns、同一 IP | Node5=`.160/.161`,Node6=`.162/.163`,Node7=`.164/.165`,Node8=`.166/.167`（PC2）; Node9=`.168/.169`,Node10=`.170/.171`,Node11=`.172/.173`,Node12=`.174/.175`（PC3） | 動態，共用 `12.1.1.0/24` SMF pool；UE17 額外占用 macvlan `.176`（直連 relay，需要自己的 macvlan IP） |
+| internal bridge IP | — | 不需要（relay 的 MT/DU 共用 netns，沒有獨立位址） | **PC2 用 `192.168.74.0/24`**：Node5=`.10/.20`,Node6=`.11/.21`,Node7=`.12/.22`,Node8=`.13/.23`；**PC3 用 `192.168.75.0/24`**：Node9=`.10/.20`,Node10=`.11/.21`,Node11=`.12/.22`,Node12=`.13/.23` | — |
+
+> **PC2/PC3 internal bridge 子網刻意不同**（`.74.0/24` vs `.75.0/24`）：PC1 的路由表對同一個子網只能指到一個 next-hop，若兩台主機共用 `192.168.74.0/24`，PC1 就無法同時正確路由到兩邊的 access node internal IP。
+
+> **新增 IMSI 必須同步在核網用戶資料庫建檔，否則 NAS Registration Reject**（2026-09-11 現場踩過）：CN5G 的訂閱資料在 `oai_db.sql`（`mysql` 容器初次啟動時匯入），舊版只預先灌了 `208990100001100`~`208990100001116` 這 17 筆（Ki/OPc 相同）。這次擴容後 MT 的 IMSI 尾碼 `100`~`111` 剛好落在既有範圍內沒事，但 UE 改用全新的 `200`~`216` 區段，`mysql` 裡完全沒有對應記錄，UE 一律收到 `FGS_REGISTRATION_REJECT` 附著失敗。修法：直接對執行中的 `rfsim5g-mysql` 容器補 `INSERT INTO users`（沿用既有列的 Ki/OPc/msisdn 樣式，只換 IMSI），插入後把對應的 UE 容器 `docker compose restart` 一次讓它重新嘗試附著即可，不需要重建整個 mysql 資料卷。往後只要新增 IMSI 落在 `100`~`116` 以外的範圍，都要記得先做這一步。
+
+CN5G（`.131`~`.134`）、FlexRIC（`.141`）維持不變，全部在 PC1。
+
+> **關鍵架構事實（2026-09-11 查證）**：relay 節點的「多個 access 子節點」在 RAN 層零成本——OAI rfsimulator 的一個 DU server 本來就能同時接受多個 MT client 連線（不需要在 relay 主機上多長出額外的 MT 容器），這代表 4 個 relay 各帶 2 個 access 都只是「讓新節點的 rfsim client 指向同一個 server port」，沒有 F1/PRB 供給層面的新問題。
+
+> **UE17 一度無法附著，已解決（2026-09-11）**：曾懷疑是「Node4 的 DU 要同時服務 3 個子連線（2 個 access MT + UE17）」這個從未驗證過的連線數量本身有問題，但深入查證後**證實與連線數量無關**——OAI 的 `xapp_2d_ctrl` 2D 控制機制（`ran_func_mac.c`／`gNB_scheduler_dlsch.c`）對不在 xApp 控制清單裡的 RNTI 預設給滿額排程（不會餓死新 UE），`XAPP_MAX_UE=16`／`MAX_MOBILES_PER_GNB=32` 也遠夠用。**真正原因**：Node4 的 DU 在某次容器操作造成的 CPU/排程抖動中觸發了 F1AP SCTP 斷線（Donor CU log 顯示 `releasing DU ID 3588 on assoc_id 11`），但 DU 端沒有像 Node2 一樣自動重新做 F1 Setup，導致 SCTP socket 卡死，DU 每次嘗試送 Msg4 (RRCSetup) 都是 `Sctp_sendmsg failed: Broken pipe`，UE17 永遠等不到 Contention Resolution 完成——已存在的 UE（Node11/Node12 的 GTP-U 資料面走 UDP，不受影響，這是為什麼只有新附著會卡住、舊連線看起來正常的原因。修法：重啟 `rfsim5g-iab-du-4` 容器強制重新做 F1 Setup 即可，不需要動任何 RAN 層排程程式碼。
+
+### 歷史沿革：雙主機時期（2026-09-11 之前）
+
+以下記錄僅供歷史參考，**目前已被上方三主機拓樸取代**：舊架構是「PC1（CN5G/FlexRIC/Donor/Node1,2 relay/全部 xApp+inference）+ PC2（Node3,4,5 access + UE1~6）」的雙主機、非對稱（Node1 帶 2 個 access、Node2 只帶 1 個）拓樸。PC2 當時的帳號也是 `lindor`；2026-09-11 PC2 換成全新機器（帳號 `mcalab`），同時新增 PC3，才有了這次的三主機/四層樹狀重構。
+> **開發進度註記**：舊雙主機拓樸下，PC 1 的 FlexRIC Server 能夠成功與所有 6 個節點 (Donor + 5 IAB Nodes) 建立 SCTP/E2AP 連線，並且驗證了 OAI MAC 層確實開放 PRB 控制權給 xApp 進行覆寫。
 > **Local rApp 暫時完成開發**：`inference_server.py` 同一 Python 進程中包含 Near-RT 推論（ZeroMQ REP）與 Non-RT Fine-tuning（背景訓練執行緒，每 60 秒從 MongoDB 讀取經驗執行 Offline A2C 更新）兩個功能，共享同一 DRLAgent 實例。**這個「同進程共享記憶體」的假設只在 Phase 4 範圍內成立**；Phase 5 的 Flower ClientApp 是 `flower-supernode` 另開的獨立 subprocess，跟 `inference_server.py` 改用磁碟 checkpoint 檔案同步，細節見第 2 節第 2 點與第五階段。
 
 ---
@@ -23,6 +72,8 @@
 * **底層協議棧 (C 語言)**：使用 OAI (OpenAirInterface) 實作 DU/CU 與 UE。
 * **Near-RT RIC (C 語言)**：使用 FlexRIC 作為 E2 代理伺服器與 xApp 框架。
 * **Non-RT RIC & AI (Python)**：使用 Flower Framework 進行階層式聯邦學習 (Hierarchical FL)，並透過 ZeroMQ 建立跨語言 IPC 通訊。
+
+> **2026-09-11 拓樸變更影響範圍**：本節與第 3 節描述的「Node1/2 relay、Node3/4/5 access」是**舊雙主機拓樸**下的具體節點編號與量測數據，予以保留作歷史紀錄。新的三主機/12-node 拓樸（見第 1 節）目前**只做到 Local xApp + Local rApp 這一層**（純 Local-only DRL，等同本節第 1、2 點的機制，只是節點數變多）——**Global xApp（第 3 點）與 Flower 聯邦學習（第 4 點）本輪刻意跳過，尚未針對 12-node 拓樸重新設計**，`global_xapp.py::compute_quotas()`／`global_xapp_bridge.py`／`flower-app/` 目前仍是寫死 5-node 的舊版本，暫不啟動（`docker-compose-iab-server.yaml` 已不含 `global-xapp-bridge`／`flower-*` 服務定義）。`traffic_scenario.py` 的 `NODE_CONFIG` 也還沒擴充到 12 個節點，本輪不跑流量場景/DRL 對比實驗。
 
 ### 核心控制元件定義
 
@@ -211,11 +262,12 @@ Global xApp 的差異化價值：跨層 IAB 回傳協調，Local-only 架構做�
 * `/openairinterface5g/openair2/E2AP/flexric`：FlexRIC 專案目錄
 * `/openairinterface5g/openair2/E2AP/flexric/src/`：C 語言 Local xApp 的主要開發目錄
 * `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator`：docker部屬目錄
-* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-server.yaml`：for PC 1（CN5G、Donor CU/DU、FlexRIC、MongoDB、全部 5 個 xapp-nodeN + inference-nodeN 容器，由 `run_local_pc1.sh` 啟動；PC1 LAN IP = `192.168.88.1`）
-* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-client.yaml`：for PC 2（MT-3/4/5、DU-3/4/5、UE1~6，由 `run_local_pc2.sh` → `start_iab_client.sh` 啟動）
+* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-server.yaml`：for PC 1（CN5G、Donor CU/DU、FlexRIC、MongoDB、全部 12 組 xapp-nodeN + inference-nodeN 容器，由 `iab/run_local_pc1.sh` → `iab/start_iab_server.sh` 啟動；PC1 LAN IP = `192.168.88.1`）
+* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-pc2.yaml`：for PC 2（Node1,2 relay + Node5,6,7,8 access + UE1~8，由 `iab/run_local_pc2.sh` → `iab/start_iab_pc2.sh` 啟動；PC2 LAN IP = `192.168.88.2`，帳號 `mcalab`）
+* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-pc3.yaml`：for PC 3（Node3,4 relay + Node9,10,11,12 access + UE9~17，由 `iab/run_local_pc3.sh` → `iab/start_iab_pc3.sh` 啟動；PC3 LAN IP = `192.168.88.3`，帳號 `lindor`）
 
-> **注意**：目前 Node3/4/5 的 `xapp-node3~5`／`inference-node3~5` 容器實際上跟 Node1/2 一樣全部部署在 PC1（`docker-compose-iab-server.yaml`），並未真正搬到 PC2。硬體配置表第 1 節「PC2 各自運行專屬 Local xApp 容器」是**目標架構**，尚未實現；PC2 目前只跑資料面（MT/DU/UE）。這代表 `MONGO_URI`／未來 Flower Client 目前都還能用 `localhost` 連線，但 Phase 5/6 若真的把 Node3/4/5 遷到 PC2，所有跨主機連線位址都要改用 PC1 的 `192.168.88.1`。
-* `/flower/`：Python 推論伺服器、Flower Client/Server 與 MongoDB 讀寫腳本所在目錄。
+> **xApp/inference 集中在 PC1 是刻意設計，不是技術債**（見第 1 節說明）：12 組 `xapp-nodeN`/`inference-nodeN` 容器全部定義在 `docker-compose-iab-server.yaml`，`MONGO_URI` 全部維持 `mongodb://localhost:27017`，PC2/PC3 只跑純資料面（MT/DU/UE）容器。
+* `/flower/`：Python 推論伺服器、Flower Client/Server 與 MongoDB 讀寫腳本所在目錄（Flower 本輪未啟用，見第 2 節註記）。
 
 ---
 
@@ -232,18 +284,16 @@ Global xApp 的差異化價值：跨層 IAB 回傳協調，Local-only 架構做�
   cd ~/openairinterface5g/cmake_targets
   sudo ./build_oai --gNB --nrUE --build-e2 --ninja -w USRP -C --cmake-opt -DE2AP_VERSION=E2AP_V2 --cmake-opt -DKPM_VERSION=KPM_V3_00 --cmake-opt -DCMAKE_BUILD_TYPE=Release
 
+> **PC2（Ubuntu 20.04）專屬額外步驟**（2026-09-11 現場踩過，三台主機唯一不是 24.04 的）：新機器缺 `build_oai -I` 沒裝全的相依套件，需要：① `apt-cache policy libuhd-dev` 確認有 UHD 開發庫（`-w USRP` 編譯選項需要，focal 原生倉庫有）；② `libyaml-cpp-dev` 原生只有 0.6.2，OAI 的 CMake 需要 0.8.0 才有新版 `yaml-cpp::yaml-cpp` ALIAS target 支援，要移除舊版、從源碼建置 0.8.0（`git clone --branch 0.8.0 https://github.com/jbeder/yaml-cpp.git`）；③ CMake 原生只有 3.16.3 太舊，要用 Kitware 官方倉庫裝到跟 PC1/PC3 一致的 3.28.3；④ GCC 原生只有 9.4.0 編譯 AVX512 SIMD 路徑會出 `_mm256_load_epi32` 找不到宣告的錯誤，要用 `ppa:ubuntu-toolchain-r/test` 裝 gcc-13/g++-13 並設為預設。**還有一個容易漏掉、不是編譯期會噴錯、而是跑起來才炸的**：`nr-uesoftmodem`/`nr-softmodem` 編譯連結到 PC2 host 原生的 `libssl.so.1.1`（20.04 預設版本），但容器基底 `custom-oai-runtime:24.04` 只有 `libssl3`，跑起來會報 `error while loading shared libraries: libcrypto.so.1.1`；修法是把 host 的 `/usr/lib/x86_64-linux-gnu/{libssl,libcrypto}.so.1.1` 複製進 `cmake_targets/ran_build/build/`（這個目錄本來就整包 bind-mount 進容器、也在 `LD_LIBRARY_PATH` 裡），**這個檔案不在 git 版控裡、也不會被 `build_oai` 重新產生**，每次 `ran_build` 目錄被清掉重建都要重做這一步。
+
 ## 7. 注意事項
 
-目前進行中為**第四階段**（DRL 閉環控制 + Local rApp 訓練）並準備進入**第五階段**（Global xApp 設計）。第五階段開始前需等待 Local DRL 訓練確認收斂。開發 xApp 至少要修改以下這些檔案：
+目前進行中為**三主機擴容**（1 donor + 4 relay + 8 access + 17 UE，見第 1 節），範疇是把基礎設施跑起來、讓 12 個 Local xApp 都能完成 E2 連線與 ZMQ round trip（純 Local-only DRL）。Global xApp 配額機制與 Flower 聯邦學習本輪刻意跳過，第五階段的敘述（見第 3 節）仍是舊 5-node 拓樸下的內容，尚未針對新拓樸重做。開發/修改 xApp 至少要涉及以下這些檔案（**正確檔名是 `xapp_nodeN.c`，不是 `mac_ctrl_nodeN.c`**——後者是舊文件的錯誤記載，從未存在過）：
 
-**xApp 本體（每個 Node 各自獨立，共 5 份）**
-`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node1.c`
-`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node2.c`
-`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node3.c`
-`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node4.c`
-`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/mac_ctrl_node5.c`
+**xApp 本體（每個 Node 各自獨立，共 12 份）**
+`~/openairinterface5g/openair2/E2AP/flexric/examples/xApp/c/ctrl/xapp_node1.c` ~ `xapp_node12.c`
 
-**共用底層檔案（Node 1~5 共用，修改須謹慎）**
+**共用底層檔案（Node 1~12 共用，修改須謹慎）**
 `~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/ie/mac_data_ie.c`
 `~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/ie/mac_data_ie.h`
 `~/openairinterface5g/openair2/E2AP/flexric/src/sm/mac_sm/enc/mac_enc_plain.c`
@@ -257,7 +307,7 @@ Global xApp 的差異化價值：跨層 IAB 回傳協調，Local-only 架構做�
 `~/openairinterface5g/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c`
 `~/openairinterface5g/openair2/E2AP/flexric/src/xApp/db/sqlite3/sqlite3_wrapper.c`
 
-> **規則**：刪除整份檔案需經過授權。所有修改先在 PC 1 完成，再將修改好的檔案傳給 PC 2。
+> **規則**：刪除整份檔案需經過授權。所有修改先在 PC 1 完成，再將修改好的檔案傳給 PC 2、PC 3（`rsync`，見 `setup_lab_net.sh` 建立的 SSH 免密碼登入：`ssh pc2`／`ssh pc3`）。PC2/PC3 各自在本機重新編譯（`build_oai`／FlexRIC cmake），不是直接搬二進位檔——因為 docker-compose 用**絕對路徑** bind-mount 宿主機編譯產物（例如 `/home/lindor/openairinterface5g/cmake_targets/ran_build/build/...`），PC2 帳號是 `mcalab` 但仍在 `/home/lindor/openairinterface5g` 編譯（已手動建立 `/home/lindor` 目錄供其使用），確保路徑跟 compose 檔一致。
 
 ### 狀態觀測窗口（100ms）與 MAX_BSR／MAX_BUF_INFO 正規化
 
@@ -281,12 +331,13 @@ MAX_BUF_INFO = 2,000,000 bytes（drl_agent.py，dl_buffer_info 正規化，2026-
 **現象二（DU 端，2026-07-09 新發現）**：在現象一發生後，若只單獨重啟 xApp/DU 而不動 FlexRIC 本身，DU 容器會在啟動後數秒內以 `assoc_rb_tree_extract: Assertion 'z_node != tree->dummy...' failed`（`assoc_rb_tree.c:457`）反覆崩潰（`Exited (139)`，SIGSEGV），**每次重啟都在同一點崩潰，不是偶發競爭條件**。這是 DU 內建的 E2 Agent 在協議關聯追蹤上的 bug，推測跟 FlexRIC 端殘留的壞狀態互動有關——單獨重啟 DU 無法清掉，必須連同 FlexRIC 一起做完整乾淨重啟才會恢復正常。
 
 **恢復流程**：
-1. 重新執行完整腳本（FlexRIC 須先於 DU 啟動，兩台機器都要重新跑，不能只重啟其中一邊）：
+1. 重新執行完整腳本（FlexRIC 須先於 DU 啟動，三台機器都要重新跑，不能只重啟其中一台）：
    ```bash
    # PC1
    bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc1.sh
-   # PC2（等 PC1 FlexRIC healthy 後）
+   # PC2、PC3（等 PC1 FlexRIC healthy 後，兩台可同時跑）
    bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc2.sh
+   bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc3.sh
    ```
 2. `inference_server.py` 啟動時會自動從 `/app/models/model_nodeX.pt` 載入 checkpoint，**訓練進度與 MongoDB experience 不會丟失**，直接從上次停止點繼續（除非是刻意的破壞性重訓，見 DRL_DESIGN.md 相關章節）。
 3. 啟動順序強制要求：**FlexRIC → DU → xApp**，單獨重啟 FlexRIC 或單獨重啟 DU 都無效（現象二已驗證：只重啟 DU 3/4/5 兩次，都以同樣的 assertion 重現崩潰；連同 FlexRIC 一起做完整乾淨重啟後才恢復穩定）。

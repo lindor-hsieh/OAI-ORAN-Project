@@ -18,9 +18,7 @@ services:
             - "36422:36422/sctp"
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
-            # 掛載本地編譯的 nearRT-RIC，確保與 xapp_node3 使用相同 MAC SM wire format
             - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/ric/nearRT-RIC:/usr/local/bin/nearRT-RIC
-            # 掛載所有本地編譯的 SM 插件，與 nearRT-RIC 及 xApp 保持 ABI 一致
             - /usr/local/lib/flexric/:/usr/local/lib/flexric/
         healthcheck:
             test: /bin/bash -c "pgrep nearRT-RIC"
@@ -31,7 +29,6 @@ services:
 
     xapp-kpm-moni:
         image: oaisoftwarealliance/oai-flexric:develop
-        # 掛載本地編譯的 xapp_kpm_moni，與本地 nearRT-RIC E42 ABI 一致
         command: "stdbuf -o0 /xapp_kpm_moni"
         container_name: xapp-kpm-moni
         privileged: true
@@ -39,7 +36,6 @@ services:
         depends_on:
             oai-flexric:
                 condition: service_healthy
-        # [修改] 改用 Host 模式，這樣它就能透過宿主機的 macvlan-br 看到 FlexRIC
         network_mode: "host"
         environment:
             - NEAR_RT_RIC_IP=192.168.88.141
@@ -49,7 +45,7 @@ services:
             - /usr/local/lib/flexric/:/usr/local/lib/flexric/
 
     # ==========================================================
-    # 0-a. MongoDB (FL 訓練資料持久化)
+    # 0-a. MongoDB (經驗持久化，供 12 個節點的 inference 容器共用)
     # ==========================================================
     mongodb:
         image: mongo:7.0
@@ -67,20 +63,9 @@ services:
             start_period: 20s
 
     # ==========================================================
-    # 0-a2. Phase 5 Global xApp 回傳配額橋接
-    # （橋接 Node1/2 relay PUB tcp://127.0.0.1:5561/5562 →
-    #  Node3/4/5 access SUB tcp://127.0.0.1:5560，見 global_xapp_bridge.py）
-    # ==========================================================
-    global-xapp-bridge:
-        image: local-xapp-inference:latest
-        container_name: global-xapp-bridge
-        network_mode: "host"
-        depends_on: [inference-node1, inference-node2]
-        command: ["python3", "global_xapp_bridge.py"]
-        restart: on-failure
-
-    # ==========================================================
-    # 0-b. Python 推論伺服器 (Near-RT 閉環 AI 推論)
+    # 0-b. Python 推論伺服器 + C xApp（12 個節點，全部集中在 PC1）
+    #   刻意選擇：xApp/inference 不跟著 RAN 節點搬到 PC2/PC3，理由見 CLAUDE.md。
+    #   本輪不含 Global xApp 配額橋接與 Flower 聯邦學習（見 CLAUDE.md 第五階段註記）。
     # ==========================================================
     inference-node1:
         image: local-xapp-inference:latest
@@ -96,235 +81,8 @@ services:
             MODEL_DIR: "/app/models"
         volumes:
             - /tmp:/tmp
-            # 模型持久化：容器重啟後繼續使用已訓練的權重
             - inference_models_node1:/app/models
         command: ["python3", "main.py"]
-        restart: on-failure
-
-    inference-node2:
-        image: local-xapp-inference:latest
-        container_name: inference-node2
-        network_mode: "host"
-        depends_on:
-            mongodb:
-                condition: service_healthy
-        environment:
-            NODE_ID: "2"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - /tmp:/tmp
-            - inference_models_node2:/app/models
-        command: ["python3", "main.py"]
-        restart: on-failure
-
-    inference-node3:
-        image: local-xapp-inference:latest
-        container_name: inference-node3
-        network_mode: "host"
-        depends_on:
-            mongodb:
-                condition: service_healthy
-        environment:
-            NODE_ID: "3"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - /tmp:/tmp
-            - inference_models_node3:/app/models
-        command: ["python3", "main.py"]
-        restart: on-failure
-
-    inference-node4:
-        image: local-xapp-inference:latest
-        container_name: inference-node4
-        network_mode: "host"
-        depends_on:
-            mongodb:
-                condition: service_healthy
-        environment:
-            NODE_ID: "4"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - /tmp:/tmp
-            - inference_models_node4:/app/models
-        command: ["python3", "main.py"]
-        restart: on-failure
-
-    inference-node5:
-        image: local-xapp-inference:latest
-        container_name: inference-node5
-        network_mode: "host"
-        depends_on:
-            mongodb:
-                condition: service_healthy
-        environment:
-            NODE_ID: "5"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - /tmp:/tmp
-            - inference_models_node5:/app/models
-        command: ["python3", "main.py"]
-        restart: on-failure
-
-    # ==========================================================
-    # 0-c. Phase 5：Flower ServerApp/ClientApp 聯邦學習控制平面
-    # （ServerApp/ClientApp + flwr run，取代已 deprecated 的
-    #  fl.server.start_server()/fl.client.start_numpy_client()）
-    # ==========================================================
-    flower-superlink:
-        image: local-xapp-inference:latest
-        container_name: flower-superlink
-        network_mode: "host"
-        restart: on-failure
-        environment:
-            PYTHONPATH: "/app"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            # Global rApp 聚合完成後要把結果廣播寫回全部 5 個節點的 checkpoint，
-            # 所以這裡要掛全部 5 個 volume，而不是只有自己那一份
-            MODEL_DIR_NODE1: "/app/models_node1"
-            MODEL_DIR_NODE2: "/app/models_node2"
-            MODEL_DIR_NODE3: "/app/models_node3"
-            MODEL_DIR_NODE4: "/app/models_node4"
-            MODEL_DIR_NODE5: "/app/models_node5"
-        volumes:
-            - inference_models_node1:/app/models_node1
-            - inference_models_node2:/app/models_node2
-            - inference_models_node3:/app/models_node3
-            - inference_models_node4:/app/models_node4
-            - inference_models_node5:/app/models_node5
-        command: ["flower-superlink", "--insecure"]
-
-    flower-supernode-node1:
-        image: local-xapp-inference:latest
-        container_name: flower-supernode-node1
-        network_mode: "host"
-        depends_on: [flower-superlink]
-        environment:
-            PYTHONPATH: "/app"
-            NODE_ID: "1"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - inference_models_node1:/app/models
-        command:
-            - flower-supernode
-            - --insecure
-            - --superlink=127.0.0.1:9092
-            - --clientappio-api-address=127.0.0.1:9101
-            - --node-config=node-id=1
-        restart: on-failure
-
-    flower-supernode-node2:
-        image: local-xapp-inference:latest
-        container_name: flower-supernode-node2
-        network_mode: "host"
-        depends_on: [flower-superlink]
-        environment:
-            PYTHONPATH: "/app"
-            NODE_ID: "2"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - inference_models_node2:/app/models
-        command:
-            - flower-supernode
-            - --insecure
-            - --superlink=127.0.0.1:9092
-            - --clientappio-api-address=127.0.0.1:9102
-            - --node-config=node-id=2
-        restart: on-failure
-
-    flower-supernode-node3:
-        image: local-xapp-inference:latest
-        container_name: flower-supernode-node3
-        network_mode: "host"
-        depends_on: [flower-superlink]
-        environment:
-            PYTHONPATH: "/app"
-            NODE_ID: "3"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - inference_models_node3:/app/models
-        command:
-            # 現況 Node3 的 xApp/rApp 容器仍在 PC1（見 CLAUDE.md §5 注意事項），
-            # --superlink 用 127.0.0.1；未來真的搬去 PC2 時改成 192.168.88.1:9092
-            - flower-supernode
-            - --insecure
-            - --superlink=127.0.0.1:9092
-            - --clientappio-api-address=127.0.0.1:9103
-            - --node-config=node-id=3
-        restart: on-failure
-
-    flower-supernode-node4:
-        image: local-xapp-inference:latest
-        container_name: flower-supernode-node4
-        network_mode: "host"
-        depends_on: [flower-superlink]
-        environment:
-            PYTHONPATH: "/app"
-            NODE_ID: "4"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - inference_models_node4:/app/models
-        command:
-            - flower-supernode
-            - --insecure
-            - --superlink=127.0.0.1:9092
-            - --clientappio-api-address=127.0.0.1:9104
-            - --node-config=node-id=4
-        restart: on-failure
-
-    flower-supernode-node5:
-        image: local-xapp-inference:latest
-        container_name: flower-supernode-node5
-        network_mode: "host"
-        depends_on: [flower-superlink]
-        environment:
-            PYTHONPATH: "/app"
-            NODE_ID: "5"
-            MONGO_URI: "mongodb://localhost:27017"
-            MONGO_DB: "iab_xapp"
-            MODEL_DIR: "/app/models"
-        volumes:
-            - inference_models_node5:/app/models
-        command:
-            - flower-supernode
-            - --insecure
-            - --superlink=127.0.0.1:9092
-            - --clientappio-api-address=127.0.0.1:9105
-            - --node-config=node-id=5
-        restart: on-failure
-
-    flower-scheduler:
-        image: local-xapp-inference:latest
-        container_name: flower-scheduler
-        network_mode: "host"
-        depends_on:
-            - flower-superlink
-            - flower-supernode-node1
-            - flower-supernode-node2
-            - flower-supernode-node3
-            - flower-supernode-node4
-            - flower-supernode-node5
-        environment:
-            FL_ROUND_INTERVAL_S: "3600"
-            FL_FEDERATION: "local-deployment"
-            FL_APP_PATH: "/app/flower-app"
-        command: ["bash", "flower-app/run_hourly.sh"]
         restart: on-failure
 
     node1-l-xapp:
@@ -348,6 +106,23 @@ services:
             - ./iab/start_xapp_node1.sh:/start_xapp_node1.sh
             - /tmp:/tmp
         command: /bin/bash /start_xapp_node1.sh
+    inference-node2:
+        image: local-xapp-inference:latest
+        container_name: inference-node2
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "2"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node2:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
 
     node2-l-xapp:
         image: custom-oai-runtime:24.04
@@ -370,6 +145,23 @@ services:
             - ./iab/start_xapp_node2.sh:/start_xapp_node2.sh
             - /tmp:/tmp
         command: /bin/bash /start_xapp_node2.sh
+    inference-node3:
+        image: local-xapp-inference:latest
+        container_name: inference-node3
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "3"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node3:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
 
     node3-l-xapp:
         image: custom-oai-runtime:24.04
@@ -384,22 +176,31 @@ services:
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
             NEAR_RT_RIC_IP: 192.168.88.141
-            # -1 = 永久運行，不因 XAPP_DURATION timeout 退出
             XAPP_DURATION: -1
         volumes:
             - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
-            # xApp 執行檔 (編譯自 xapp_node3.c)
             - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node3:/node3_brain
-            # 掛載所有本地編譯的 SM 插件，取代 Docker 版本以確保 ABI 一致
-            # (Docker 的 libkpm_sm.so 等與本地靜態連結的 xApp ABI 不符會導致 SIGSEGV)
             - /usr/local/lib/flexric/:/usr/local/lib/flexric/
-            # 啟動腳本 (安裝 zmq/cjson + 等待 RIC 就緒)
             - ./iab/start_xapp_node3.sh:/start_xapp_node3.sh
-            # /tmp 與宿主機共享，用於 ZMQ IPC socket:
-            #   C xApp     → ipc:///tmp/zmq_node3_inference.ipc (REQ)
-            #   Python 推論伺服器 → 同路徑 (REP)，需掛載同一個 /tmp
             - /tmp:/tmp
         command: /bin/bash /start_xapp_node3.sh
+    inference-node4:
+        image: local-xapp-inference:latest
+        container_name: inference-node4
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "4"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node4:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
 
     node4-l-xapp:
         image: custom-oai-runtime:24.04
@@ -422,6 +223,23 @@ services:
             - ./iab/start_xapp_node4.sh:/start_xapp_node4.sh
             - /tmp:/tmp
         command: /bin/bash /start_xapp_node4.sh
+    inference-node5:
+        image: local-xapp-inference:latest
+        container_name: inference-node5
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "5"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node5:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
 
     node5-l-xapp:
         image: custom-oai-runtime:24.04
@@ -444,6 +262,279 @@ services:
             - ./iab/start_xapp_node5.sh:/start_xapp_node5.sh
             - /tmp:/tmp
         command: /bin/bash /start_xapp_node5.sh
+    inference-node6:
+        image: local-xapp-inference:latest
+        container_name: inference-node6
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "6"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node6:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    node6-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node6
+        privileged: true
+        tty: true
+        restart: on-failure
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node6:/node6_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node6.sh:/start_xapp_node6.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node6.sh
+    inference-node7:
+        image: local-xapp-inference:latest
+        container_name: inference-node7
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "7"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node7:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    node7-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node7
+        privileged: true
+        tty: true
+        restart: on-failure
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node7:/node7_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node7.sh:/start_xapp_node7.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node7.sh
+    inference-node8:
+        image: local-xapp-inference:latest
+        container_name: inference-node8
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "8"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node8:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    node8-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node8
+        privileged: true
+        tty: true
+        restart: on-failure
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node8:/node8_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node8.sh:/start_xapp_node8.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node8.sh
+    inference-node9:
+        image: local-xapp-inference:latest
+        container_name: inference-node9
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "9"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node9:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    node9-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node9
+        privileged: true
+        tty: true
+        restart: on-failure
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node9:/node9_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node9.sh:/start_xapp_node9.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node9.sh
+    inference-node10:
+        image: local-xapp-inference:latest
+        container_name: inference-node10
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "10"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node10:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    node10-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node10
+        privileged: true
+        tty: true
+        restart: on-failure
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node10:/node10_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node10.sh:/start_xapp_node10.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node10.sh
+    inference-node11:
+        image: local-xapp-inference:latest
+        container_name: inference-node11
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "11"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node11:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    node11-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node11
+        privileged: true
+        tty: true
+        restart: on-failure
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node11:/node11_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node11.sh:/start_xapp_node11.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node11.sh
+    inference-node12:
+        image: local-xapp-inference:latest
+        container_name: inference-node12
+        network_mode: "host"
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            NODE_ID: "12"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - /tmp:/tmp
+            - inference_models_node12:/app/models
+        command: ["python3", "main.py"]
+        restart: on-failure
+
+    node12-l-xapp:
+        image: custom-oai-runtime:24.04
+        container_name: xapp-node12
+        privileged: true
+        tty: true
+        restart: on-failure
+        depends_on:
+            oai-flexric:
+                condition: service_healthy
+        network_mode: "host"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/flexric
+            NEAR_RT_RIC_IP: 192.168.88.141
+            XAPP_DURATION: -1
+        volumes:
+            - ./conf/flexric.conf:/usr/local/etc/flexric/flexric.conf
+            - /home/lindor/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/ctrl/xapp_node12:/node12_brain
+            - /usr/local/lib/flexric/:/usr/local/lib/flexric/
+            - ./iab/start_xapp_node12.sh:/start_xapp_node12.sh
+            - /tmp:/tmp
+        command: /bin/bash /start_xapp_node12.sh
 
     # ==========================================================
     # 1. 5G Core Network (AMF, SMF, UPF, MySQL)
@@ -520,7 +611,7 @@ services:
                 ipv4_address: 192.168.72.135
 
     # ==========================================================
-    # 2. IAB Donor (Root Node)
+    # 2. IAB Donor (Root Node) — 4 個 relay node (PC2/PC3) 皆跨主機連到這裡
     # ==========================================================
     rfsim5g-donor-cu:
         image: custom-oai-runtime:24.04
@@ -537,7 +628,6 @@ services:
             - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
-            # [修正] 插件從宿主機安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
         command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --log_config.global_log_options level,nocolor,time
@@ -559,102 +649,12 @@ services:
             - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
-            # [修正] 插件從宿主機安裝目錄掛載
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
         ports:
             - "4043:4043/udp"
             - "4043:4043/tcp"
         command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --log_config.global_log_options level,nocolor,time
-
-    # ==========================================================
-    # 3. Layer 1: IAB Node 1 (Aggregator Left)
-    # ==========================================================
-    rfsim5g-iab-mt:
-        image: custom-oai-runtime:24.04
-        container_name: rfsim5g-iab-mt
-        privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
-        depends_on: [rfsim5g-donor-du]
-        networks:
-            public_net:
-                ipv4_address: 192.168.88.150
-        devices:
-             - /dev/net/tun:/dev/net/tun
-        environment:
-            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
-        volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
-             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
-             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        ports:
-            - "4044:4044/udp"
-            - "4044:4044/tcp"
-            - "127.0.0.1:9089:9089"   # Node 1 DU telnetsrv (chanmod control)
-        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
-
-    rfsim5g-iab-du:
-        image: custom-oai-runtime:24.04
-        container_name: rfsim5g-iab-du
-        privileged: true
-        depends_on: [rfsim5g-iab-mt]
-        network_mode: "service:rfsim5g-iab-mt"
-        environment:
-            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-        volumes:
-            - ./conf/iab_du.conf:/opt/oai-gnb/etc/gnb.conf
-            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
-            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
-            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
-            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
-            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
-            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4044 --telnetsrv --log_config.global_log_options level,nocolor,time
-
-    # ==========================================================
-    # 4. Layer 1: IAB Node 2 (Aggregator Right)
-    # ==========================================================
-    rfsim5g-iab-mt-2:
-        image: custom-oai-runtime:24.04
-        container_name: rfsim5g-iab-mt-2
-        privileged: true
-        cap_add: [NET_ADMIN, NET_RAW]
-        networks:
-            public_net:
-                ipv4_address: 192.168.88.152
-        devices:
-             - /dev/net/tun:/dev/net/tun
-        environment:
-            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
-        volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf  
-             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
-             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        ports:
-            - "4045:4045/udp"
-            - "4045:4045/tcp"
-            - "127.0.0.1:9090:9090"   # Node 2 DU telnetsrv (chanmod control)
-        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --log_config.global_log_options level,nocolor,time
-
-    rfsim5g-iab-du-2:
-        image: custom-oai-runtime:24.04
-        container_name: rfsim5g-iab-du-2
-        privileged: true
-        depends_on: [rfsim5g-iab-mt-2]
-        network_mode: "service:rfsim5g-iab-mt-2"
-        environment:
-            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-        volumes:
-            - ./conf/iab_du_2.conf:/opt/oai-gnb/etc/gnb.conf
-            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
-            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
-            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
-            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
-            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
-            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4045 --telnetsrv --log_config.global_log_options level,nocolor,time
 
 networks:
     public_net:
@@ -675,7 +675,6 @@ networks:
 volumes:
     mongo_data:
         name: iab-xapp-mongo-data
-    # DRL 模型持久化 volume：各節點獨立儲存，容器重啟後繼續訓練
     inference_models_node1:
         name: iab-xapp-model-node1
     inference_models_node2:
@@ -686,3 +685,17 @@ volumes:
         name: iab-xapp-model-node4
     inference_models_node5:
         name: iab-xapp-model-node5
+    inference_models_node6:
+        name: iab-xapp-model-node6
+    inference_models_node7:
+        name: iab-xapp-model-node7
+    inference_models_node8:
+        name: iab-xapp-model-node8
+    inference_models_node9:
+        name: iab-xapp-model-node9
+    inference_models_node10:
+        name: iab-xapp-model-node10
+    inference_models_node11:
+        name: iab-xapp-model-node11
+    inference_models_node12:
+        name: iab-xapp-model-node12

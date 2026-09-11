@@ -1,0 +1,473 @@
+version: '3.8'
+
+services:
+    # ========================================== 
+    # IAB Node 1 (relay) — 直連 Donor (跨主機 macvlan)
+    # ==========================================
+    rfsim5g-iab-mt-1:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-mt-1
+        privileged: true
+        cap_add: [NET_ADMIN, NET_RAW]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.150
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        ports:
+            - "4044:4044/udp"
+            - "4044:4044/tcp"
+            - "127.0.0.1:9089:9089"   # Node 1 DU telnetsrv (chanmod control)
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --log_config.global_log_options level,nocolor,time
+
+    rfsim5g-iab-du-1:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-du-1
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-1]
+        network_mode: "service:rfsim5g-iab-mt-1"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+        volumes:
+            - ./conf/iab_du_node1.conf:/opt/oai-gnb/etc/gnb.conf
+            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4044 --telnetsrv --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # IAB Node 2 (relay) — 直連 Donor (跨主機 macvlan)
+    # ==========================================
+    rfsim5g-iab-mt-2:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-mt-2
+        privileged: true
+        cap_add: [NET_ADMIN, NET_RAW]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.151
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        ports:
+            - "4045:4045/udp"
+            - "4045:4045/tcp"
+            - "127.0.0.1:9090:9090"   # Node 2 DU telnetsrv (chanmod control)
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --log_config.global_log_options level,nocolor,time
+
+    rfsim5g-iab-du-2:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-du-2
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-2]
+        network_mode: "service:rfsim5g-iab-mt-2"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+        volumes:
+            - ./conf/iab_du_node2.conf:/opt/oai-gnb/etc/gnb.conf
+            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4045 --telnetsrv --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # IAB Node 5 (access) — 子節點掛在 relay Node 1 底下
+    # ==========================================
+    rfsim5g-iab-mt-5:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-mt-5
+        privileged: true
+        cap_add: [NET_ADMIN, NET_RAW]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.160
+            iab_internal_net:
+                ipv4_address: 192.168.74.10
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001104 --rfsimulator.serveraddr 192.168.88.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: >
+            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001104 --rfsimulator.serveraddr 192.168.88.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time"
+
+    rfsim5g-iab-du-5:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-du-5
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-5]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.161
+            iab_internal_net:
+                ipv4_address: 192.168.74.20
+        ports:
+            - "127.0.0.1:9093:9093"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+        volumes:
+            - ./conf/iab_du_node5.conf:/opt/oai-gnb/etc/gnb.conf
+            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --telnetsrv --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # IAB Node 6 (access) — 子節點掛在 relay Node 1 底下
+    # ==========================================
+    rfsim5g-iab-mt-6:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-mt-6
+        privileged: true
+        cap_add: [NET_ADMIN, NET_RAW]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.162
+            iab_internal_net:
+                ipv4_address: 192.168.74.11
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001105 --rfsimulator.serveraddr 192.168.88.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: >
+            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001105 --rfsimulator.serveraddr 192.168.88.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time"
+
+    rfsim5g-iab-du-6:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-du-6
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-6]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.163
+            iab_internal_net:
+                ipv4_address: 192.168.74.21
+        ports:
+            - "127.0.0.1:9094:9094"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+        volumes:
+            - ./conf/iab_du_node6.conf:/opt/oai-gnb/etc/gnb.conf
+            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4049 --telnetsrv --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # IAB Node 7 (access) — 子節點掛在 relay Node 2 底下
+    # ==========================================
+    rfsim5g-iab-mt-7:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-mt-7
+        privileged: true
+        cap_add: [NET_ADMIN, NET_RAW]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.164
+            iab_internal_net:
+                ipv4_address: 192.168.74.12
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001106 --rfsimulator.serveraddr 192.168.88.151 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: >
+            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001106 --rfsimulator.serveraddr 192.168.88.151 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time"
+
+    rfsim5g-iab-du-7:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-du-7
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-7]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.165
+            iab_internal_net:
+                ipv4_address: 192.168.74.22
+        ports:
+            - "127.0.0.1:9095:9095"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+        volumes:
+            - ./conf/iab_du_node7.conf:/opt/oai-gnb/etc/gnb.conf
+            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4050 --telnetsrv --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # IAB Node 8 (access) — 子節點掛在 relay Node 2 底下
+    # ==========================================
+    rfsim5g-iab-mt-8:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-mt-8
+        privileged: true
+        cap_add: [NET_ADMIN, NET_RAW]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.166
+            iab_internal_net:
+                ipv4_address: 192.168.74.13
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001107 --rfsimulator.serveraddr 192.168.88.151 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: >
+            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001107 --rfsimulator.serveraddr 192.168.88.151 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time"
+
+    rfsim5g-iab-du-8:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-iab-du-8
+        privileged: true
+        depends_on: [rfsim5g-iab-mt-8]
+        networks:
+            macvlan_net:
+                ipv4_address: 192.168.88.167
+            iab_internal_net:
+                ipv4_address: 192.168.74.23
+        ports:
+            - "127.0.0.1:9096:9096"
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+        volumes:
+            - ./conf/iab_du_node8.conf:/opt/oai-gnb/etc/gnb.conf
+            - ./conf/flexric.conf:/opt/oai-gnb/etc/flexric.conf
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+            - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
+            - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
+            - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
+        command: /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4051 --telnetsrv --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # UE1 -> Node5 (access)
+    # ==========================================
+    rfsim5g-end-ue-1:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-1
+        restart: on-failure
+        privileged: true
+        networks:
+            - iab_internal_net
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001200 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001200 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # UE2 -> Node5 (access)
+    # ==========================================
+    rfsim5g-end-ue-2:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-2
+        restart: on-failure
+        privileged: true
+        networks:
+            - iab_internal_net
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001201 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001201 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # UE3 -> Node6 (access)
+    # ==========================================
+    rfsim5g-end-ue-3:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-3
+        restart: on-failure
+        privileged: true
+        networks:
+            - iab_internal_net
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001202 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001202 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # UE4 -> Node6 (access)
+    # ==========================================
+    rfsim5g-end-ue-4:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-4
+        restart: on-failure
+        privileged: true
+        networks:
+            - iab_internal_net
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001203 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001203 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # UE5 -> Node7 (access)
+    # ==========================================
+    rfsim5g-end-ue-5:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-5
+        restart: on-failure
+        privileged: true
+        networks:
+            - iab_internal_net
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001204 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001204 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # UE6 -> Node7 (access)
+    # ==========================================
+    rfsim5g-end-ue-6:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-6
+        restart: on-failure
+        privileged: true
+        networks:
+            - iab_internal_net
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001205 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001205 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # UE7 -> Node8 (access)
+    # ==========================================
+    rfsim5g-end-ue-7:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-7
+        restart: on-failure
+        privileged: true
+        networks:
+            - iab_internal_net
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001206 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001206 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time
+
+    # ========================================== 
+    # UE8 -> Node8 (access)
+    # ==========================================
+    rfsim5g-end-ue-8:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-8
+        restart: on-failure
+        privileged: true
+        networks:
+            - iab_internal_net
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001207 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001207 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time
+
+# ==========================================
+# 網路定義區
+# ==========================================
+networks:
+    macvlan_net:
+        driver: macvlan
+        driver_opts:
+            parent: enxc84d44350008
+        ipam:
+            config:
+                - subnet: 192.168.88.0/24
+                  gateway: 192.168.88.1
+
+    iab_internal_net:
+        driver: bridge
+        ipam:
+            config:
+                - subnet: 192.168.74.0/24

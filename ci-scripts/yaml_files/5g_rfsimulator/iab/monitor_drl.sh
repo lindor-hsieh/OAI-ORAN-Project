@@ -122,9 +122,9 @@ while true; do
     ZMQ=$(check_zmq)
 
     if [ "$E2" -ge 6 ] 2>/dev/null; then
-        E2_STR="${GREEN}${E2}/6  ✓${NC}"
+        E2_STR="${GREEN}${E2}/13  ✓${NC}"
     else
-        E2_STR="${RED}${E2}/6  ✗ (等待中)${NC}"
+        E2_STR="${RED}${E2}/13  ✗ (等待中)${NC}"
     fi
 
     if [ "$ZMQ" -ge 5 ] 2>/dev/null; then

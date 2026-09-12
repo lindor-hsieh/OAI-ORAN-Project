@@ -83,6 +83,23 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
      * **Non-RT Fine-tuning（秒/分鐘級）**：從 MongoDB 讀取歷史資料，執行本地模型微調（`inference_server.py` 背景訓練執行緒 `_train_worker`，每 60 秒一輪）。
 3. **Global xApp / Global rApp（Flower Server）**：待針對 12-node 拓樸重建，見第 3 節。
 
+### 與 3GPP IAB / O-RAN 標準規格的差異（誠實揭露，供論文方法論限制章節引用）
+
+這個測試平台**不是**完整落地 3GPP IAB 規格與完整 O-RAN RIC 階層的系統，而是「用標準相容的底層元件（OAI 的 3GPP-compliant PHY/MAC/RRC/NAS 協議棧、FlexRIC 這個符合 O-RAN E2AP 規格的 Near-RT RIC 框架）搭建、但在 IAB backhaul 資源共享機制與 RIC 階層上做了論文範疇內合理簡化」的研究平台。差異點如下：
+
+| 項目 | 標準規範怎麼定義 | 這個測試平台實際做法 |
+|---|---|---|
+| Backhaul 資源共享 | 3GPP TS 38.300 / 38.874 定義 **BAP 層**（Backhaul Adaptation Protocol），負責跳點路由、backhaul RLC channel 對應、QoS mapping | **完全沒有 BAP 層**——MT+DU 串接模式，靠 Linux IP Routing 透傳（見第 1 節），不是標準的 backhaul bearer 機制 |
+| H/S/NA 資源分時 | 標準定義 Hard/Soft/Not-Available 資源，DU 跟 MT 在**真正的時域/頻域**上互斥使用資源 | 「Backhaul-aware 動態 PRB 預算」機制（第 3 節）是**容量代理**（依 MT 忙碌程度縮放 DU 可用 PRB 池的大小），不是真正的雙工資源劃分 |
+| 多跳無線資源競爭 | 真實 IAB 多跳共用同一段頻譜，節點之間會互相干擾、搶資源 | 每個 Node 各自跑獨立的 rfsimulator 載波，彼此完全不搶頻譜——這點對「模擬多跳拓樸的路由/backhaul 聚合排程問題」是合理簡化，但不對應真實電磁環境下的資源競爭 |
+| O-RAN RIC 完整架構 | Non-RT RIC + A1 介面 + Near-RT RIC + SMO | **只有 Near-RT RIC**（FlexRIC + E2 + xApp），沒有 A1 介面、沒有 Non-RT RIC、沒有 SMO；「Global xApp/Global rApp」的 FedAvg/Cluster FL 設計是這篇論文自訂的機制，不是 O-RAN 標準定義的元件 |
+
+**單一 UE、無競爭情況下的理論吞吐量上限**（供對照實測數據用）：以本平台目前的 PHY 參數代入 3GPP TS 38.306 peak data rate 公式——106 PRB @ 30kHz SCS（`donor_du.conf`：`dl_carrierBandwidth=106`, `subcarrierSpacing=1`，等效 40MHz）、SISO 1 層、256QAM（Qm=8）、R_max=948/1024、FR1 DL overhead=0.14：
+
+$$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \times 12}{T_s^\mu} \times (1-OH) \approx 227\ \text{Mbps（下行，MAC 層理論峰值）}$$
+
+這是規格書定義的絕對上限（假設每個 RE 都排到最高 MCS、最大編碼率），**不是**實際 iperf3 會量到的數字。本平台用 rfsimulator（軟體模擬，非真實 RF，受 CPU 排程效率影響）+ 多跳 IP relay（每一跳都有處理開銷），Part 4 機制驗證量到的單一 UE（3-hop，旁邊 UE 閒置）實測吞吐量是 **43.8 Mbps**，比理論峰值低了一個數量級，落差主要來自「軟體模擬」與「多跳開銷」兩點，這是 IAB 多跳架構本身要付出的代價之一，不代表系統有問題。
+
 ---
 
 ## 3. 標準開發流程
@@ -104,7 +121,7 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
 
 | Stage | 策略 | Global 層（配額協調/FL 聚合） | Local 層（單節點 DRL） | 狀態 |
 |---|---|---|---|---|
-| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **待重測**（2026-09-12 舊數據見 `experiment_results/PF.md`：併發 JFI=0.2619、單一 UE 平均吞吐量約 6.72 Mbps——**這份數據是「backhaul-aware 動態 PRB 預算機制」上線前**量測的，機制上線後 PF 本身的行為會改變，必須重測才能當作後續 Stage 的比較基準） |
+| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**（2026-09-12 重測，見 `experiment_results/PF.md`：併發 JFI=0.2584、17 UE 平均吞吐量約 5.26 Mbps、平均 RTT 329.10 ms，15 分鐘全程三主機零崩潰——**這份數據是「backhaul-aware 動態 PRB 預算機制」上線後**的第一份正式基準，是 Stage 2~5 的比較對象） |
 | 2 | avg FL + 最基礎 DRL | Global xApp+Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | 未開始 |
 | 3 | cluster FL + 最基礎 DRL | Global xApp+Global rApp：Cluster FL，依角色分兩群聚合：relay cluster（Node1~4）、access cluster（Node5~12）各自獨立 FedAvg | Local xApp+Local rApp：最基礎 DRL（同 Stage 2，模型不變，只有 Global 聚合方式不同） | 未開始 |
 | 4 | 自訂 FL + 最基礎 DRL | Global xApp+Global rApp：自訂聚合演算法（介面待設計） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2/3） | 未開始 |
@@ -135,10 +152,7 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
 
 **各開發階段需要注意的事**：
 
-* **Stage 1（PF baseline）**：
-  - 這個機制上線後，OAI 需要在**全部三台主機重新編譯**（`build_oai`），Stage 1 baseline **必須重新量測**——2026-09-12 量出來的 `PF.md` 舊數據是機制上線前的結果，不能拿來跟 Stage 2 以後比較。
-  - 因為改動的是 MAC 排程器核心邏輯、影響全部 12 個節點，改完要先做回歸測試（跑一輪確認 13/13 E2、17/17 UE 附著、基本 iperf3 吞吐量正常），確認沒有把既有功能改壞，再重新量測 PF baseline。
-  - PF 這邊不需要額外開發（它本來就不讀任何自訂 state），縮小可用 PRB 池這件事對 PF 排程器是透明的。
+* **Stage 1（PF baseline）**：**已完成**（2026-09-12）。回歸測試（13/13 E2、17/17 UE 附著、iperf3 sanity check）與正式 15 分鐘量測皆已通過，過程中額外發現並根除三個 root cause bug（詳見 HISTORY.md 對應日期條目）：telnetsrv 的 `recv()` 錯誤值處理不完整導致的 buffer overflow 崩潰、CU UID 分配器耗盡時的整數溢位崩潰、CU 對同一 DU ID 的 F1 association 記錄在異常斷線後永久不清除導致的連線永久拒絕。三個修復皆已編譯部署到三主機，並通過完整 15 分鐘、17 UE、三主機同時動態流量+路徑損耗量測的零崩潰驗證。PF 排程器本身不需要額外開發（它本來就不讀任何自訂 state），縮小可用 PRB 池這件事對 PF 排程器是透明的。
 
 * **Stage 2（avg FL + 最基礎 DRL）**：
   - 這是第一個要接上 Global xApp/Global rApp 的階段，`global_xapp.py`／`global_xapp_bridge.py`／`inference/flower-app/` 都要先針對 12-node 拓樸重建（目前是舊 5-node 版本，尚未重建）。

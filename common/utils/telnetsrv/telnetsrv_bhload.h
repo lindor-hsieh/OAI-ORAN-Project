@@ -22,7 +22,7 @@
 #ifndef TELNETSRV_BHLOAD_H
 #define TELNETSRV_BHLOAD_H
 
-/* [Backhaul-aware PRB budget] 註冊 "bhload get" telnet 命令，只能在 nr-uesoftmodem
+/* [Backhaul-aware PRB budget] 註冊 "bhload query" telnet 命令，只能在 nr-uesoftmodem
  * (MT/UE) process 呼叫，不能在 nr-softmodem (DU/gNB) process 呼叫。 */
 void init_bhload_telnetcmd(void);
 

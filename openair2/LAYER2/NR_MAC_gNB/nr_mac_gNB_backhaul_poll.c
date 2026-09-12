@@ -25,7 +25,7 @@
  * relay/access 節點的 DU（本 process）跟自己的 MT 共用同一個 Docker network
  * namespace，兩者是不同的 process（nr-softmodem vs nr-uesoftmodem）。這支執行緒
  * 定期連到 127.0.0.1:<mt_telnet_port>（MT 上的 telnetsrv，見 telnetsrv_bhload.c）,
- * 送 "bhload get" 取得 MT 累積的 DL/UL RB 使用量，換算成忙碌比例後寫入
+ * 送 "bhload query" 取得 MT 累積的 DL/UL RB 使用量，換算成忙碌比例後寫入
  * mac->backhaul_prb_ratio（1.0=無約束, 0.0=完全占滿），供 nr_dlsch_preprocessor()
  * 縮小這次排程週期的可用 PRB 池（gNB_scheduler_dlsch.c）。
  *
@@ -67,7 +67,7 @@
 // 重新觸發 read_history()/write_history()，機率只會隨輪詢次數累積趨近於 1。
 // [Race condition 修復 2026-09-12 第二版，根本修法] 改成整個 poll thread 生命週期
 // 只在第一次成功時建立「一條長連線」，之後每次輪詢都在同一條連線上重複送
-// "bhload get"，不再每輪重新 connect/close——這樣 read_history() 等函式整個
+// "bhload query"，不再每輪重新 connect/close——這樣 read_history() 等函式整個
 // process 生命週期只會在「連線建立那一刻」被呼叫一次（分析同一個 race 的觸發條件：
 // 每一次新連線 = 一次觸發機會，這版把觸發機會從「每 3 秒一次」降到「幾乎只在
 // process 啟動或連線異常斷線後重連時發生一次」，數量級對齊、甚至優於既有
@@ -120,7 +120,7 @@ static int bh_open_connection(const char *ip, int port)
   return sock;
 }
 
-// 在既有連線上送一次 "bhload get" 查詢。回傳 -1 代表這條連線已經壞掉（送失敗、
+// 在既有連線上送一次 "bhload query" 查詢。回傳 -1 代表這條連線已經壞掉（送失敗、
 // 對面關閉、逾時都算），呼叫端要把 sock 關掉、下一輪重新 bh_open_connection()。
 //
 // [2026-09-12 長連線 bug 修復] 第一版長連線改法只在 bh_open_connection() 做一次

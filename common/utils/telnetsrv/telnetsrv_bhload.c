@@ -20,7 +20,7 @@
  */
 
 /*
- * [Backhaul-aware PRB budget] MT 端 telnetsrv 模組："bhload get"
+ * [Backhaul-aware PRB budget] MT 端 telnetsrv 模組："bhload query"
  *
  * 只在 nr-uesoftmodem（MT/UE）process 裡註冊，暴露自己的累積 DL/UL RB 使用量
  * （NR_UE_MAC_INST_t.stats.dl/ul.rb_size），給同一個 container/netns 內、

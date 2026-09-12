@@ -25,7 +25,7 @@
 #include "nr_mac_gNB.h"
 
 /* [Backhaul-aware PRB budget] 啟動一個獨立輪詢執行緒，定期連到本節點自己 MT 的
- * telnetsrv port（"bhload get"），推算 backhaul 忙碌程度並寫入 mac->backhaul_prb_ratio。
+ * telnetsrv port（"bhload query"），推算 backhaul 忙碌程度並寫入 mac->backhaul_prb_ratio。
  * mt_telnet_port <= 0 時（例如 Donor 沒有 MT）直接不啟動，ratio 恆為初始值 1.0（無約束）。
  * mt_telnet_addr：relay 節點 MT/DU 共用 netns 用 "127.0.0.1"；access 節點 MT/DU 是
  * 分開的 netns（透過 iab_internal_net bridge 連接），要填 MT 在該 bridge 上的 IP。

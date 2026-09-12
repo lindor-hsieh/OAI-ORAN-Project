@@ -37,7 +37,15 @@
 #include "openair2/LAYER2/NR_MAC_UE/mac_proto.h"
 #include "openair2/LAYER2/NR_MAC_UE/mac_defs.h"
 
-static int bhload_get_cmd(char *buff, int debug, telnet_printfunc_t prnt)
+// [2026-09-12 修復] 命令原本叫 "get"，撞上 telnetsrv.c::process_command() 保留給
+// 「模組變數存取語法」的關鍵字（"get"/"set"，見 setgetvar()）——process_command() 對
+// 子命令字面等於 "get"/"set" 一律優先當成變數存取處理，根本不會派發到這裡註冊的命令
+// 函式；因為 bhload 模組沒有任何變數（見下方 bhload_vardef 是空的），呼叫
+// setgetvar() 時傳入的 params 是 NULL（"bhload get" 沒有多帶變數名稱），
+// setgetvar() 內部 sscanf(NULL, ...) 是未定義行為，實測會直接 SIGSEGV。
+// 改名成 "query" 徹底避開這個保留字碰撞（同時已在 telnetsrv.c::setgetvar() 補上
+// NULL 防呆，屬於共用程式碼的獨立修復，避免以後其他模組再踩到同一個坑）。
+static int bhload_query_cmd(char *buff, int debug, telnet_printfunc_t prnt)
 {
   NR_UE_MAC_INST_t *mac = get_mac_inst(0);
   if (mac == NULL) {
@@ -51,7 +59,7 @@ static int bhload_get_cmd(char *buff, int debug, telnet_printfunc_t prnt)
 }
 
 static telnetshell_cmddef_t bhload_cmdarray[] = {
-    {"get", "", bhload_get_cmd, {NULL}, TELNETSRV_CMDFLAG_TELNETONLY, NULL},
+    {"query", "", bhload_query_cmd, {NULL}, TELNETSRV_CMDFLAG_TELNETONLY, NULL},
     {"", "", NULL, {NULL}, 0, NULL},
 };
 

@@ -341,3 +341,78 @@ docker exec -u 0 <du容器> ip route add 192.168.88.1 via <該主機internal bri
 
 * **坑5（access DU 缺到 CU 的 host route）其實不是腳本的 bug**。`start_iab_pc2.sh`（第174行）、`start_iab_pc3.sh`（第151行）在正常流程裡，每個 access DU 容器建立後本來就會執行 `docker exec -u 0 $DU_NAME ip route replace $SERVER_IP via ...`，內容跟這次手動補的路由完全一樣。這次會缺路由，是因為 Node5/6/9/12 在正常腳本流程裡先被「等 parent relay 逾時（120s）」邏輯整個跳過（腳本根本沒執行到這一步），事後用 `docker compose up -d --no-deps` 手動把它們補起來時，繞過了腳本接在容器建立後面的這段路由設定。**結論：只要腳本能完整跑完、沒有中途逾時跳過某個節點，這條路由就會自動補上，不會重演**；只有在「腳本判定逾時跳過→事後用非腳本方式手動補容器」這個特定組合下才會重現，往後若再遇到這種「等 parent 逾時被跳過」的節點，記得比照腳本第174/151行的邏輯手動補路由，而不是只補容器本身。
 * **坑4（`~` 展開成錯誤帳號 home 目錄）是真的腳本 bug，已直接修掉**。確認過 `mcalab` 帳號**互動式登入**的 `$HOME` 本來就是 `/home/mcalab`（`.bashrc`/`.profile` 都沒有覆寫成 `/home/lindor`），代表這不是「我用非互動 SSH 呼叫才會踩到」的特例，而是任何人用 `mcalab` 身份執行 `run_local_pc2.sh`（不管是互動登入後執行，還是透過 SSH 一次性指令）都會 100% 踩到。已直接把 `run_local_pc2.sh` 的 `COMPOSE_DIR=~/openairinterface5g/...` 改成寫死絕對路徑 `/home/lindor/openairinterface5g/...`，並把 `cd`／`bash iab/start_iab_pc2.sh` 兩步加上失敗就 `exit 1`（避免像這次一樣，實際執行失敗卻因為收尾的 `ok "..."` 沒檢查前面結果而看起來像成功），修好後已用 `rsync` 同步到 PC2。**PC1／PC3 的 `run_local_pc1.sh`／`run_local_pc3.sh` 用的都是 `lindor` 帳號，`~` 本來就對得上，沒有這個問題，不需要改。**
+
+---
+
+## 2026-09-12（續）— Stage 1 重測後排查 UE17：歷史「SYN-SENT 永遠卡住」bug 已不復現，取而代之的是 backhaul-aware PRB 機制下的嚴重 RTT 劣化
+
+Stage 1 PF baseline 重新量測（見 `experiment_results/PF.md`）產出後，發現 UE17 的數據明顯異常：平均吞吐量 0.80 Mbps、平均 RTT 639.40ms，是全部 17 個 UE 裡最差的一個，卻只是 2-hop（UE17 直接掛在 Node4 的 DU，不經過 access 層），理論上應該比大多數 3-hop 的 UE 表現更好。這個反常結果讓人聯想到專案更早期就記錄過、當時未徹底解決的「UE17 TCP 連線卡在 SYN-SENT 永遠不動」的舊 bug，因此專門花時間確認這個舊 bug 是否復發。
+
+**排查方法**：對 UE17（`rfsim5g-end-ue-17`，tunnel IP `12.1.1.21`）連續多次做 ICMP ping + iperf3 TCP 連線測試，同時用 `ss -tn` 每 0.5 秒連續快照觀察連線狀態演變，並在 `rfsim5g-oai-ext-dn` 端用 `tcpdump` 直接抓包驗證封包層級的行為。
+
+**發現一：ICMP RTT 嚴重劣化**：`ping -c 3` 量到 min/avg/max = 1285.892 / 1787.288 / 2244.517 ms，比 PF.md 記錄的平均 639ms 還要糟上許多，且 ping 輸出出現 `pipe 2` 標記（代表因為 RTT 遠超過 1 秒的送包間隔，同時有多個 ICMP echo request 在途中），本身就是嚴重延遲的訊號。
+
+**發現二：TCP 連線最終都會成功建立，不是永久卡死**：連續 `ss -tn` 快照顯示，一次新的 iperf3 連線嘗試在 `SYN-SENT` 狀態停留約 1.5~2 秒後，**自行轉為 `ESTAB`**，且 Send-Q 從 37 bytes 持續增長到 127 bytes，證實真的有應用層資料在傳送，不是卡住不動。`tcpdump` 在 ext-dn 端也直接證實同一件事：抓到一次完整的三向交握（`[S]` → `[S.]` → `[.]`），中間有一次 SYN 因為前一次 SYN-ACK 疑似遺失/延遲而重傳（間隔約 0.86 秒），整個交握耗時約 1.4 秒才完成，隨後立刻有 PSH 資料封包成功雙向交換。
+
+**結論——這不是歷史 bug 復發，是一個性質不同的新問題**：
+- 歷史記載的「SYN-SENT 永遠卡住」是連線**完全建立不起來**；這次觀察到的是連線**建立得異常慢（1.5~2 秒的交握時間，比正常網路環境慢 1~2 個數量級），但最終一定會成功**。先前初步測試看到的「iperf3 顯示 0.00 bits/sec」、「抓到 SYN-SENT 快照」，比對之後判斷只是**短時間測試（`timeout 3`/`timeout 5`）在極端延遲下來不及跑完交握就先被計時器砍掉**、或是**運氣不好剛好在交握中途按下快門**，並非連線邏輯真的壞掉。
+- 根本原因指向 **Node4（PC2）的排程資源壅塞**，而非軟體 bug：Node4 這個 relay 節點的 DU 同時要服務三份負載——UE17 直連、中繼 Node11（PC3 access，UE13/14）、中繼 Node12（PC3 access，UE15/16）——三方共用同一個 DU 排程資源池，再加上 backhaul-aware 動態 PRB 預算機制（CLAUDE.md 第 3 節）會依 Node4 自己 MT 的 backhaul 忙碌程度動態縮小其 DU 可用的 PRB 池。UE17 雖然只有 2-hop，但這個特殊的「直連 UE + 雙重跨主機中繼」拓樸位置，讓 Node4 承受的排程壓力反而比許多 3-hop 的 access 節點更重，這可以合理解釋為什麼 UE17 的 RTT/吞吐量表現全場最差。
+- 嘗試進一步用 telnet 直接查詢 Node4 當下的 `backhaul_prb_ratio`（機制的核心即時指標）做因果驗證，但容器內缺 `nc` 指令未能查成，這部分留待未來需要時再補一次驗證（例如改用 `docker exec` 內建的 bash `/dev/tcp` 或改善除錯腳本，先裝好 `nc`／`socat`）。
+
+**教訓與後續**：這個發現不需要任何程式碼修復——不是 bug，是 backhaul-aware PRB 機制生效後、UE17 特殊拓撲位置（直連 relay 且該 relay 同時扛兩個跨主機中繼負載）造成的真實資源競爭效應，跟 CLAUDE.md 第 2 節「多跳鏈路自我節流」的理論推導方向一致。若未來要緩解，方向是「調整 Node4 的資源分配權重」或「重新評估 UE17 的拓撲位置」，而非除錯連線邏輯本身；Stage 2 以後若這個現象持續存在，可以做為評估 DRL/FL 排程策略是否能改善「單一節點多重負載擁塞」情境的一個天然測試案例。
+
+---
+
+## 2026-09-13 — `bhload` 機制其實是靜默 no-op、真正根因是 telnetsrv 保留字命名衝突（`"get"`/`"set"` 導致 SIGSEGV），並非環境不穩或隨機競爭
+
+延續 UE17 排查時「容器內缺 `nc`，未能直接查詢 `backhaul_prb_ratio`」這個未竟項目，使用者要求「現在就查」，因而牽出這次整個 session 裡分量最重、耗時最久的一次根因排查。
+
+### 發現一：`bhload get` 從一開始就從未真正成功過
+
+用 bash `/dev/tcp` 直接對 Node4、Node1 的 MT telnet port 手動送 `bhload get`，兩個節點都回傳 telnetsrv 的通用「未知命令」錯誤，而不是預期的 `dl_rb_cum ... ul_rb_cum ...` 數字。追查發現：`init_bhload_telnetcmd()`（負責把 `bhload` 命令註冊進 telnetsrv）原本寫在 `radio/rfsimulator/simulator.c` 的 `chanmod` 選項初始化分支裡，隱含假設「MT process 自己的 rfsimulator options 也會設 chanmod」——但實際上 `chanmod` 是設在 **DU 端**的 conf（`iab_du_nodeN.conf` 的 `rfsimulator.options=("chanmod")`），MT 端的 `nrue.uicc.conf` 從未設定這個選項，這個分支在任何 MT process 上都從未被進入過，`bhload` 命令從未在任何 MT 上真正註冊成功。連先前 `backhaul_mechanism_verification.md` 記錄的「MT 端 telnetsrv 命令正確回應」也是誤判——當時只確認了連線建立、telnetsrv log 印出 `Command received`，沒有進一步檢查回傳內容是不是真的有效數據。
+
+**第一次修復**：把 `init_bhload_telnetcmd()` 移到迴圈外、只依 `IS_SOFTMODEM_GNB` 判斷是否為 MT/UE process，不再依賴 chanmod 是否設定。三主機重新編譯部署後，`bhload get` 終於能被 telnetsrv 正確 dispatch 到——但緊接著就撞上發現二。
+
+### 發現二：Node2 的 MT 反覆自發性「重啟」，一度誤判成 Docker 環境問題
+
+機制上線後，用腳本乾淨重啟三主機時，Node2（PC1 本機 relay）的 MT 開始反覆重啟，導致跟它共用 netns 的 DU 反覆變成孤兒（同一類 2026-09-12 已修復過的坑，但這次是新一輪的觸發源）。一開始的排查方向完全錯誤：
+1. 先懷疑是自己手動 `docker compose up -d --force-recreate --no-deps` 操作本身觸發的（因為每次介入 DU 都巧合地跟 MT 重啟時間點很近），改用「分開 stop/rm/create」的方式緩解，一度看似有效。
+2. 後來懷疑是 docker daemon 被反覆 `systemctl restart docker` 波及（journalctl 裡確實在某次事故時間點看到大量容器的 `stopping restart-manager`），一度以為是自己不小心把同一份啟動腳本背景執行了兩次造成的操作污染（這件事**確實也發生過**，是這次除錯過程中一個真實但獨立的操作失誤，已排除、不影響下述真正根因）。
+3. 使用者明確指出「之前的腳本就沒問題啊，我要一次跑到底」，正確點出不該把新出現的問題歸因成含糊的「環境不穩定」——這個提醒把排查方向拉回到「這次改了什麼程式碼」上。
+
+### 發現三（真正根因）：用 `strace` 直接在崩潰現場抓到 `SIGSEGV`，鎖定 telnetsrv 保留字碰撞
+
+在乾淨、無任何手動介入的環境下用 `strace -f -p <MT_PID> -e signal=all` 即時監控，同時手動對 MT 送一次 `bhload get`，直接抓到 telnet 執行緒本身收到 `SIGSEGV {si_code=SEGV_MAPERR, si_addr=NULL}`（先前一度誤判成外部 `SIGTERM` 導致的正常 NAS 去註冊流程，是因為第一次 attach 的其實是**上一輪測試殘留的舊容器**，被自己的 `docker compose down` 正常關閉而已——這也是本次排查中一個值得記取的方法論教訓：attach 前務必先確認目標 PID 真的是這一輪、這一個 instance）。
+
+追進 `common/utils/telnetsrv/telnetsrv.c::process_command()`，發現致命的設計碰撞：這個函式對任何模組底下**字面等於 `"get"` 或 `"set"`** 的子命令，一律優先當成「通用變數存取語法」處理（呼叫 `setgetvar()`），完全不管這個模組是否真的把某個命令取名叫 `"get"`。`setgetvar()` 內部：
+```c
+n = sscanf(params, "%9s %ms", varname, &varval);
+```
+`params` 就是原始輸入裡 `"get"` 後面剩下的字串——`bhload get` 沒有多打一個變數名稱，`params`（也就是 `process_command` 裡的 `cmdb`）是 NULL，`sscanf(NULL, ...)` 是未定義行為，實測直接 SIGSEGV。這個 bug 在 `telnetsrv.c` 裡已經存在很久，只是這個專案裡從來沒有任何模組把自己的「命令」取名跟 `"get"`/`"set"` 這兩個保留字撞名過，直到新增的 `bhload` 模組把查詢指令取名叫 `"get"` 才第一次觸發——這正好解釋了「之前的腳本就沒問題」：問題不是環境退化，是**這次新增的程式碼第一次踩中一個從未被觸發過的既有陷阱**，跟 2026-09-12 telnetsrv buffer overflow 那次根因模式（既有程式碼裡的陷阱，被新的使用模式第一次觸發）如出一轍。
+
+### 修復
+
+1. `common/utils/telnetsrv/telnetsrv_bhload.c`：命令從 `"get"` 改名為 `"query"`，徹底避開保留字碰撞（`bhload_get_cmd` 也一併改名成 `bhload_query_cmd`）。
+2. `openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB_backhaul_poll.c`：DU 端輪詢執行緒送出的指令字串同步改成 `"bhload query\n"`。
+3. `common/utils/telnetsrv/telnetsrv.c::setgetvar()`：補上 `params == NULL` 的防呆（直接 `return CMDSTATUS_VARNOTFOUND`），這是共用程式碼裡一個獨立、真實存在的 bug，順手修掉避免以後其他模組的命令又意外撞上 `"get"`/`"set"` 保留字時重蹈覆轍。
+
+三處修改三主機同步編譯部署後，重新做了一次完全不介入、乾淨的三主機啟動：**全程 RAN 節點（Donor CU/DU + 全部 relay/access 的 MT/DU）RestartCount 皆為 0，13/13 E2 連線、17/17 UE 附著**，一次跑完成功，沒有再手動補救任何節點。事後用 `tcpdump` 直接抓包確認 `bhload query` 現在會回傳真實、非零、持續累積的 MAC 統計數字（`dl_rb_cum 44086 ul_rb_cum 404315`），確認機制真正生效，不再是 no-op。
+
+### 這次排查方法論上的教訓
+
+- **不要把新出現的、可重現的問題輕易歸因成「環境不穩定」或「隨機競爭」**——使用者的提醒是對的，先假設是自己新改的程式碼有問題，去對照實驗（停用新功能 vs 啟用），比一開始就往外部環境找理由更快找到真正根因。
+- **對照實驗（A/B test）是這次真正定位問題的關鍵一步**：把 `init_bhload_telnetcmd()` 的呼叫註解掉重新編譯、跑同樣的啟動流程，2.5 分鐘內 MT 完全零重啟；换回啟用版本，幾乎每次第一次查詢後就重啟——這個乾淨的二元對照直接把懷疑範圍鎖定到 bhload 本身，避免了在 Docker 網路層面繼續空轉。
+- **`strace -e signal=all` 直接在崩潰現場抓真實訊號，比靜態讀程式碼／猜測環境問題快得多**——尤其是當初步猜測（外部 SIGTERM）被更仔細的複查推翻後，能夠說「我看到的就是這個訊號，來源是這裡」，比任何猜測都有說服力。
+- **attach 除錯工具前，務必先確認目標 PID/container instance 真的是「這一輪」的，不是殘留的舊 instance**——這次至少有一次完整的 strace 追蹤結果，事後證實是誤判了上一輪測試留下的容器，白白浪費了一輪排查。
+
+### 後續追加坑：PC2/PC3 的 `librfsimulator.so` 漏編譯，導致「已修好」的機制其實只有三分之一節點真的生效
+
+`bhload` 命名衝突修好、三主機重新編譯部署、驗證 PC1 一次跑到底成功後，使用者要求「驗證機制真的有效，再重測 Stage 1」。第一次 Stage 1 重測（見 PF.md 作廢說明）忘記停用 xApp，作廢重來；停用 xApp 後的第二次量測數據看起來正常（JFI、吞吐量都在合理範圍），但使用者追問「更新 UE17 吞吐量狀態」時，現場複測 UE17 意外發現比先前更嚴重（ICMP 完全打不通），這個異常反過來促使重新檢查機制是否真的在三台主機都生效——查下去才發現 PC2、PC3 的 `librfsimulator.so` 時間戳竟然**舊於** `simulator.c` 原始碼的時間戳：修 `bhload` segfault 那一輪（`telnetsrv.c`/`telnetsrv_bhload.c`/`nr_mac_gNB_backhaul_poll.c` 三個檔案的修復）重新編譯時，下的指令是 `sudo ninja nr-uesoftmodem nr-softmodem telnetsrv`，**沒有包含 `rfsimulator`**——因為那一輪沒有直接改動 `simulator.c`，直覺上以為不需要重編這個 target，卻忽略了 `simulator.c` 是**更早一輪**（把 `init_bhload_telnetcmd()` 從 chanmod 分支移出來那次修復）才改的，PC2/PC3 那時候雖然也重新編譯過 `rfsimulator`，但那次的重建被 rsync＋接下來這一輪的 `nr-uesoftmodem`/`nr-softmodem`/`telnetsrv` 重編動作誤以為「這輪都處理過了」，實際上這一輪根本沒再碰 `rfsimulator`，PC2/PC3 上的 `librfsimulator.so` 就這樣停留在舊版本，`init_bhload_telnetcmd()` 從未在 PC2、PC3 的任何 MT process 上被呼叫過。
+
+**验证方式**：直接對 PC2 的 Node1、Node4 手動送 `bhload query`，兩個都回傳「未知命令」（模組根本沒註冊），而 PC1 的 Node2 用同樣方式測試完全正常——證實這不是隨機的、是 PC2（後來確認 PC3 也一樣）整批性的問題。用 `stat -c '%Y %n'` 比對 `simulator.c` 跟 `librfsimulator.so` 的時間戳，PC1 正確（`.so` 新於原始碼），PC2/PC3 都是 `.so` 舊於原始碼，直接坐實。
+
+**影響範圍**：這代表**第二次 Stage 1 重測的數據其實只有 PC1 三個節點（Node2、Node7、Node8）的 backhaul-aware 機制真正生效，PC2（Node1,3,4,5,6）、PC3（Node9~12）全部節點仍是先前那個「回傳錯誤、fail-safe 回退無約束」的 no-op 狀態**——這份數據雖然表面上「看起來合理」（JFI、吞吐量都不是離譜的數字），但實際上是「三分之一節點有約束、三分之二節點沒有約束」這種不對稱狀態下量到的，不能代表機制生效後的真實系統基準，已作廢。
+
+**修復**：在 PC2、PC3 上補跑 `sudo ninja rfsimulator`，確認三主機 `librfsimulator.so` 時間戳都新於 `simulator.c` 後，重新做一次乾淨的三主機清空重啟，逐一確認 `bhload` 模組在 PC1（Node2）、PC2（Node4）、PC3（Node11）都成功註冊，才產出第三次、真正有效的 Stage 1 數據（見 PF.md）。
+
+**教訓（已寫進 CLAUDE.md 第 7 節）**：`rsync` 完原始碼只是把檔案搬過去，不代表 PC2/PC3 已經吃到修改——一定要重編**這次修改實際影響到的全部 build target**，不能只重編「這一輪明確有改動原始碼的那幾個 target」；一份原始碼檔案的修改可能橫跨好幾輪 debug session（`simulator.c` 這次就橫跨了兩輪：先移動 `init_bhload_telnetcmd()` 呼叫位置、後來又在裡面用到重新命名後的 `bhload_query_cmd`），每一輪收工前都要重新檢查全部相關檔案的「原始碼時間戳 vs 編譯產物時間戳」，不能只看「這一輪自己改了哪些檔案」就推斷該重編哪些 target。這次能發現，某種程度上是運氣好——剛好使用者追問 UE17 狀態、UE17 現場複測結果比預期更差，才回頭起疑；如果沒有這個巧合，這個「三分之一節點生效」的錯誤基準可能會被當成正式數據一路沿用到 Stage 2~5 的比較，屆時才發現會需要重做全部後續量測。

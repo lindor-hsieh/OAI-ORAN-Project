@@ -143,7 +143,9 @@ static int bh_query(int sock, unsigned long *dl_rb_cum, unsigned long *ul_rb_cum
   }
   fcntl(sock, F_SETFL, flags_save);
 
-  const char *cmd = "bhload get\n";
+  // [2026-09-12 修復] "get" 改名成 "query"，見 telnetsrv_bhload.c 的說明（撞上
+  // telnetsrv.c 保留給模組變數存取語法的 "get"/"set" 關鍵字，會導致 MT 端 SIGSEGV）。
+  const char *cmd = "bhload query\n";
   if (send(sock, cmd, strlen(cmd), MSG_NOSIGNAL) < 0)
     return -1;
 

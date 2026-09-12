@@ -471,6 +471,15 @@ int setgetvar(int moduleindex, char getorset, char *params)
   char varname[TELNET_CMD_MAXSIZE];
   char *varval = NULL;
   memset(varname, 0, sizeof(varname));
+  // [2026-09-12 修復] process_command() 把任何模組底下字面等於 "get"/"set" 的子命令
+  // 都當成這個通用變數存取語法處理，呼叫這裡時的 params 就是原始輸入裡"get"/"set"
+  // 後面剩下的字串——如果呼叫端沒有多打一個參數（例如 "bhload get" 沒有變數名稱），
+  // params（也就是 process_command 裡的 cmdb）會是 NULL。sscanf(NULL, ...) 是未定義
+  // 行為，實測會直接 SIGSEGV（SEGV_MAPERR at NULL）。這個 bug 一直存在，只是這個
+  // 專案裡剛好從來沒有模組把自己的「命令」取名跟 "get"/"set" 這兩個保留字撞名過，
+  // 直到新增的 bhload 模組把查詢指令取名叫 "get" 才第一次觸發。
+  if (params == NULL)
+    return CMDSTATUS_VARNOTFOUND;
   n = sscanf(params, "%9s %ms", varname, &varval);
 
   for (i = 0; telnetparams.CmdParsers[moduleindex].var[i].varvalptr != NULL; i++) {

@@ -354,15 +354,16 @@ static void rfsimulator_readconfig(rfsimulator_state_t *rfsimulator) {
       init_channelmod();
       load_channellist(rfsimulator->tx_num_channels, rfsimulator->rx_num_channels, rfsimulator->sample_rate, rfsimulator->rx_freq, rfsimulator->tx_bw);
       rfsimulator->channelmod = true;
-      // [Backhaul-aware PRB budget] 只在 UE/MT process 註冊 bhload 命令，gNB/DU process 不能呼叫
-      // get_mac_inst()（UE 專用 accessor），否則行為未定義
-      if (!IS_SOFTMODEM_GNB)
-        init_bhload_telnetcmd();
     } else {
       fprintf(stderr, "unknown rfsimulator option: %s\n", rfsimu_params[p].strlistptr[i]);
       exit(-1);
     }
   }
+
+  // [2026-09-12 修復] 見 telnetsrv_bhload.c 與 nr_mac_gNB_backhaul_poll.c 的說明：
+  // 這個命令必須依「是不是 UE/MT process」註冊，不依賴 rfsimulator 是否有開 chanmod。
+  if (!IS_SOFTMODEM_GNB)
+    init_bhload_telnetcmd();
 
   if ( strncasecmp(rfsimulator->ip,"enb",3) == 0 ||
        strncasecmp(rfsimulator->ip,"server",3) == 0 )

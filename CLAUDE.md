@@ -100,6 +100,12 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 
 這是規格書定義的絕對上限（假設每個 RE 都排到最高 MCS、最大編碼率），**不是**實際 iperf3 會量到的數字。本平台用 rfsimulator（軟體模擬，非真實 RF，受 CPU 排程效率影響）+ 多跳 IP relay（每一跳都有處理開銷），Part 4 機制驗證量到的單一 UE（3-hop，旁邊 UE 閒置）實測吞吐量是 **43.8 Mbps**，比理論峰值低了一個數量級，落差主要來自「軟體模擬」與「多跳開銷」兩點，這是 IAB 多跳架構本身要付出的代價之一，不代表系統有問題。
 
+**多跳鏈路（Donor→Relay→Access→UE）下，backhaul-aware PRB 預算機制本身造成的自我節流上限**：上面 227 Mbps 只考慮「每跳是獨立不競爭的模擬載波」這件事，沒有考慮這次上線的 backhaul-aware 動態 PRB 預算機制（第 3 節）本身在多跳鏈路上會形成一個自我節流的回饋迴圈——因為 UE 的下行資料要送達，必須先實際流過**該 UE 所屬 access 節點自己的 MT 無線鏈路**（DU 的 F1-U 資料是透過該節點 MT 的 tunnel relay 進來的），所以這個節點 MT 的忙碌度，正好就等於它正在 relay 給下游 UE 的那份流量本身，形成自己餵自己的迴圈；Relay 節點的 DU→Access-MT 這一段也是同樣的迴圈。
+
+設穩態端到端吞吐量為 $T$，單一載波理論峰值為 227 Mbps。對 Access 這一跳：Access-MT 忙碌度 $\approx T/227$，故 Access-DU 可用容量 $=(1-T/227)\times227=227-T$，要撐住穩態流量需 $T \le 227-T$，即 $T \le 113.5$ Mbps；對 Relay 這一跳推導完全相同，也收斂到 $T \le 113.5$ Mbps。兩層剛好收斂到同一個不動點（不會疊乘複合往下掉，因為 Relay 節流後送出的 113.5 Mbps 到了 Access 這一跳，Access-MT 忙碌度變成 113.5/227≈0.5，Access-DU 可用容量也剛好是 113.5，供給等於自己的節流上限，是穩定不動點）；Donor-DU 本身沒有 MT、不受此機制限制，不構成瓶頸。
+
+**結論**：三跳鏈路（Donor→Relay→Access→UE）在這個機制下的理論吞吐量上限 **≈113.5 Mbps**（約為不考慮此機制時 227 Mbps 的一半），這是機制設計本身對深層 UE 的內建懲罰，量化了「為什麼較深層節點吞吐量普遍偏低」除了跳數本身的處理開銷之外，還有這個機制額外貢獻的一份下降；上述推導為忽略 EWMA 平滑暫態、假設下行主導流量的理想化穩態近似，僅供對照量級參考。此上限仍遠高於 Part 4 實測的 43.8 Mbps（後者已經計入 rfsimulator 軟體模擬與 iperf3/TCP goodput 的額外損耗）。
+
 ---
 
 ## 3. 標準開發流程
@@ -121,7 +127,7 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 
 | Stage | 策略 | Global 層（配額協調/FL 聚合） | Local 層（單節點 DRL） | 狀態 |
 |---|---|---|---|---|
-| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**（2026-09-12 重測，見 `experiment_results/PF.md`：併發 JFI=0.2584、17 UE 平均吞吐量約 5.26 Mbps、平均 RTT 329.10 ms，15 分鐘全程三主機零崩潰——**這份數據是「backhaul-aware 動態 PRB 預算機制」上線後**的第一份正式基準，是 Stage 2~5 的比較對象） |
+| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**（2026-09-13 三度重測，見 `experiment_results/PF.md`：併發 JFI=0.3303、17 UE 平均吞吐量約 6.45 Mbps、平均 RTT 224.23 ms，15 分鐘全程三主機零新增崩潰——**這份數據是 backhaul-aware 機制在三台主機全部真正生效後的正式基準**。前兩次量測皆已作廢：第一次忘記停用 xApp；第二次雖已停用 xApp，但事後發現 PC2/PC3 的 `librfsimulator.so` 忘記重新編譯（只重編了 nr-uesoftmodem/nr-softmodem/telnetsrv，見第 7 節新增的 rsync 後置檢查規則），導致只有 PC1 節點的機制真正生效，PC2/PC3 全部節點仍是 no-op；三主機皆確認 `bhload` 模組成功註冊後才產出本次數據。**UE17 現場複測 ICMP 100% 封包遺失、iperf3 完全無法建立傳輸**，是三主機機制全部真正介入後 Node4（UE17 直連 relay，同時中繼 Node11+Node12）三重負載疊加的極端案例，詳見 PF.md「UE17 特別說明」；是 Stage 2~5 的比較對象） |
 | 2 | avg FL + 最基礎 DRL | Global xApp+Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | 未開始 |
 | 3 | cluster FL + 最基礎 DRL | Global xApp+Global rApp：Cluster FL，依角色分兩群聚合：relay cluster（Node1~4）、access cluster（Node5~12）各自獨立 FedAvg | Local xApp+Local rApp：最基礎 DRL（同 Stage 2，模型不變，只有 Global 聚合方式不同） | 未開始 |
 | 4 | 自訂 FL + 最基礎 DRL | Global xApp+Global rApp：自訂聚合演算法（介面待設計） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2/3） | 未開始 |
@@ -152,7 +158,9 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 
 **各開發階段需要注意的事**：
 
-* **Stage 1（PF baseline）**：**已完成**（2026-09-12）。回歸測試（13/13 E2、17/17 UE 附著、iperf3 sanity check）與正式 15 分鐘量測皆已通過，過程中額外發現並根除三個 root cause bug（詳見 HISTORY.md 對應日期條目）：telnetsrv 的 `recv()` 錯誤值處理不完整導致的 buffer overflow 崩潰、CU UID 分配器耗盡時的整數溢位崩潰、CU 對同一 DU ID 的 F1 association 記錄在異常斷線後永久不清除導致的連線永久拒絕。三個修復皆已編譯部署到三主機，並通過完整 15 分鐘、17 UE、三主機同時動態流量+路徑損耗量測的零崩潰驗證。PF 排程器本身不需要額外開發（它本來就不讀任何自訂 state），縮小可用 PRB 池這件事對 PF 排程器是透明的。
+* **Stage 1（PF baseline）**：**已完成**（最終定案於 2026-09-13）。歷經兩輪：
+  - **2026-09-12**：回歸測試（13/13 E2、17/17 UE 附著、iperf3 sanity check）與正式 15 分鐘量測通過，過程中發現並根除三個 root cause bug（詳見 HISTORY.md 對應日期條目）：telnetsrv 的 `recv()` 錯誤值處理不完整導致的 buffer overflow 崩潰、CU UID 分配器耗盡時的整數溢位崩潰、CU 對同一 DU ID 的 F1 association 記錄在異常斷線後永久不清除導致的連線永久拒絕。但這輪的 `PF.md` **事後查出 backhaul-aware 機制其實整段是靜默 no-op**（`bhload` 命令命名撞上 telnetsrv 保留字導致 MT 端 SIGSEGV，見下方 HISTORY.md 條目），數據已作廢。
+  - **2026-09-13**：修復 `bhload` 命名衝突（改名 `get`→`query`，並補上 `telnetsrv.c::setgetvar()` 的 NULL 防呆）、修復 PC2/PC3 漏編譯 `rfsimulator` target 導致機制只有三分之一節點真正生效的問題後，三度重測才產出真正有效的基準（`experiment_results/PF.md`：JFI=0.3303、平均吞吐量 6.45 Mbps、平均 RTT 224.23 ms）。PF 排程器本身不需要額外開發（它本來就不讀任何自訂 state），縮小可用 PRB 池這件事對 PF 排程器是透明的。
 
 * **Stage 2（avg FL + 最基礎 DRL）**：
   - 這是第一個要接上 Global xApp/Global rApp 的階段，`global_xapp.py`／`global_xapp_bridge.py`／`inference/flower-app/` 都要先針對 12-node 拓樸重建（目前是舊 5-node 版本，尚未重建）。
@@ -264,6 +272,13 @@ bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc3
 ```
 
 > **規則**：刪除整份檔案需經過授權。所有修改先在 PC 1 完成，再將修改好的檔案傳給 PC 2、PC 3（`rsync`，見 `setup_lab_net.sh` 建立的 SSH 免密碼登入：`ssh pc2`／`ssh pc3`）。PC2/PC3 各自在本機重新編譯（`build_oai`／FlexRIC cmake），不是直接搬二進位檔——因為 docker-compose 用**絕對路徑** bind-mount 宿主機編譯產物（例如 `/home/lindor/openairinterface5g/cmake_targets/ran_build/build/...`），PC2 帳號是 `mcalab` 但仍在 `/home/lindor/openairinterface5g` 編譯（已手動建立 `/home/lindor` 目錄供其使用），確保路徑跟 compose 檔一致。
+>
+> **⚠️ `rsync` 完只是同步了原始碼，不代表 PC2/PC3 已經吃到修改**：一定要在 PC2、PC3 上各自重新執行編譯指令，且要重編**全部受這次修改影響的 build target**，不是只重編「看起來相關」的那一個——2026-09-13 debug session 曾經漏編 `radio/rfsimulator/simulator.c` 對應的 `rfsimulator` target（只重編了 `nr-uesoftmodem`/`nr-softmodem`/`telnetsrv`），導致 PC2、PC3 的 `librfsimulator.so` 停留在舊版本，三台主機表面上都跑著「同一份原始碼」，實際上只有 PC1 真正生效，另外兩台主機的行為跟修 bug 之前完全一樣，卻很容易被誤判成「已經全部修好」。修改共用檔案後，收工前務必在三台主機上都做這個檢查：
+> ```bash
+> stat -c '%Y %n' <改過的原始碼檔案>
+> stat -c '%Y %n' <對應編譯產物，例如 librfsimulator.so / libtelnetsrv.so / nr-softmodem / nr-uesoftmodem>
+> ```
+> 確認每一台主機上編譯產物的時間戳都新於原始碼的時間戳，時間戳比原始碼舊就代表沒吃到這次修改，必須重編。哪個原始碼檔案對應哪個 build target，用 `grep -rn <檔名> --include=CMakeLists.txt .` 或 `grep -rn <檔名> CMakeLists.txt`（頂層）查，不要用猜的——這個專案裡不少檔案（例如 `telnetsrv_bhload.c`）是直接编進某個執行檔而非獨立成 `.so`，跟其他 telnetsrv 模組的慣例不同。
 
 ### 狀態觀測窗口（100ms）與正規化常數
 

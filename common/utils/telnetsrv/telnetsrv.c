@@ -657,14 +657,19 @@ void run_telnetsrv(void) {
   if(listen(sock, 1) == -1)
     fprintf(stderr,"[TELNETSRV] Error %s on listen call\n",strerror(errno));
 
-  using_history();
-  int plen = sprintf(prompt, "%s_%s> ", TELNET_PROMPT_PREFIX, get_softmodem_function());
+  sprintf(prompt, "%s_%s> ", TELNET_PROMPT_PREFIX, get_softmodem_function());
   TELNET_LOG("\nInitializing telnet server...\n");
 
   while( (telnetparams.new_socket = accept(sock, &cli_addr, &cli_len)) ) {
     TELNET_LOG("Telnet client connected....\n");
-    read_history(telnetparams.histfile);
-    stifle_history(telnetparams.histsize);
+    // [2026-09-12 修復] 移除每次新連線都執行的 read_history()/stifle_history()——這個測試
+    // 平台的 telnet 用法全部是機器對機器的自動化查詢（channelmod 控制、backhaul-aware PRB
+    // 預算輪詢），從來不是人類互動式打指令，沒有任何地方依賴指令歷史回顧（"!N"/"!!"）這個
+    // 功能。GNU readline 的 history 機制本身不是為了被高頻率、非互動式連線呼叫設計的，這裡
+    // 曾經觀察到穩定復現的 "*** buffer overflow detected ***" 崩潰（在極高頻率的自動化連線
+    // 下尤其容易觸發，但已知在遠低於原本理論安全頻率下也曾復現，代表這是 history 機制本身
+    // 的問題，不只是呼叫太頻繁的問題）。既然這個專案完全不需要這個功能，直接移除是根除
+    // 手段，而非降低機率的緩解。
 
     if(telnetparams.new_socket < 0)
       fprintf(stderr,"[TELNETSRV] Error %s on accept call\n",strerror(errno));
@@ -676,7 +681,20 @@ void run_telnetsrv(void) {
       while(filled < ( TELNET_MAX_MSGLENGTH-1)) {
         readc = recv(telnetparams.new_socket, buf+filled, TELNET_MAX_MSGLENGTH-filled-1, 0);
 
-        if(!readc)
+        // [2026-09-12 修復] 原本只檢查 !readc（readc==0，乾淨斷線），沒有檢查
+        // recv() 回傳 -1（連線錯誤，例如對面用 RST 而非乾淨 FIN 關閉連線，
+        // ECONNRESET/ETIMEDOUT 等）的情況。一旦 readc 是 -1，底下的
+        // "filled += readc" 會讓 filled 變成負值，緊接著 "buf[filled-1]" 就會
+        // 寫超出 buf 陣列邊界之外（往低位址方向），直接砸毀 stack canary，被
+        // FORTIFY_SOURCE 偵測到觸發 "*** buffer overflow detected ***" 直接
+        // terminate 整個 process。這是這個測試平台這次觀察到、反覆復現的
+        // telnetsrv 崩潰的真正根因——不是 readline history 機制本身（那個已經
+        // 移除，是額外的風險緩解），而是這裡對 recv() 錯誤回傳值處理不完整。
+        // 高頻率、非人類互動的自動化連線（backhaul-aware PRB 預算輪詢）比既有
+        // 低頻用法（channelmod，每 60 秒一次）更容易在連線生命週期中遇到對面
+        // RST 關閉的情況，因此比既有用法更容易踩到這個早就存在、從未被觸發過
+        // 的邊角案例。修法：readc<=0 一律視為連線結束，跟乾淨斷線一樣處理。
+        if(readc <= 0)
           break;
 
         filled += readc;
@@ -687,7 +705,7 @@ void run_telnetsrv(void) {
         }
       }
 
-      if(!readc) {
+      if(readc <= 0) {
         TELNET_LOG("Telnet Client disconnected.\n");
         break;
       }
@@ -695,20 +713,9 @@ void run_telnetsrv(void) {
       //if (telnetparams.telnetdbg > 0)
       TELNET_LOG("Command received: readc %i filled %i \"%s\"\n", readc, filled, buf);
 
-      if (buf[0] == '!') {
-        if (buf[1] == '!') {
-          sprintf(buf,"%s","telnet history list");
-        } else {
-          HIST_ENTRY *hisentry = history_get(strtol(buf+1,NULL,0));
-
-          if (hisentry) {
-            char msg[TELNET_MAX_MSGLENGTH + plen +10];
-            sprintf(buf,"%s",hisentry->line);
-            sprintf(msg,"%s %s\n",prompt, hisentry->line);
-            send(telnetparams.new_socket, msg, strlen(msg), MSG_NOSIGNAL);
-          }
-        }
-      }
+      // [2026-09-12 修復] "!N"/"!!" 指令歷史回顧語法移除——依賴 history_get()，而
+      // history 機制整體已經移除（見上方連線建立處的說明），這個語法在這個專案裡
+      // 從未被任何自動化呼叫端使用過。
 
       if (strlen(buf) > 2 ) {
         status = process_command(buf, 0);
@@ -720,9 +727,8 @@ void run_telnetsrv(void) {
           char msg[TELNET_MAX_MSGLENGTH + 50];
           sprintf(msg,"Error: \n      %s\n is not a softmodem command\n",buf);
           send(telnetparams.new_socket, msg, strlen(msg), MSG_NOSIGNAL);
-        } else if (status == CMDSTATUS_FOUND) {
-          add_history(buf);
         }
+        // [2026-09-12 修復] 不再 add_history(buf)——指令歷史機制整體移除。
 
         send(telnetparams.new_socket, prompt, strlen(prompt), MSG_NOSIGNAL);
       } else {
@@ -731,8 +737,7 @@ void run_telnetsrv(void) {
       }
     }
 
-    write_history(telnetparams.histfile);
-    clear_history();
+    // [2026-09-12 修復] 不再 write_history()/clear_history()——指令歷史機制整體移除。
     close(telnetparams.new_socket);
     TELNET_LOG("Telnet server waiting for connection...\n");
   }

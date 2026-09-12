@@ -214,7 +214,7 @@ for n in 9 10 11 12; do
     COUNT=0
     while ! docker exec "${ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; do
         sleep 5; COUNT=$((COUNT+1))
-        [ $COUNT -ge 24 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(120s)，跳過${NC}"; break; }
+        [ $COUNT -ge 60 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(300s)，跳過${NC}"; break; }
     done
     if docker exec "${ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
         configure_and_start_access_du "${ACCESS_MT_NAME[$n]}" "${ACCESS_DU_NAME[$n]}" "${ACCESS_DU_IP[$n]}"

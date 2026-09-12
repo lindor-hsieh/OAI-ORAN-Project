@@ -141,6 +141,8 @@ extern "C"
 #define CONTINUOUS_TX       softmodem_params.continuous_tx
 #define SYNC_REF            softmodem_params.sync_ref
 #define DEFAULT_PDU_ID      softmodem_params.default_pdu_session_id
+#define BACKHAUL_MT_TELNET_PORT softmodem_params.backhaul_mt_telnet_port
+#define BACKHAUL_MT_TELNET_ADDR softmodem_params.backhaul_mt_telnet_addr
 
 #define DEFAULT_RFCONFIG_FILE    "/usr/local/etc/syriq/ue.band7.tm1.PRB100.NR40.dat";
 
@@ -184,6 +186,8 @@ extern int usrp_tx_thread;
   {"imscope" ,              CONFIG_HLP_IMSCOPE,       PARAMFLAG_BOOL, .uptr=&enable_imscope,                   .defintval=0,            TYPE_UINT,   0}, \
   {"imscope-record" ,       CONFIG_HLP_IMSCOPE_RECORD,PARAMFLAG_BOOL, .uptr=&enable_imscope_record,            .defintval=0,            TYPE_UINT,   0}, \
   {"default-pdu-id",        NULL,                     0,              .iptr=&DEFAULT_PDU_ID,                   .defintval=10,           TYPE_INT,    0}, \
+  {"backhaul-mt-telnet-port", NULL,                   0,              .iptr=&BACKHAUL_MT_TELNET_PORT,          .defintval=0,            TYPE_INT,    0}, \
+  {"backhaul-mt-telnet-addr", NULL,                   0,              .strptr=&BACKHAUL_MT_TELNET_ADDR,        .defstrval="127.0.0.1",  TYPE_STRING, 0}, \
 }
 // clang-format on
 
@@ -218,6 +222,8 @@ extern int usrp_tx_thread;
                {"MONOLITHIC", "PNF", "VNF", "AERIAL","UE_STUB_PNF","UE_STUB_OFFNET","STANDALONE_PNF"}, \
                {NFAPI_MONOLITHIC, NFAPI_MODE_PNF, NFAPI_MODE_VNF, NFAPI_MODE_AERIAL,NFAPI_UE_STUB_PNF,NFAPI_UE_STUB_OFFNET,NFAPI_MODE_STANDALONE_PNF}, \
                7 } }, \
+    { .s5 = { NULL } },                     \
+    { .s5 = { NULL } },                     \
     { .s5 = { NULL } },                     \
     { .s5 = { NULL } },                     \
     { .s5 = { NULL } },                     \
@@ -338,6 +344,9 @@ typedef struct {
   int threequarter_fs;
   int default_pdu_session_id;
   int extra_pdu_session_id;
+  int backhaul_mt_telnet_port; // [Backhaul-aware PRB budget] DU 端要輪詢的自身 MT telnetsrv port，0=停用
+  char *backhaul_mt_telnet_addr; // 自身 MT 的位址：relay 節點 MT/DU 共用 netns 用 127.0.0.1；
+                                  // access 節點 MT/DU 是分開 netns，要填 MT 在 iab_internal_net 上的 IP
 } softmodem_params_t;
 
 #define IS_SA_MODE(sM_params) (!(sM_params)->phy_test && !(sM_params)->do_ra && !(sM_params)->nsa)

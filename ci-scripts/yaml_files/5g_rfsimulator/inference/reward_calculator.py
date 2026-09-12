@@ -47,11 +47,21 @@ throughput），解決「固定權重/固定退火時程表對不同場景需要
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 # =============================================================================
 # 超參數
 # =============================================================================
+
+# ── REWARD_MODE 開關（五階段路線圖 Stage 2~4 用，見 CLAUDE.md 第 3 節）───────
+# "lagrangian"（預設，維持現行行為）：inference_server.py 呼叫
+#   compute_lagrangian_reward()，含 JFI 限制式與 λ 自適應更新。
+# "throughput_only"（陽春版）：inference_server.py 改呼叫
+#   compute_reward_breakdown()（純 throughput，見下方 W_THROUGHPUT 等常數），
+#   drl_agent.py 的 λ 更新也會被跳過、恆為 LAMBDA_INIT。
+REWARD_MODE: str = os.getenv("REWARD_MODE", "lagrangian")
 
 # ── Lagrangian 限制式（現行公式）─────────────────────────────────────────────
 # JFI_MIN：2026-07-09 現場量測，PF baseline、Scenario R 真實隨機流量條件下

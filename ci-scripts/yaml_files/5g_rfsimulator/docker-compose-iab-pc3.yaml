@@ -19,13 +19,13 @@ services:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001108 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001108 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --telnetsrv --telnetsrv.listenport 9197 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
         command: >
-            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001108 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time"
+            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001108 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --telnetsrv --telnetsrv.listenport 9197 --log_config.global_log_options level,nocolor,time"
 
     rfsim5g-iab-du-9:
         image: custom-oai-runtime:24.04
@@ -50,7 +50,7 @@ services:
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4052 --telnetsrv --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4052 --telnetsrv --backhaul-mt-telnet-port 9197 --backhaul-mt-telnet-addr 192.168.75.10 --log_config.global_log_options level,nocolor,time
 
     # ========================================== 
     # IAB Node 10 (access) — 子節點掛在 relay Node 3 底下
@@ -70,13 +70,13 @@ services:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001109 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001109 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --telnetsrv --telnetsrv.listenport 9198 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
         command: >
-            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001109 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time"
+            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001109 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --telnetsrv --telnetsrv.listenport 9198 --log_config.global_log_options level,nocolor,time"
 
     rfsim5g-iab-du-10:
         image: custom-oai-runtime:24.04
@@ -101,7 +101,7 @@ services:
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4053 --telnetsrv --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4053 --telnetsrv --backhaul-mt-telnet-port 9198 --backhaul-mt-telnet-addr 192.168.75.11 --log_config.global_log_options level,nocolor,time
 
     # ========================================== 
     # IAB Node 11 (access) — 子節點掛在 relay Node 4 底下
@@ -121,13 +121,13 @@ services:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001110 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001110 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --telnetsrv --telnetsrv.listenport 9199 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
         command: >
-            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001110 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time"
+            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001110 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --telnetsrv --telnetsrv.listenport 9199 --log_config.global_log_options level,nocolor,time"
 
     rfsim5g-iab-du-11:
         image: custom-oai-runtime:24.04
@@ -152,7 +152,7 @@ services:
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4054 --telnetsrv --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4054 --telnetsrv --backhaul-mt-telnet-port 9199 --backhaul-mt-telnet-addr 192.168.75.12 --log_config.global_log_options level,nocolor,time
 
     # ========================================== 
     # IAB Node 12 (access) — 子節點掛在 relay Node 4 底下
@@ -172,13 +172,13 @@ services:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001111 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001111 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --telnetsrv --telnetsrv.listenport 9200 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
         command: >
-            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001111 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time"
+            /bin/bash -c "/opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001111 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --telnetsrv --telnetsrv.listenport 9200 --log_config.global_log_options level,nocolor,time"
 
     rfsim5g-iab-du-12:
         image: custom-oai-runtime:24.04
@@ -203,7 +203,7 @@ services:
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4055 --telnetsrv --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4055 --telnetsrv --backhaul-mt-telnet-port 9200 --backhaul-mt-telnet-addr 192.168.75.13 --log_config.global_log_options level,nocolor,time
 
     # ========================================== 
     # UE9 -> Node9 (access)

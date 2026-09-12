@@ -61,7 +61,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from channelmod_ctrl import ChannelModController
 
@@ -175,6 +175,7 @@ class UEConfig:
                                             # target_cqi 只是反查最近對照表值的 log 顯示標籤）
     is_idle: bool = False                  # Scenario R 專用：True 時 iperf3 真的停止（非低頻寬）
     _iperf_proc: Optional[subprocess.Popen] = field(default=None, repr=False)
+    _iperf_log: Optional[Any] = field(default=None, repr=False)   # iperf3 client stdout 檔案控制代碼
     _last_rx_bytes: int = field(default=0, repr=False)       # watchdog: 上次量到的 oaitun_ue1 rx bytes
     _last_rx_check: float = field(default=0.0, repr=False)   # watchdog: 上次檢查的 timestamp
 
@@ -249,9 +250,16 @@ def start_iperf_client(ue: UEConfig) -> bool:
     if ue.protocol == "udp":
         cmd.insert(cmd.index("-R"), "-u")
     try:
+        # iperf3 client 的即時輸出（每秒一筆進度 + 結尾摘要）寫進固定路徑的
+        # log 檔（覆寫模式，每次重啟這個 UE 的 session 就重新開始），供外部
+        # 量測取樣腳本（見 iab/measure_stage.py）讀取「實際達成吞吐量」，
+        # 而不是這裡設定的目標頻寬 ue.bandwidth_mbps。這是唯一的職責擴充，
+        # traffic_scenario.py 本身不做任何量測/記錄邏輯，維持給全部 5 個
+        # stage 共用的環境產生器角色不變。
+        ue._iperf_log = open(f"/tmp/iperf_client_{ue.container}.log", "w")
         ue._iperf_proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
+            stdout=ue._iperf_log,
             stderr=subprocess.DEVNULL,
         )
         ue._last_rx_bytes = 0
@@ -275,6 +283,12 @@ def stop_iperf_client(ue: UEConfig) -> None:
         except Exception:
             pass
         ue._iperf_proc = None
+    if ue._iperf_log:
+        try:
+            ue._iperf_log.close()
+        except Exception:
+            pass
+        ue._iperf_log = None
 
     # Step 2：殺容器內殘留的 iperf3（按 port 精確匹配）
     try:

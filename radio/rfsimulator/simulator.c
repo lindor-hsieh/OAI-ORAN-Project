@@ -44,8 +44,10 @@
 #include <common/utils/LOG/log.h>
 #include <common/utils/load_module_shlib.h>
 #include <common/utils/telnetsrv/telnetsrv.h>
+#include <common/utils/telnetsrv/telnetsrv_bhload.h>
 #include <common/config/config_userapi.h>
 #include "common_lib.h"
+#include "executables/softmodem-common.h"
 #define CHANNELMOD_DYNAMICLOAD
 #include <openair1/SIMULATION/TOOLS/sim.h>
 #include "rfsimulator.h"
@@ -352,6 +354,10 @@ static void rfsimulator_readconfig(rfsimulator_state_t *rfsimulator) {
       init_channelmod();
       load_channellist(rfsimulator->tx_num_channels, rfsimulator->rx_num_channels, rfsimulator->sample_rate, rfsimulator->rx_freq, rfsimulator->tx_bw);
       rfsimulator->channelmod = true;
+      // [Backhaul-aware PRB budget] 只在 UE/MT process 註冊 bhload 命令，gNB/DU process 不能呼叫
+      // get_mac_inst()（UE 專用 accessor），否則行為未定義
+      if (!IS_SOFTMODEM_GNB)
+        init_bhload_telnetcmd();
     } else {
       fprintf(stderr, "unknown rfsimulator option: %s\n", rfsimu_params[p].strlistptr[i]);
       exit(-1);

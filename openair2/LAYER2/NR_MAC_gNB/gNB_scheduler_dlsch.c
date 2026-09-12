@@ -942,8 +942,12 @@ static void nr_dlsch_preprocessor(module_id_t module_id, frame_t frame, slot_t s
   int bw = scc->downlinkConfigCommon->frequencyInfoDL->scs_SpecificCarrierList.list.array[0]->carrierBandwidth;
   int num_beams = mac->beam_info.beam_allocation ? mac->beam_info.beams_per_period : 1;
   int n_rb_sched[num_beams];
+  // [Backhaul-aware PRB budget] 依本節點 MT 目前 backhaul 忙碌程度縮小這次排程週期可用的 PRB 池，
+  // 對 PF 原生排程與 xApp/DRL 覆寫一視同仁生效（無條件套用，不檢查是否有 xApp 連線），
+  // 讓 Stage 1 PF baseline 也吃得到這個約束。刻意不改動 bw 本身，避免影響下面 max_sched_ues 的計算。
+  float bh_ratio = atomic_load_explicit(&mac->backhaul_prb_ratio, memory_order_relaxed);
   for (int i = 0; i < num_beams; i++)
-    n_rb_sched[i] = bw;
+    n_rb_sched[i] = (int)(bw * bh_ratio);
 
   /* Retrieve amount of data to send for this UE */
   nr_store_dlsch_buffer(module_id, frame, slot);

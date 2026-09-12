@@ -241,3 +241,103 @@ Node2/7,8 搬到 PC1 之後，對三主機做一次全部端點同時冷啟動�
 1. 搬遷節點到新主機時，網路設定要同時檢查三個地方：docker-compose 的網路**名稱**、網路裡的 **IP 位址數值**、以及該節點 conf 檔裡**寫死的靜態 IP**（access DU 的 `local_n_address` 沒有動態同步機制，relay DU 有）。
 2. Access 節點的 parent relay 可以放在不同主機，不需要額外設定——rfsimulator 的 serveraddr 走 macvlan L2，位址可達性只跟「IP 有沒有正確 assign 給某個 container」有關，跟那個 container 實際跑在哪台實體主機無關。
 3. 診斷「relay MT 反覆斷線重連」時，先確認是不是同一台主機上跑了太多組即時 RF 模擬 process（`docker ps | grep -E "iab-mt|iab-du|end-ue" | wc -l` 抓數量，配合 `uptime`/`load average` 看是否過載），這比逐一排查協定層 log 更快定位。
+
+---
+
+## 2026-09-12 — UE17 持續高延遲/斷線根因查證與修復
+
+**現象**：UE17（直連 Node4 DU，2-hop）在 Stage 1 PF baseline 量測期間持續嚴重劣化——CU 直接 ping UE17 tunnel IP 100% 封包遺失，`iab_perf_test.sh`/`measure_stage.py` 兩種量測方式全部無法取得任何有效數據。一度被記錄為「已知異常、暫不深究」的邊界案例寫進 `experiment_results/PF.md`。
+
+**排查過程**：
+1. 檢查 UE17 容器本身：tunnel IP（12.1.1.57）、預設路由（`default via 12.1.1.1 dev oaitun_ue1`）皆正確，`chrt -f 80` 即時排程優先權也正確套用在 `nr-uesoftmodem` 上，排除容器層級設定錯誤。
+2. 直接測試發現行為不一致：多次重測 ping 有時 100% loss，有時 0% loss 但 RTT 高達 **1000~2000ms**（正常應為個位數~數十 ms）；同一時間 macvlan 層（不經過 RF-sim tunnel）的 ping 是正常的個位數 ms，排除了 host 網路/CPU 排程層級的問題。
+3. 查 Node4 DU log 發現關鍵訊息：`[OCM] E Model rfsimu_channel_ue2 not found` 後接 `Random channel rfsimu_channel_ue2 in rfsimulator activated`。
+4. 檢查 `conf/iab_du_node4.conf` 的 `channelmod.DefaultChannelList`，只定義了 `rfsimu_channel_ue0`／`ue1` 兩組模型——但 Node4 DU 實際上要同時服務 **3 個裝置**（Node11-MT、Node12-MT、UE17，UE17 是後來才直接掛上去的第 3 個裝置，config 從未同步更新）。第 3 個連進來的裝置找不到對應模型，OAI RF Simulator fallback 到「Random channel」，其延遲/時間偏移參數不受控，是造成 UE17 異常高延遲與間歇性封包遺失的根本原因。PHY/MAC 層本身（RSRP、BLER、in-sync 狀態）全程正常，問題完全發生在 channel model 這一層，跟 CPU 資源競爭無關。
+
+**修復**：在 `conf/iab_du_node4.conf` 的 `DefaultChannelList` 補上 `rfsimu_channel_ue2`／`rfsimu_channel_ue3` 兩組跟現有模型參數一致的 AWGN 模型（`ploss_dB=0.0`, `ds_tdl=0.0`），重啟 `rfsim5g-iab-du-4` 後三個裝置都能取得正確定義的模型。修復後 UE17 ping RTT 恢復到 **2~13ms**，封包遺失率恢復到個位數百分比的正常範圍（跟 Scenario R 動態路徑損耗下的其他 UE 相當）。
+
+**已排查、確認沒有同類風險的節點**：Node1/2/3 的 conf 都只定義 2 組 channel model，且實際連線數也剛好都是 2（各自的 2 個 access 子節點），沒有額外直連 UE，不會撞到同一個坑。這個 class of bug 只會發生在「relay DU 的實際連線數 > conf 裡定義的 channel model 組數」時，未來若要在任何 relay 底下新增直連裝置，切記同步在該 relay 的 conf 補齊對應數量的 channel model。
+
+**殘留、獨立於本次修復的新發現（尚未解決）**：channel model 修好後，ping 恢復正常，但用 iperf3 對 UE17 做 TCP 連線測試時，`ss -tn` 顯示 TCP 連線卡在 `SYN-SENT`（SYN 送出去、SYN-ACK 沒收到），在 ext-dn 容器上用 tcpdump 監聽對應 port 完全沒有抓到封包。這代表 SYN 離開 UE17 之後，在往 ext-dn 的路徑上（很可能是 UPF 的 NAT/conntrack，或跟 UE17 作為「relay DU 直連的一般 UE」這個較少見的拓樸位置有關的 QoS flow/SDAP 設定）某處被吃掉，但 ICMP（ping）走的路徑正常。UE9~16（透過 Node11/12 這層 access DU）走 TCP 都正常，所以問題很可能跟「UE 直接掛在 relay DU 底下、沒有經過 access 層」這個較特殊的拓樸位置有關，而不是全面性的 UPF 問題。此為獨立於 channel model 的另一個問題，尚待後續排查（下次可從 UPF 的 conntrack table、或比較 UE17 與一般 access UE 的 PDU Session/QoS flow 設定差異切入）。
+
+---
+
+## 2026-09-12 — Backhaul-aware PRB 預算機制上線後的三個新踩坑：telnetsrv buffer overflow、DU/MT netns 孤兒、重啟骨牌效應
+
+實作 backhaul-aware 動態 PRB 預算機制（見 CLAUDE.md 第 3 節）並完成三主機重新編譯後，在回歸測試與 Stage 1 重新量測的乾淨重啟過程中，連續踩到三個環環相扣的坑。記錄下來是因為第三個坑的教訓（不要反射性重啟）比機制本身更重要，往後任何除錯都該先套用這個原則。
+
+### 坑 1：telnetsrv 高頻連線觸發 GNU readline history 的 buffer overflow
+
+**現象**：機制上線初期（DU 端輪詢間隔 300ms）量測到一半，MT-11/MT-12 陸續以 exit code 139（SIGSEGV 樣式）消失，DU-9 容器整個不見，log 顯示 `*** buffer overflow detected ***: terminated`（glibc FORTIFY_SOURCE abort）。
+
+**根因**：`common/utils/telnetsrv/telnetsrv.c` 的 `run_telnetsrv()` 對**每一次新連線**都會呼叫 GNU readline 的 `read_history()`/`add_history()`/`write_history()`/`stifle_history()`/`clear_history()`——這個設計是給人類互動式 shell 用的，不是為了被機器高頻轟炸設計的。這個專案既有的 telnet 用法（`channelmod_ctrl.py`）呼叫頻率是每個 Scenario R phase（60 秒）一次，而我新增的 DU→MT backhaul 輪詢執行緒（`nr_mac_gNB_backhaul_poll.c`）原本設 300ms 一次，比既有用法高頻 200 倍以上，首次踩中這個沒人踩過的 race。
+
+**處理**：`telnetsrv.c` 是全部既有模組（含 channelmod）共用的檔案，判斷修改風險太高，不直接動它。改成把 `BH_POLL_INTERVAL_MS` 從 300 拉長到 3000（10 倍），把觸發機率壓低到接近既有 channelmod 用法的安全頻率——**這是機率緩解，不是根除**，程式碼裡已留言註記；若之後長時間量測又復現，必須改成長連線（避免每次連線都觸發 read/write_history）或直接修 `telnetsrv.c` 本體。
+
+### 坑 2：relay 節點的 DU 容器卡在「孤兒」network namespace（比坑1更隱蔽、影響更大）
+
+**現象**：坑1修復、三主機重新編譯部署後的乾淨重啟過程中，Node2（relay，PC1）的 DU 自己 log 顯示有 UE 在正常收發（RNTI c87f/58cb 有真實 dlsch/ulsch 流量），看起來健康；但 Node2 底下的兩個 access 子節點 Node7、Node8 的 MT，卻持續每秒對 `192.168.88.151:4045`（Node2 的 macvlan IP + rfsimulator port）連線失敗，`errno(111) connection refused`，且兩個 MT 的 `oaitun_ue1` tunnel 介面完全沒有 IP。
+
+**排查過程（刻意不重啟、先確認事實）**：
+1. `docker exec rfsim5g-iab-du-2 ip addr show`：只有 `lo`，**沒有 macvlan 介面、沒有 tunnel 介面**——但 relay 的 DU 服務定義是 `network_mode: "service:rfsim5g-iab-mt-2"`，理論上應該跟 MT-2 共用同一個 netns，看到的介面應該要跟 MT-2 一模一樣。
+2. `docker exec rfsim5g-iab-mt-2 ip addr show`：MT-2 自己有完整的 `eth0`（`192.168.88.151`）跟 `oaitun_ue1`（`12.1.1.10`），一切正常。
+3. 直接比對兩個容器實際 PID 的 `/proc/<pid>/ns/net`：**inode 不一樣**（`4026533719` vs `4026533803`）——證實 DU-2 跟 MT-2 事實上跑在兩個不同的 network namespace，儘管 docker-compose 的宣告（`HostConfig.NetworkMode = container:<mt-2的container id>`）看起來完全正確。
+4. `ss -tlnp` 在 DU-2 的（孤兒）netns 裡確實有 process 監聽 `*:4045`——這解釋了為什麼從 DU-2 自己的角度看「一切正常」（它能在自己的孤兒 netns 裡跟已經連進來的舊 UE 繼續互動），但外部（Node7/Node8 的 MT）連進來的封包，因為孤兒 netns 沒有掛任何實體/macvlan 介面，根本到不了這個監聽的 socket，才會回報 `connection refused`。
+
+**根因機制**：`network_mode: container:X` 只在**容器建立當下**解析一次「加入 X 目前的 netns」。如果之後 X（這裡是 MT-2）本身被重新建立（`docker compose up -d --force-recreate` 或整個重跑 compose，會產生新的 sandbox/netns），而依附在它身上的 DU-2 沒有被同步 recreate（只是被單純 `docker restart` 或完全沒動），DU-2 會繼續留在 MT-2「舊」的、現在已經沒人使用的 netns 裡——這個舊 netns 沒有任何網路介面（macvlan 從沒真正屬於過它，或是連介面本身都在 MT-2 重建時一併被清掉），變成名副其實的「孤兒」。`docker restart` 只是重啟 process，不會重新解析 `network_mode`，所以不能修好這個問題；必須用 `docker compose up -d --force-recreate --no-deps <DU服務>` 讓它重新加入 MT 容器**現在**的 netns。
+
+**修復與驗證**：對 `rfsim5g-iab-du-2` 執行 `--force-recreate`，重建後 DU-2 跟 MT-2 的 netns inode 變成一致，`ip addr show` 也拿到跟 MT-2 一樣的完整介面清單。DU-2 重建後對 CU 的 F1 Setup 一開始連續失敗約 7 次（`the CU reported F1AP Setup Failure`，CU 端還握著幾秒前的舊 association），但**放著讓它自己重試**（不去動 CU），30 幾秒後自然收到 `received F1 Setup Response from CU gNB-CU-Donor`，Node7/Node8 的 MT 隨即都拿到新的 tunnel IP、E2 Setup 也正常完成——全程沒有重啟 CU，沒有波及系統其他任何節點。
+
+**預防性排查**：同時檢查了 Node1、Node3、Node4（其餘三個 relay）的 DU/MT netns inode 是否一致，三個都正常（`network_mode` 建立以來從未經歷「MT 被單獨 recreate、DU 沒跟著動」這個特定序列，所以沒中獎）——代表這不是這次編譯或機制本身引入的系統性 bug，而是這次除錯過程中我自己先前對 Node2 做過的某次 `docker restart`／局部操作，跟 MT-2 之後又被重建的時間點沒有對齊而巧合造成的。
+
+### 坑 3（最重要的教訓）：反射性重啟本身就是「IP 一直變」的成因
+
+**使用者明確指出**：「為什麼一直重啟 這問題要解決 不然ip會一直變」。這句話點出的因果鏈是：CU 一旦被重啟（或任何操作導致 CU 判定某個 DU 的舊 F1 association 需要清掉、進而牽動更大範圍），**全系統所有 MT 都要重新做 NAS 註冊 + PDU Session Establishment**，這個系統的 SMF 沒有設定任何靜態 IP 保留，所以每個 MT 每次都會拿到一個全新的動態 IP——這才是「IP 一直變」的真正機制，不是隨機發生的。
+
+**這次的具體教訓**：坑2的排查一開始，我對「Node8 單獨故障、但其實 sibling Node7 早就證實健康」這個局面，直接做了「重啟 Node2 的 DU」這個動作——這個動作本身並沒有先確認 Node2 的 DU 到底是不是真的壞的（後來證實 Node2 的 DU 表面 log 是健康的，真正壞的是 netns 孤兒問題，`docker restart` 這個動作根本不可能修好它，等於是一次沒有事先诊斷、賭一把式的重啟）。這類「看到下游有問題、直接重啟上游猜測目標」的操作，一旦真的觸發 CU 端的 stale-association 拒絕連鎖，就會需要重啟 CU 才能解開，進而波及全系統 MT 的 IP。
+
+**往後的原則（已在這次坑2的排查中實際套用並印證有效）**：任何節點看起來「有問題」時，**先用完全唯讀的方式**（分別、不合併地看每個相關容器自己的 log、比對 netns/介面/IP 這類客觀事實、必要時對目標 IP/port 做一次即時連線測試）把問題定位到「哪一層、哪一個具體機制」壞掉，確認修法之後，才執行**範圍最小、最貼近根因**的動作（例如這次的 `--force-recreate` 單一 DU 容器，而不是重啟整個 CU 或整條鏈路上的其他容器）。唯讀排查的成本遠低於一次誤判重啟可能造成的全系統 IP 洗牌代價。
+
+---
+
+## 2026-09-12（續）— 同一輪乾淨重啟：PC2 的 `~` 展開陷阱、access DU 缺 host route 導致 SCTP 單向被 Docker bridge 隔離擋掉
+
+同一次 v4 乾淨重啟過程中，繼續往下排查 PC2（Node1,3,4,5,6 + UE1~4,17）跟 PC3 的 Node9,12 時，又踩到兩個新坑，記錄下來避免下次重蹈覆轍。
+
+### 坑 4：`ssh pc2 'bash <腳本路徑>'` 的 `~` 在腳本內部展開成錯誤帳號的 home 目錄
+
+**現象**：透過 `ssh pc2 'nohup bash ~/openairinterface5g/.../run_local_pc2.sh > log 2>&1 &'` 背景啟動 PC2，log 檔案只有一行就結束：`bash: /home/mcalab/openairinterface5g/.../run_local_pc2.sh: No such file or directory`。即使把外層呼叫改成完整絕對路徑 `/home/lindor/openairinterface5g/.../run_local_pc2.sh`，腳本本身第一次執行還是失敗在**腳本內部**的 `COMPOSE_DIR=~/openairinterface5g/...`（`cd` 失敗、找不到 `iab/start_iab_pc2.sh`），卻因為 `ok "PC2 IAB 資料面啟動完成"` 這行沒有檢查前面指令的結果就直接印出來，讓 log 看起來像是「啟動完成」，其實整個沒跑。
+
+**根因**：CLAUDE.md 第 6 節早就記載「PC2 帳號是 `mcalab` 但仍在 `/home/lindor/openairinterface5g` 編譯（已手動建立 `/home/lindor` 目錄供其使用）」——這個安排隱含一個前提：正常透過互動式 SSH 登入 PC2 時，某個機制（很可能是 shell profile 或既有慣例）讓實際操作都在 `/home/lindor` 下進行；但 bash 的 `~` 展開是照**執行時的 `$HOME` 環境變數**展開，不是照腳本檔案實際存放的路徑展開。透過 `ssh pc2 'bash ...'` 這種非互動、一次性指令的方式呼叫，`$HOME` 就是 SSH 登入帳號（`mcalab`）的真正 home（`/home/mcalab`），跟腳本裡假設的 `/home/lindor` 對不上。
+
+**修復**：改用 `ssh pc2 'nohup env HOME=/home/lindor bash /home/lindor/openairinterface5g/.../run_local_pc2.sh > log 2>&1 &'`，顯式覆寫 `HOME` 環境變數，讓腳本內部所有 `~` 展開都對齊到正確目錄。**這個腳本本身也有一個獨立的小毛病**：`ok "..."` 收尾訊息沒有檢查前面指令的 exit code，之後可以考慮讓 `run_local_pc2.sh`／`run_local_pc3.sh` 在 `cd`/`bash iab/start_iab_pc*.sh` 失敗時直接 `exit 1`，不要把失敗的執行印成「完成」。
+
+### 坑 5：access DU 有第二張 macvlan 網卡時，F1 SCTP 會抄近路直接出 macvlan、繞過 internal bridge，導致回程封包被 Docker 對該 bridge 的預設隔離規則 DROP 掉
+
+**現象**：PC2 的 Node5、Node6，以及 PC3 用 `docker compose up -d --no-deps` 補啟動的 Node9、Node12，DU 容器本身正常執行、log 卡在 `waiting for F1 Setup Response before activating radio` 不動，CU 端完全沒有任何一行提到這些 DU（連拒絕訊息都沒有——不是 assoc 衝突）。用 `docker exec -u 0 <du容器> ip route`／`ip addr` 檢查排除了 netns 孤兒（坑2那種問題）：介面、IP 都正常。
+
+**排查方法（用 tcpdump 直接抓包，而非猜測）**：
+1. 在 CU 容器 netns 內對 `macvlan-br` 抓包，同時手動 `docker restart` 該 DU 容器觸發一次新的 SCTP 嘗試：確認 DU 送出的 `[INIT]` packet 有到達 CU，且 CU **立刻回了 `[INIT ACK]`**——代表去程完全正常，CU 應用層完全沒問題。
+2. 在 CU 端看不到任何後續的 `[COOKIE ECHO]`，代表 DU 從沒收到那個 INIT ACK、或收到了卻沒有回應。
+3. 到 DU 所在主機（PC2/PC3）的 internal bridge 介面（`br-xxxxxxxx`，對應 compose 裡的 `iab_internal_net`）上抓包：**完全零封包**——證實 CU 回覆的 INIT ACK 根本沒有進到這個 bridge 裡。
+4. 檢查該主機的 `iptables -L DOCKER-FORWARD -n -v`：Docker 針對每個 bridge 網路預設插入的規則是「該 bridge 自己送出去的封包一律 ACCEPT」＋「該 bridge 上明確 publish 的 port 各自有一條 ACCEPT」＋**「其餘從外部進到這個 bridge 的封包，若不是 RELATED/ESTABLISHED，一律 DROP」**。這個 DROP 規則在 PC2 上實測有 88 個封包命中，代表它真的在擋東西。
+5. 比對已知正常的節點（例如 PC3 的 Node10）跟出問題的節點（Node9）各自的 `ip route`：**Node10 多了一條 Node9 沒有的路由 `192.168.88.1 via 192.168.75.1 dev eth0`**（把「到 CU 的流量」明確導向 internal bridge 這個 gateway，而不是走 DU 自己另一張直連 macvlan 網卡的介面）。
+
+**根因**：這些 access DU 的 compose 服務**同時接了兩個網路**：`macvlan_net`（給它自己一個直連的 macvlan IP）跟 `iab_internal_net`（跟同主機的 MT 之間的私有 bridge，DU 對外宣告的 F1-C/GTP 位址是 internal bridge 這個 IP）。在沒有額外路由的情況下，Linux 核心選路徑是「看目的地」不是「看 socket bind 的來源位址」：到 CU（`192.168.88.1`）這個目的地，走 macvlan 網卡的直連路由（`192.168.88.0/24 dev ethX`）比走 internal bridge 的預設路由更明確（destination 直連 vs 走 gateway 的 default route），所以核心選擇讓 SCTP INIT 直接從 macvlan 網卡出去（外層 IP header 帶著 internal bridge 的來源位址，但実際出口是 macvlan 網卡）——**完全沒有經過 internal bridge**。因為去程沒經過 bridge，Docker/netfilter 在 bridge 這個 chain 上就沒有建立這條 flow 的 conntrack 紀錄；回程的 INIT ACK 依照 CU 的路由表（`192.168.74.0/24 via 192.168.88.2`／`192.168.75.0/24 via 192.168.88.3`，經由對方主機的 macvlan 端點）進到目的主機、想要轉發進 internal bridge 時，因為在 conntrack 裡查無 RELATED/ESTABLISHED 紀錄、又不是明確 publish 的 port，就被那條預設 DROP 規則擋掉——**這是不對稱路徑（去程繞過 bridge、回程需要進 bridge）撞上 Docker bridge 網路內建隔離機制的典型案例**，不是 F1AP/SCTP 本身的問題，也不是 CU 應用層的問題。
+
+**這也解釋了為什麼同樣拓樸位置的 Node10、Node11 當時是正常的**：它們是在 PC3 原本乾淨重啟流程裡、比較早的時間點就成功完成過一次 F1 SCTP association，那條 flow 早就在 conntrack 裡留下 ESTABLISHED 紀錄、之後就一路沿用下去；Node9、Node12 當時因為要等的 PC2 relay（Node3,4）還沒就緒而逾時被腳本跳過，從頭到尾沒建立過這條 flow，所以現在用 `docker compose up -d --no-deps` 手動補開時，是一次全新的、會撞上隔離規則的連線嘗試。Node5、Node6（PC2）也是同樣道理，只是換成因為 PC2 本身因坑4的 `~` 展開錯誤而完全沒啟動，兩個節點都從頭到尾沒機會建立過這條 flow。
+
+**修復**：對每個受影響的 access DU 容器，補上一條明確導向 internal bridge gateway 的 host route：
+```bash
+docker exec -u 0 <du容器> ip route add 192.168.88.1 via <該主機internal bridge gateway> dev <該DU接internal bridge的那張介面>
+```
+（介面名稱在不同容器裡可能是 `eth0` 也可能是 `eth1`，取決於 compose 裡兩個網路的宣告順序，不能寫死，每次都要先 `ip route`/`ip addr` 確認哪張介面接的是哪個網路。）補上路由後，DU process 自己內建的 F1 Setup 重試機制（實測約每 40~50 秒一次）會在下一次重試時自動走新路由成功——**不需要重啟 DU 容器**，補完路由等它自己重試就會成功。這條路由**不會在 `docker restart`／容器重建後保留**，是這個測試平台裡跟坑2「netns 孤兒」同一類「非持久化手動修復」，任何新建立或重啟過的 access DU 都要重新檢查、重新補這條路由。
+
+**額外的教訓（我自己在這次排查中犯的操作失誤）**：補完 DU-5 的路由後，我沒有先等它自己重試，就手動下了一次 `docker restart rfsim5g-iab-du-5`——事後翻 log 才發現 DU-5 其實已經靠自己的重試機制在補路由後成功過一次（`received F1 Setup Response`、`PHY ready`），我這次不必要的重啟把它重新打回「等待中」的狀態，等於是自己製造了一次可以避免的延誤。**教訓**：修好一個根因之後，如果那個 process 本身有已知的自動重試機制，應該先等待、用 log 確認它有沒有自己恢復，而不是預設「我修完了就該手動催一次」；手動介入的時機應該保留給「確認過該 process 沒有自動重試能力」的情況（例如坑2的 relay `network_mode: container:X` 那種，process 本身不會重新解析網路設定，非重啟/recreate 不可）。
+
+### 坑4、坑5 事後釐清：哪些是腳本本身的 bug（會一直重演），哪些不是（正常跑腳本就不會再發生）
+
+系統全部恢復後，重新檢查 `start_iab_pc2.sh`／`start_iab_pc3.sh`／`run_local_pc2.sh` 本體，把這兩個坑分清楚：
+
+* **坑5（access DU 缺到 CU 的 host route）其實不是腳本的 bug**。`start_iab_pc2.sh`（第174行）、`start_iab_pc3.sh`（第151行）在正常流程裡，每個 access DU 容器建立後本來就會執行 `docker exec -u 0 $DU_NAME ip route replace $SERVER_IP via ...`，內容跟這次手動補的路由完全一樣。這次會缺路由，是因為 Node5/6/9/12 在正常腳本流程裡先被「等 parent relay 逾時（120s）」邏輯整個跳過（腳本根本沒執行到這一步），事後用 `docker compose up -d --no-deps` 手動把它們補起來時，繞過了腳本接在容器建立後面的這段路由設定。**結論：只要腳本能完整跑完、沒有中途逾時跳過某個節點，這條路由就會自動補上，不會重演**；只有在「腳本判定逾時跳過→事後用非腳本方式手動補容器」這個特定組合下才會重現，往後若再遇到這種「等 parent 逾時被跳過」的節點，記得比照腳本第174/151行的邏輯手動補路由，而不是只補容器本身。
+* **坑4（`~` 展開成錯誤帳號 home 目錄）是真的腳本 bug，已直接修掉**。確認過 `mcalab` 帳號**互動式登入**的 `$HOME` 本來就是 `/home/mcalab`（`.bashrc`/`.profile` 都沒有覆寫成 `/home/lindor`），代表這不是「我用非互動 SSH 呼叫才會踩到」的特例，而是任何人用 `mcalab` 身份執行 `run_local_pc2.sh`（不管是互動登入後執行，還是透過 SSH 一次性指令）都會 100% 踩到。已直接把 `run_local_pc2.sh` 的 `COMPOSE_DIR=~/openairinterface5g/...` 改成寫死絕對路徑 `/home/lindor/openairinterface5g/...`，並把 `cd`／`bash iab/start_iab_pc2.sh` 兩步加上失敗就 `exit 1`（避免像這次一樣，實際執行失敗卻因為收尾的 `ok "..."` 沒檢查前面結果而看起來像成功），修好後已用 `rsync` 同步到 PC2。**PC1／PC3 的 `run_local_pc1.sh`／`run_local_pc3.sh` 用的都是 `lindor` 帳號，`~` 本來就對得上，沒有這個問題，不需要改。**

@@ -76,7 +76,19 @@ rrc_gNB_ue_context_t *rrc_gNB_allocate_new_ue_context(gNB_RRC_INST *rrc_instance
     LOG_E(NR_RRC, "Cannot allocate new ue context\n");
     return NULL;
   }
-  new_p->ue_context.rrc_ue_id = uid_linear_allocator_new(&rrc_instance_pP->uid_allocator) + 1;
+  uid_t new_uid = uid_linear_allocator_new(&rrc_instance_pP->uid_allocator);
+  // [2026-09-12 修復] uid_linear_allocator_new() 池耗盡時回傳 UINT_MAX，若不檢查直接
+  // +1 會整數溢位變成 0，撞上既有 rrc_ue_id 造成 AssertFatal 讓整個 CU process 崩潰
+  // （"UE F1 Context for ID 0 already exists, logic bug"）。長時間/高流動率的測試場景
+  // （大量 UE 反覆重新附著/RRC Reestablishment）足以耗盡這個固定 1024 個的池，改成
+  // 優雅回傳 NULL（呼叫端 rrc_gNB_create_ue_context 已經有處理 NULL 的既有邏輯），
+  // 不要讓一次池耗盡演變成整個 CU 當機、系統全部 UE IP 洗牌。
+  if (new_uid == UINT_MAX) {
+    LOG_E(NR_RRC, "UE ID allocator exhausted (pool size %d), rejecting new UE context\n", UID_LINEAR_ALLOCATOR_SIZE);
+    free(new_p);
+    return NULL;
+  }
+  new_p->ue_context.rrc_ue_id = new_uid + 1;
   rrc_gNB_ue_context_update_time(new_p);
 
   LOG_D(NR_RRC, "Returning new RRC UE context RRC ue id: %d\n", new_p->ue_context.rrc_ue_id);

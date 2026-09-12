@@ -322,14 +322,28 @@ void rrc_gNB_process_f1_setup_req(f1ap_setup_req_t *req, sctp_assoc_t assoc_id)
   nr_rrc_du_container_t *it = NULL;
   RB_FOREACH(it, rrc_du_tree, &rrc->dus) {
     if (it->setup_req->gNB_DU_id == req->gNB_DU_id) {
-      LOG_E(NR_RRC,
-            "gNB-DU ID: existing DU %s on assoc_id %d already has ID %ld, rejecting requesting gNB-DU\n",
+      // [2026-09-12 修復] 過去這裡看到同一個 gNB_DU_id 就直接拒絕新的 F1 Setup
+      // Request，隱含假設「舊的那筆 assoc_id 紀錄一定還是活的連線」。但如果舊的
+      // DU（同一個 container 因為任何原因被 recreate/restart）並沒有走乾淨的
+      // SCTP SHUTDOWN，CU 這邊永遠不會收到 f1_lost_connection 通知去清掉這筆
+      // 舊紀錄——導致同一個 DU ID 之後永遠連不上，即使舊的那個 SCTP association
+      // 底層其實早就不存在（kernel 層級的 assoc_id 數字後來甚至可能被回收給完全
+      // 無關的連線用）。這在有大量 DU 重啟/recreate 的部署環境下會持續發生，不是
+      // 罕見的邊角案例。既然同一個 DU ID 送來新的 F1 Setup Request 幾乎必然代表
+      // 「舊連線已經死了、DU 正在用新的 SCTP 連線重新註冊」（一個還活著的 DU 不會
+      // 無緣無故重送 F1 Setup Request），改成比照 rrc_CU_process_f1_lost_connection()
+      // 的邏輯清掉這筆舊紀錄（含釋放資源、讓舊連線底下的 UE context 正確失效），
+      // 再繼續往下走正常的新 DU 註冊流程，而不是直接拒絕。
+      LOG_W(NR_RRC,
+            "gNB-DU ID: existing DU %s on assoc_id %d already has ID %ld, treating as stale entry from a "
+            "DU reconnect and replacing it with the new F1 Setup Request on assoc_id %d\n",
             it->setup_req->gNB_DU_name,
             it->assoc_id,
-            it->setup_req->gNB_DU_id);
-      fail.cause = F1AP_CauseMisc_unspecified;
-      rrc->mac_rrc.f1_setup_failure(assoc_id, &fail);
-      return;
+            it->setup_req->gNB_DU_id,
+            assoc_id);
+      f1ap_lost_connection_t lc = {0};
+      rrc_CU_process_f1_lost_connection(rrc, &lc, it->assoc_id);
+      break;
     }
     // note: we assume that each DU contains only one cell; otherwise, we would
     // need to check every cell in the requesting DU to any existing cell.

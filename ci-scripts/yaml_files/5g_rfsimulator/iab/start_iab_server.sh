@@ -180,7 +180,11 @@ configure_and_start_local_access_du() {
 wait_for_local_relay_du_healthy() {
     local DU_NAME=$1
     local COUNT=0
-    while [ $COUNT -lt 20 ]; do
+    # [2026-09-12 修復] 20 圈(每圈最多 sleep 3s，約 60s)對 relay 曾經觀察到的 CU stale
+    # F1 association 重試骨牌效應（實測要 100+ 秒才自然解開）來說不夠，拉長到 40 圈
+    # (~120s)，減少「relay 還沒真的穩定，但這裡已經逾時放行，導致下游 access node
+    # 的 120s 倒數在 relay 準備好之前就先開始算」這種銜接失準的情況。
+    while [ $COUNT -lt 40 ]; do
         local STATUS=$(docker inspect -f '{{.State.Status}}' "$DU_NAME" 2>/dev/null)
         local RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$DU_NAME" 2>/dev/null)
         if [ "$STATUS" = "running" ]; then
@@ -233,7 +237,11 @@ for n in 7 8; do
     COUNT=0
     while ! docker exec "${LOCAL_ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; do
         sleep 5; COUNT=$((COUNT+1))
-        [ $COUNT -ge 24 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(120s)，跳過${NC}"; break; }
+        # [2026-09-12 修復] 120s 對 relay 偶爾要 100+ 秒才穩定（CU stale F1 association
+        # 重試骨牌效應）來說太短，一旦逾時整個 configure_and_start_local_access_du()
+        # 就永遠不會被呼叫（包含正確的 DNAT/NAT/route 設定），導致這個 access node 永久
+        # 卡住、需要事後手動補。拉長到 300s 給 relay 更多穩定時間，避免整組設定被跳過。
+        [ $COUNT -ge 60 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(300s)，跳過${NC}"; break; }
     done
     if docker exec "${LOCAL_ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
         configure_and_start_local_access_du "${LOCAL_ACCESS_MT_NAME[$n]}" "${LOCAL_ACCESS_DU_NAME[$n]}" "${LOCAL_ACCESS_DU_IP[$n]}"

@@ -102,22 +102,62 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
 
 目標：在同一組流量+路徑損耗場景下，依序驗證 5 個遞增複雜度的控制策略，**每一階的實驗數據（TCP-DL、Latency、UDP-DL/UL、Jain's Fairness Index 等）都必須贏過前一階**，最終逼近吞吐量理論上限。
 
-| Stage | 策略 | Local DRL reward | FL 聚合方式 |
-|---|---|---|---|
-| 1 | PF baseline | 無（無 AI） | 無 |
-| 2 | avg FL | 陽春版（`REWARD_MODE=throughput_only`：只有 throughput，無 Lagrangian／無限制式） | 標準 FedAvg，全部 12 節點一起聚合 |
-| 3 | cluster FL | 陽春版（同 Stage 2） | 依角色分兩群聚合：relay cluster（Node1~4）、access cluster（Node5~12）各自獨立 FedAvg |
-| 4 | 自訂 FL | 陽春版（同 Stage 2） | 使用者自行設計的聚合演算法（介面待設計） |
-| 5 | 自訂 FL + 改進版 DRL | 改進版（`REWARD_MODE=lagrangian`：重新啟用 `drl_agent.py` 已寫好但目前未使用的 Lagrangian JFI 限制機制） | 同 Stage 4 |
+| Stage | 策略 | Global 層（配額協調/FL 聚合） | Local 層（單節點 DRL） | 狀態 |
+|---|---|---|---|---|
+| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **待重測**（2026-09-12 舊數據見 `experiment_results/PF.md`：併發 JFI=0.2619、單一 UE 平均吞吐量約 6.72 Mbps——**這份數據是「backhaul-aware 動態 PRB 預算機制」上線前**量測的，機制上線後 PF 本身的行為會改變，必須重測才能當作後續 Stage 的比較基準） |
+| 2 | avg FL + 最基礎 DRL | Global xApp+Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | 未開始 |
+| 3 | cluster FL + 最基礎 DRL | Global xApp+Global rApp：Cluster FL，依角色分兩群聚合：relay cluster（Node1~4）、access cluster（Node5~12）各自獨立 FedAvg | Local xApp+Local rApp：最基礎 DRL（同 Stage 2，模型不變，只有 Global 聚合方式不同） | 未開始 |
+| 4 | 自訂 FL + 最基礎 DRL | Global xApp+Global rApp：自訂聚合演算法（介面待設計） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2/3） | 未開始 |
+| 5 | 自訂 FL + 改良版 DRL | Global xApp+Global rApp：自訂聚合演算法（同 Stage 4，不變） | Local xApp+Local rApp：改良版 DRL（`REWARD_MODE=lagrangian`，重新啟用 Lagrangian JFI 限制機制） | 未開始 |
 
-**單調遞增要求**：PF < avg FL < cluster FL < 自訂 FL < 自訂FL+改進版DRL。
+**Stage 1 量測方法**（後續 Stage 2~5 沿用同一套方法以確保公平比較）：`iab/measure_stage.py` 與 `scenarios/traffic_scenario.py` 同時執行，併發取樣全部 17 個 UE 在同一組動態流量+路徑損耗場景下的即時吞吐量與 RTT；每個 stage 的完整數據與量測日期記錄在 `experiment_results/<方法名>.md`（例如 `PF.md`、`avgFL.md`、`clusterFL.md`）。
+
+**單調遞增要求**：PF < avg FL + 最基礎DRL < cluster FL + 最基礎DRL < 自訂FL + 最基礎DRL < 自訂FL + 改良版DRL。Stage 2→3→4 只換 Global 聚合方式、Local 模型不變，用來單獨驗證「聚合策略」的貢獻；Stage 4→5 只換 Local reward 機制、Global 聚合不變，用來單獨驗證「改良版 DRL（Lagrangian）」的貢獻——每次只換一個變數，才能把進步歸因到正確的地方。
 
 **關鍵設計決定（避免混淆）**：
 * Stage 2~4 底層用的是**同一個**陽春 DRL（只差 FL 聚合方式），不是三種不同的模型。
-* 「改進版 DRL」= 重新啟用現有**已經寫好但目前沒被呼叫**的 Lagrangian 機制。目前 `inference_server.py` 唯一呼叫的是 `reward_calculator.py::compute_lagrangian_reward()`（`R = R_tp + λ·(JFI_raw − JFI_MIN)`，λ 由 `drl_agent.py::train_on_batch()` 自適應更新）——**這已經是有 Lagrangian 項的版本**，不是本檔案曾經誤植的純加權和版本。要做到 Stage 2~4 的「陽春」reward，需要新增一個 `REWARD_MODE` 開關（`throughput_only` 時改呼叫 `compute_reward`/`compute_reward_breakdown`，`W_THROUGHPUT=1.0, W_FAIRNESS=0, W_DELAY=0`，並讓 λ 固定在 0），這是待實作項目。
+* 「改進版 DRL」= 重新啟用現有的 Lagrangian 機制。**`REWARD_MODE` 開關已實作完成**（2026-09-12）：環境變數預設 `lagrangian`（維持現行行為，`inference_server.py` 呼叫 `reward_calculator.py::compute_lagrangian_reward()`，`R = R_tp + λ·(JFI_raw − JFI_MIN)`，λ 由 `drl_agent.py::train_on_batch()` 自適應更新）；設成 `throughput_only` 時改呼叫 `compute_reward_breakdown()`（純 throughput，`W_THROUGHPUT=1.0, W_FAIRNESS=0, W_DELAY=0`），且 `drl_agent.py` 會跳過 λ 更新（恆為 `LAMBDA_INIT=0.0`）。用法：`REWARD_MODE=throughput_only bash iab/run_local_pc1.sh`（12 個 `inference-nodeN` 服務的 `docker-compose-iab-server.yaml` 都已接上 `${REWARD_MODE:-lagrangian}`）。**切換 REWARD_MODE 前務必清空 MongoDB 經驗與模型 checkpoint**，reward 語意改變不能混在同一批訓練資料裡（沿用既有先例）。
 * **不寫死、隨時可單獨跑任一 stage**：每個 stage 要能透過環境變數/CLI flag 獨立選擇（例如 `FL_MODE=none|avg|cluster|custom` + `REWARD_MODE=throughput_only|lagrangian`），不是「一定要照順序、前面沒做完後面就不能跑」的線性相依關係——不論開發進度到哪，都要能重跑任何一個 stage 的數據。
-* Stage 3 的 cluster 分群邏輯可參考 `inference/DRL_METHODOLOGY_PLAN.md`（舊 5-node 版本的 relay/access 分群設計，需要重新推導成 4/8 分群）。
+* Stage 3 的 cluster 分群邏輯可參考 `inference/DRL_METHODOLOGY_PLAN.md`（舊 5-node 版本的 relay/access 分群設計，需要重新推導成 4/8 分群；分群理由本來是「relay 中繼下游流量、access 直接面對 UE，結構不同」——這個理由在加入下方 backhaul-aware PRB 預算機制後仍然成立，因為 relay 的下游是「其他有 DU 的節點」、access 的下游是「純 UE」，性質確實不同，但兩者現在都同樣會被 backhaul 使用量壓縮 PRB 預算，不是只有 relay 才有這個約束）。
 * Global xApp／Flower FL 的完整舊版部署細節（SuperLink/SuperNode 拓樸、client/server app 邏輯）在 `HISTORY.md`，復原時可直接參考架構，但節點數/角色分群需要重新推導成新的 12-node 拓樸。
+
+### 環境層新增機制：Backhaul-aware 動態 PRB 預算（五階段共用，2026-09-12 設計討論）
+
+**動機**（詳細討論過程見 `HISTORY.md`）：現行架構每個 Node 各自跑獨立的 rfsimulator 載波，彼此不搶頻譜，這本身是合理的 IAB 模擬簡化（對應 3GPP IAB 的 MT+DU 分裂架構、多 hop backhaul 聚合排程問題都有確實模擬到），但**每個節點自己的 MT（連上層 backhaul）跟 DU（服務下游）之間目前完全獨立，沒有互相牽制**——這跟真實 IAB 的 H/S/NA（Hard/Soft/Not-Available）資源分時機制不符：真實系統裡，一個節點的 DU 能不能用某段資源，取決於當下 MT 有沒有在用同一份資源做 backhaul。
+
+**適用範圍**：Node1~Node12 全部 12 個節點都要套用（不是只有「relay」Node1~4）——因為 Node5~12（access）一樣有自己的 MT（連上層 relay）+ DU（服務底下的 UE 或再下一層 access），一樣存在 MT/DU 資源互搶的問題，只是它們的下游是純 UE、relay 的下游是其他節點，這點不影響「MT 用得多、DU 就該分得少」這個規則本身。
+
+**機制設計（核心規則，符合真實 H/S/NA 語意）**：
+1. 每個排程週期開始前，**先**根據該節點當下 MT backhaul 的即時使用量，算出「這個節點的 DU 這次排程週期實際可用的 PRB 數量」（<106，隨 MT 忙碌程度動態縮小）。
+2. 這個縮小後的可用 PRB 數量，是排程器（不管是 OAI 內建 PF 演算法，還是 xApp/DRL 的權重陣列）的**輸入**，不是對輸出結果的事後裁切——真實系統的 H/S/NA 資源分類是排程器「看不到」被劃走的資源，不是「排完再砍」。
+3. **必須實作在 OAI MAC 排程器的 C 語言層**（很可能是 `gNB_scheduler_dlsch.c`，已在第 7 節「共用底層檔案」清單中），讓這個縮小規則對 PF 跟 DRL 兩種排程來源都一視同仁地生效——因為 Stage 1 PF baseline 完全沒有 xApp 介入，如果這個機制只寫在 xApp 裡，PF baseline 就吃不到這個約束，會破壞跨 Stage 比較的公平性（每一階都必須面對「同一份被壓縮過的資源池」，差別只在池子裡怎麼分）。
+4. 目前**尚未實作**，公式（MT 使用量怎麼換算成 DU 可用 PRB 上限的具體比例關係）也還沒設計，是下一步要確認的技術細節。
+
+**各開發階段需要注意的事**：
+
+* **Stage 1（PF baseline）**：
+  - 這個機制上線後，OAI 需要在**全部三台主機重新編譯**（`build_oai`），Stage 1 baseline **必須重新量測**——2026-09-12 量出來的 `PF.md` 舊數據是機制上線前的結果，不能拿來跟 Stage 2 以後比較。
+  - 因為改動的是 MAC 排程器核心邏輯、影響全部 12 個節點，改完要先做回歸測試（跑一輪確認 13/13 E2、17/17 UE 附著、基本 iperf3 吞吐量正常），確認沒有把既有功能改壞，再重新量測 PF baseline。
+  - PF 這邊不需要額外開發（它本來就不讀任何自訂 state），縮小可用 PRB 池這件事對 PF 排程器是透明的。
+
+* **Stage 2（avg FL + 最基礎 DRL）**：
+  - 這是第一個要接上 Global xApp/Global rApp 的階段，`global_xapp.py`／`global_xapp_bridge.py`／`inference/flower-app/` 都要先針對 12-node 拓樸重建（目前是舊 5-node 版本，尚未重建）。
+  - 建議評估是否要讓 Local DRL 的 state 多一個「這次排程週期實際可用 PRB 數量／106 的比例」特徵，讓 Actor 能感知 backhaul 緊繃程度、提前做出更聰明的決策（而不是每次都假設有滿的 106 可用，被動被縮減）——這是可選的優化，不是正確性必要條件（縮減是 C 語言層強制生效的，DRL 不知道這個特徵也不會違規，只是可能學得比較慢/比較不精準）。若要加，`STATE_DIM` 會變動，屬於破壞性變更。
+  - 啟動這個 Stage 前，**MongoDB 經驗與模型 checkpoint 要重新清空**：一來 `REWARD_MODE` 從 lagrangian 切到 throughput_only（既有規則），二來如果上面那條也一起做了，環境本身的 state/action 動態都變了，舊經驗不能混用。
+  - 全網 JFI（`compute_global_jfi()`，舊版已有但只做監控）如果要在這個階段就開始納入聚合權重或做為額外訊號，需要明確決定；如果沒有，`avgFL.md` 的全網 JFI 表現可能改善有限，屬於預期內、不是 bug。
+
+* **Stage 3（cluster FL + 最基礎 DRL）**：
+  - Local 模型架構跟 Stage 2 完全相同，只換 Global 聚合的分群方式，訓練資料/checkpoint 是否需要清空，取決於「換聚合方式」算不算破壞性變更——建議清空，避免 Stage 2 殘留的聚合結果污染 Stage 3 的量測（FL 聚合的效果評估需要乾淨的起點）。
+  - `DRL_METHODOLOGY_PLAN.md` 提到的舊版分群邏輯要重新推導成 4/8 分群（relay 4 個、access 8 個），確認 `min_train_nodes`/`min_evaluate_nodes` 等 Flower 參數有沒有跟著調整。
+
+* **Stage 4（自訂 FL + 最基礎 DRL）**：
+  - 自訂聚合演算法介面要先設計出來（目前 CLAUDE.md 標註「待設計」），建議設計時就把「要不要把全網 JFI 或 backhaul 緊繃程度也當作聚合權重的輸入」一併考慮進去，呼應第 3 節開頭「Global 智慧分配」要解決的是全網協調問題，不能只是換一種模型平均方式。
+  - 同樣建議 MongoDB/checkpoint 重新清空。
+
+* **Stage 5（自訂 FL + 改良版 DRL）**：
+  - 這階段**只換** `REWARD_MODE=lagrangian`（Local 層），Global 聚合方式維持跟 Stage 4 一樣不變——這是刻意設計，用來單獨驗證「加回 Lagrangian 限制式」的貢獻，不要在這階段順便改動 Global 聚合邏輯，否則進步幅度無法歸因。
+  - 必須清空 MongoDB/checkpoint（既有規則，reward 語意改變）。
+  - 這是五階段的終點，驗收標準是全部指標（TCP-DL、Latency、UDP-DL/UL、JFI）都優於前四階，尤其 JFI 應該是全程最高（Lagrangian 機制專門在管這件事）。
 
 ### 待開發：實驗數據驗證與論文撰寫
 * 設定動態干擾與高負載測試情境（見下方流量場景設計）。

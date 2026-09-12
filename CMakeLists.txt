@@ -1232,6 +1232,7 @@ set (MAC_NR_SRC
   ${NR_GNB_MAC_DIR}/mac_rrc_ul_direct.c
   ${NR_GNB_MAC_DIR}/mac_rrc_ul_f1ap.c
   ${NR_GNB_MAC_DIR}/nr_radio_config.c
+  ${NR_GNB_MAC_DIR}/nr_mac_gNB_backhaul_poll.c
  )
 
 
@@ -1880,6 +1881,8 @@ add_executable(nr-uesoftmodem
   ${OPENAIR1_DIR}/PHY/TOOLS/phy_scope_interface.c
   ${NFAPI_USER_DIR}/nfapi.c
   ${PHY_INTERFACE_DIR}/queue_t.c
+  # [Backhaul-aware PRB budget] MT 端暴露 backhaul 使用量的 telnetsrv 命令
+  ${OPENAIR_DIR}/common/utils/telnetsrv/telnetsrv_bhload.c
   )
 
 target_link_libraries(nr-uesoftmodem PRIVATE

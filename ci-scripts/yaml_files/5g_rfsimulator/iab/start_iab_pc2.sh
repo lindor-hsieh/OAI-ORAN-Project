@@ -183,7 +183,7 @@ configure_and_start_access_du() {
 wait_for_relay_du_healthy() {
     local DU_NAME=$1
     local COUNT=0
-    while [ $COUNT -lt 20 ]; do
+    while [ $COUNT -lt 40 ]; do
         local STATUS=$(docker inspect -f '{{.State.Status}}' "$DU_NAME" 2>/dev/null)
         local RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$DU_NAME" 2>/dev/null)
         if [ "$STATUS" = "running" ]; then
@@ -266,7 +266,7 @@ for n in 5 6; do
     COUNT=0
     while ! docker exec "${ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; do
         sleep 5; COUNT=$((COUNT+1))
-        [ $COUNT -ge 24 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(120s)，跳過${NC}"; break; }
+        [ $COUNT -ge 60 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(300s)，跳過${NC}"; break; }
     done
     if docker exec "${ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
         configure_and_start_access_du "${ACCESS_MT_NAME[$n]}" "${ACCESS_DU_NAME[$n]}" "${ACCESS_DU_IP[$n]}"

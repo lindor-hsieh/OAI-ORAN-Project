@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include "common/utils/ds/seq_arr.h"
 #include "common/utils/nr/nr_common.h"
 #include "common/utils/ds/byte_array.h"
@@ -989,6 +990,10 @@ typedef struct gNB_MAC_INST_s {
     uint16_t slot_mask[XAPP_MAX_UE];   // 各 UE 時域 Slot 遮罩 (0xFFFF=全開)
   } xapp_2d_ctrl;
   // -------------------------------------------
+
+  // [Backhaul-aware PRB budget] 本節點 MT backhaul 使用率，由獨立輪詢執行緒寫入
+  // 1.0 = 無約束（預設值 / Donor 無 MT 時恆為此值）；0.0 = MT 完全占滿，DU 無可用 PRB
+  _Atomic float backhaul_prb_ratio;
 } gNB_MAC_INST;
 
 #endif /*__LAYER2_NR_MAC_GNB_H__ */

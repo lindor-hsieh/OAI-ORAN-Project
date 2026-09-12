@@ -1038,6 +1038,8 @@ static int nr_ue_process_dci_dl_10(NR_UE_MAC_INST_t *mac,
       current_harq->round++;
     if (current_harq->round < sizeofArray(mac->stats.dl.rounds))
       mac->stats.dl.rounds[current_harq->round]++;
+    // [Backhaul-aware PRB budget] 累積 DL RB 使用量，供 relay 節點的 MT 端 telnetsrv 暴露給自己的 DU 輪詢
+    mac->stats.dl.rb_size += dlsch_pdu->number_rbs;
   }
 
   LOG_D(MAC,
@@ -1344,6 +1346,8 @@ static int nr_ue_process_dci_dl_11(NR_UE_MAC_INST_t *mac,
     current_harq->round++;
   if (current_harq->round < sizeofArray(mac->stats.dl.rounds))
     mac->stats.dl.rounds[current_harq->round]++;
+  // [Backhaul-aware PRB budget] 累積 DL RB 使用量，供 relay 節點的 MT 端 telnetsrv 暴露給自己的 DU 輪詢
+  mac->stats.dl.rb_size += dlsch_pdu->number_rbs;
   // send the ack/nack slot number to phy to indicate tx thread to wait for DLSCH decoding
   dlsch_pdu->k1_feedback = feedback_ti;
 

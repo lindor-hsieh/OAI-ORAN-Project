@@ -47,6 +47,7 @@
 #include "NR_MAC_gNB/mac_proto.h"
 #include "NR_MAC_gNB/mac_rrc_ul.h"
 #include "NR_MAC_gNB/nr_mac_gNB.h"
+#include "NR_MAC_gNB/nr_mac_gNB_backhaul_poll.h"
 #include "NR_PHY_INTERFACE/NR_IF_Module.h"
 #include "NR_RLC-BearerConfig.h"
 #include "NR_RadioBearerConfig.h"
@@ -297,6 +298,16 @@ void mac_top_init_gNB(ngran_node_t node_type,
       RC.nrmac[i]->cset0_bwp_size = 0;
 
       pthread_mutex_init(&RC.nrmac[i]->sched_lock, NULL);
+
+      // [Backhaul-aware PRB budget] 顯式初始化為 1.0（無約束）；不能依賴 struct zero-init，
+      // 那樣會是 0.0（=完全無可用資源），語意相反。Donor 沒有 MT/輪詢執行緒時會恆為此值。
+      atomic_init(&RC.nrmac[i]->backhaul_prb_ratio, 1.0f);
+      // --backhaul-mt-telnet-port <=0（例如 Donor 沒有 MT）時，函式內部直接不啟動輪詢執行緒
+      // softmodem_params 是 softmodem-common.c 內的 static 變數，其他檔案只能透過
+      // get_softmodem_params() 這個既有的 getter 存取，不能直接用 BACKHAUL_MT_TELNET_* 巨集
+      // （那兩個巨集展開後直接引用 softmodem_params 這個符號，只在 softmodem-common.c 本檔內有效）。
+      softmodem_params_t *sp = get_softmodem_params();
+      start_backhaul_poll_thread(RC.nrmac[i], sp->backhaul_mt_telnet_port, sp->backhaul_mt_telnet_addr);
 
       pthread_mutex_init(&RC.nrmac[i]->UE_info.mutex, NULL);
       uid_linear_allocator_init(&RC.nrmac[i]->UE_info.uid_allocator);

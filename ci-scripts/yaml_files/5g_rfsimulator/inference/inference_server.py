@@ -36,7 +36,7 @@ import pymongo
 import zmq
 
 from drl_agent import DRLAgent, MAX_UE_COUNT
-from reward_calculator import compute_lagrangian_reward
+from reward_calculator import REWARD_MODE, compute_lagrangian_reward, compute_reward_breakdown
 from training_pipeline import run_training_round
 
 # =============================================================================
@@ -513,15 +513,24 @@ class InferenceServer:
         reward 以上一步的 (state, action) 與當前 state 計算，
         實現 one-step TD 結構。
         """
-        # 計算獎勵：R(A_{t-1}, S_t)（Lagrangian 限制式，見 reward_calculator.py）
+        # 計算獎勵：R(A_{t-1}, S_t)。
         # 使用 curr_ues（S_t）而非 prev_ues（S_{t-1}）：
         # S_t.delta_tbs 反映的是 A_{t-1} 排程後的 DL 吞吐量，
         # 才是 A_{t-1} 真正造成的結果。
-        result = compute_lagrangian_reward(
-            curr_ues, prev_allocations,
-            lambda_val=self._agent.lambda_,
-            total_prb=self.total_prb,
-        )
+        # REWARD_MODE=throughput_only（五階段路線圖 Stage 2~4 用陽春版）時改用
+        # 純 throughput 的 compute_reward_breakdown()，不含 JFI 限制式；
+        # 預設 lagrangian 維持現行行為（見 reward_calculator.py）。
+        if REWARD_MODE == "throughput_only":
+            result = compute_reward_breakdown(
+                curr_ues, prev_allocations,
+                total_prb=self.total_prb,
+            )
+        else:
+            result = compute_lagrangian_reward(
+                curr_ues, prev_allocations,
+                lambda_val=self._agent.lambda_,
+                total_prb=self.total_prb,
+            )
         reward = result["reward"]
         is_idle = result["r_throughput"] < 1e-9
 

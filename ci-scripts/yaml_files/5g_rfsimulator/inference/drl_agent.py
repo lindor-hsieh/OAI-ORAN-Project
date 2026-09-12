@@ -52,7 +52,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from reward_calculator import JFI_MIN
+from reward_calculator import JFI_MIN, REWARD_MODE
 
 # =============================================================================
 # 超參數
@@ -558,10 +558,16 @@ class DRLAgent:
         batch_jfi_mean: Optional[float] = None
         if jfi_vals:
             batch_jfi_mean = float(np.mean(jfi_vals))
-            self._lambda = max(0.0, min(
-                LAMBDA_MAX,
-                self._lambda + LAMBDA_LR * (JFI_MIN - batch_jfi_mean),
-            ))
+            # REWARD_MODE=throughput_only（陽春版，見 CLAUDE.md 五階段路線圖
+            # Stage 2~4）時跳過 λ 更新，self._lambda 恆為 LAMBDA_INIT（0.0）
+            # ——等同沒有 Lagrangian 限制式，reward 只剩 inference_server.py
+            # 那邊改用的 compute_reward_breakdown() 純 throughput 分量。
+            # batch_jfi_mean 本身仍照算，維持監控用的 log/metrics 不受影響。
+            if REWARD_MODE != "throughput_only":
+                self._lambda = max(0.0, min(
+                    LAMBDA_MAX,
+                    self._lambda + LAMBDA_LR * (JFI_MIN - batch_jfi_mean),
+                ))
 
         # ── 建立 Tensor（延伸序列，見 _build_sequence_tensors 說明）────────
         ext_states, ext_masks, rewards, actions = self._build_sequence_tensors(batch)

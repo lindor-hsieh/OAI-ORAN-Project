@@ -4,7 +4,10 @@ server_app.py — Phase 5 Global rApp / Flower ServerApp
 取代已 deprecated 的 `fl.server.start_server()` 寫法（舊草稿 flower_server.py 已刪除，
 compute_global_jfi() 邏輯已搬進本檔案，本檔案是實際運作版本）。用新版
 ServerApp + `flwr run` 部署，透過 SuperLink + SuperNode（非 Simulation
-Engine，5 個節點是實體分散的 process，不是模擬的虛擬 client）。
+Engine，全部 NUM_NODES 個節點是實體分散的 process，不是模擬的虛擬 client）。
+Stage 2 起套用於 12-node 拓樸（`FL_NUM_NODES=12`），程式邏輯本身不需為
+節點數變動修改——本檔案是舊版 5-node 開發時期寫的，早已用 NUM_NODES 環境
+變數泛化，只是這份 docstring 沿用了舊敘述，一併更新避免誤導。
 
 職責：
   - 啟動時嘗試從 Node1 現有 checkpoint 讀取初始權重當作第一輪的種子
@@ -14,8 +17,8 @@ Engine，5 個節點是實體分散的 process，不是模擬的虛擬 client）
     critic 權重），聚合完成後額外從 MongoDB 計算全網 Jain's Fairness
     Index 並記錄到這輪的 metrics——**目前僅供監控／log，尚未實作
     JFI-guided 的聚合權重調整**（見 CLAUDE.md 第五階段待開發項目）。
-  - 強制 5 個節點全部參與（min_train_nodes=min_available_nodes=5）。
-  - 聚合完成後把最終權重寫回全部 5 個節點的 checkpoint（不只是送出
+  - 強制全部 NUM_NODES 個節點參與（min_train_nodes=min_available_nodes=NUM_NODES）。
+  - 聚合完成後把最終權重寫回全部 NUM_NODES 個節點的 checkpoint（不只是送出
     initial_arrays 的那個節點），讓各節點的 InferenceServer._reload_worker
     真正撿到「聚合後」的全域模型，而不只是自己聚合前的本地微調結果。
 """
@@ -38,7 +41,7 @@ from flwr.serverapp.strategy import FedAvg  # noqa: E402
 
 from drl_agent import DRLAgent  # noqa: E402
 
-NUM_NODES: int = int(os.getenv("FL_NUM_NODES", "5"))  # smoke test 可設 1 跑單節點
+NUM_NODES: int = int(os.getenv("FL_NUM_NODES", "12"))  # smoke test 可設 1 跑單節點
 JFI_LOOKBACK: int = 100  # 每節點取最近 N 筆 reward 算 JFI 代理值
 
 MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -63,7 +66,7 @@ def _split_flat_state_dict(flat: dict) -> tuple[dict, dict]:
 
 
 def _model_dir_for_node(node_id: int) -> str:
-    """各節點 checkpoint 目錄——flower-superlink 容器把 5 個節點的
+    """各節點 checkpoint 目錄——flower-superlink 容器把全部 NUM_NODES 個節點的
     inference_models_nodeN volume 都掛在 /app/models_node{N}（見 compose）。"""
     return os.environ.get(f"MODEL_DIR_NODE{node_id}", f"/app/models_node{node_id}")
 
@@ -101,7 +104,20 @@ class IABFedAvg(FedAvg):
         self._db = db
 
     def aggregate_train(self, server_round, replies):
-        arrays, metrics = super().aggregate_train(server_round, replies)
+        # 冷啟動邊界情況：MongoDB 剛清空、還沒有任何節點累積到足夠訓練資料
+        # 時，全部節點的 num-examples 皆為 0，Flower 內建的
+        # aggregate_arrayrecords() 會用 total_weight=sum(weights)=0 做除法
+        # 直接 ZeroDivisionError。這不是錯誤，只是「這輪沒有新資料可聚合」，
+        # 跳過本輪聚合（回傳 arrays=None，strategy.start() 會自動沿用上一輪
+        # 的權重，等同 no-op），不能讓常駐的 flower-scheduler 因此崩潰。
+        try:
+            arrays, metrics = super().aggregate_train(server_round, replies)
+        except ZeroDivisionError:
+            print(
+                f"[server_app] Round {server_round}: 全部節點 num-examples=0"
+                "（尚無足夠訓練資料），跳過本輪聚合"
+            )
+            arrays, metrics = None, MetricRecord({"num-examples": 0})
 
         jfi = 0.0
         if self._db is not None:
@@ -115,6 +131,19 @@ class IABFedAvg(FedAvg):
 
         return arrays, metrics
 
+    def aggregate_evaluate(self, server_round, replies):
+        # 同 aggregate_train() 的冷啟動邊界情況：evaluate 階段全部節點
+        # num-examples=0 時（尚無足夠序列可評估）一樣會在 Flower 內建的
+        # aggregate_metricrecords() 除以 0，同樣降級為「這輪沒有 metrics」。
+        try:
+            return super().aggregate_evaluate(server_round, replies)
+        except ZeroDivisionError:
+            print(
+                f"[server_app] Round {server_round}: evaluate 全部節點 "
+                "num-examples=0，跳過本輪 evaluate 聚合"
+            )
+            return None
+
 
 def _seed_initial_arrays() -> ArrayRecord:
     """啟動時嘗試載入 Node1 現有 checkpoint 當作第一輪的初始權重種子；沒有則隨機初始化。"""
@@ -125,7 +154,7 @@ def _seed_initial_arrays() -> ArrayRecord:
 
 
 def _broadcast_aggregated_weights(arrays: ArrayRecord) -> None:
-    """把聚合後的全域權重寫回全部 5 個節點的 checkpoint。
+    """把聚合後的全域權重寫回全部 NUM_NODES 個節點的 checkpoint。
 
     只把 initial_arrays 種子存回 Node1、或只讓各節點各自保留自己聚合前
     ClientApp.train() 存的本地微調結果，都不是真正的聯邦學習——FedAvg
@@ -183,4 +212,14 @@ def main(grid: Grid, context: Context) -> None:
         num_rounds=num_rounds,
     )
 
-    _broadcast_aggregated_weights(result.arrays)
+    # 冷啟動邊界情況（見 IABFedAvg.aggregate_train() 的說明）：若每一輪都
+    # 因為全部節點 num-examples=0 而跳過聚合，result.arrays 會是空的
+    # ArrayRecord（Strategy.start() 只在 aggregate_train 回傳非 None 時才會
+    # 寫入 result.arrays，从未寫入時維持預設空值）——這種情況下不能廣播，
+    # 否則每個節點的 agent.actor.load_state_dict() 會因缺 key 直接拋例外
+    # （已在真實驗證中發生過一次）。沒有任何一輪真正聚合成功，代表這次
+    # `flwr run` 完全沒有新東西可以分享，維持各節點目前的權重不變即可。
+    if result.arrays:
+        _broadcast_aggregated_weights(result.arrays)
+    else:
+        print("[server_app] 本次執行沒有任何一輪成功聚合（全程無訓練資料），跳過廣播")

@@ -66,12 +66,24 @@ services:
     # ==========================================================
     # 0-b. Python 推論伺服器 + C xApp（12 個節點，全部集中在 PC1）
     #   刻意選擇：xApp/inference 不跟著 RAN 節點搬到 PC2/PC3，理由見 CLAUDE.md。
-    #   本輪不含 Global xApp 配額橋接與 Flower 聯邦學習（見 CLAUDE.md 第五階段註記）。
+    #   Global xApp（全域公平性廣播）+ Global rApp（Flower FedAvg）服務定義
+    #   見下方 0-c 區塊（Stage 2 起新增，掛 profiles: ["stage2-fl"]）。
+    #
+    #   全部 12 個 inference-nodeN 都釘在 cpuset: "12-15"（Stage 2 上線時的
+    #   root cause 修復，2026-09-13）：Stage 2 首次讓全部 12 個 Local rApp
+    #   同時做真實 DRL 推論+背景訓練，PC1 同時還跑著 Donor CU/DU + Node2/7/8
+    #   三組即時 RT-priority（chrt -f 80）softmodem，兩者疊加造成 CPU load
+    #   average 一度飆到 37（16 核心主機），觸發全部 xApp 的 30 秒 watchdog
+    #   連鎖重連，最終壓垮 FlexRIC 的 pending event queue 崩潰一次。把 DRL
+    #   推論/訓練負載硬性限制在 4 個核心內、跟 RT-priority 的 DU/MT 執行緒
+    #   物理隔離後，load average 降回 7~9，未再復發。詳見
+    #   experiment_results/avgFL.md「上線前的清理與除錯過程」第 3 點。
     # ==========================================================
     inference-node1:
         image: local-xapp-inference:latest
         container_name: inference-node1
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -112,6 +124,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node2
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -152,6 +165,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node3
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -192,6 +206,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node4
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -232,6 +247,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node5
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -272,6 +288,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node6
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -312,6 +329,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node7
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -352,6 +370,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node8
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -392,6 +411,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node9
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -432,6 +452,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node10
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -472,6 +493,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node11
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -512,6 +534,7 @@ services:
         image: local-xapp-inference:latest
         container_name: inference-node12
         network_mode: "host"
+        cpuset: "12-15"
         depends_on:
             mongodb:
                 condition: service_healthy
@@ -548,6 +571,375 @@ services:
             - ./iab/start_xapp_node12.sh:/start_xapp_node12.sh
             - /tmp:/tmp
         command: /bin/bash /start_xapp_node12.sh
+    # ==========================================================
+    # 0-c. Stage 2 起：Global xApp（全域公平性廣播）+ Global rApp（Flower FedAvg）
+    #   全部掛 profiles: ["stage2-fl"]，Stage 1 PF baseline 重跑（不帶 --profile）
+    #   時完全不受影響。設計理由見 CLAUDE.md 第 2、3 節；量測結果見
+    #   experiment_results/avgFL.md。
+    # ==========================================================
+    global-xapp:
+        image: local-xapp-inference:latest
+        container_name: global-xapp
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            GLOBAL_XAPP_NUM_NODES: "12"
+            GLOBAL_XAPP_INTERVAL_S: "2"
+            GLOBAL_XAPP_LOOKBACK: "50"
+        volumes:
+            - /tmp:/tmp
+        command: ["python3", "global_xapp.py"]
+        restart: on-failure
+
+    flower-superlink:
+        image: local-xapp-inference:latest
+        container_name: flower-superlink
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            FL_NUM_NODES: "12"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR_NODE1: "/app/models_node1"
+            MODEL_DIR_NODE2: "/app/models_node2"
+            MODEL_DIR_NODE3: "/app/models_node3"
+            MODEL_DIR_NODE4: "/app/models_node4"
+            MODEL_DIR_NODE5: "/app/models_node5"
+            MODEL_DIR_NODE6: "/app/models_node6"
+            MODEL_DIR_NODE7: "/app/models_node7"
+            MODEL_DIR_NODE8: "/app/models_node8"
+            MODEL_DIR_NODE9: "/app/models_node9"
+            MODEL_DIR_NODE10: "/app/models_node10"
+            MODEL_DIR_NODE11: "/app/models_node11"
+            MODEL_DIR_NODE12: "/app/models_node12"
+        volumes:
+            - inference_models_node1:/app/models_node1
+            - inference_models_node2:/app/models_node2
+            - inference_models_node3:/app/models_node3
+            - inference_models_node4:/app/models_node4
+            - inference_models_node5:/app/models_node5
+            - inference_models_node6:/app/models_node6
+            - inference_models_node7:/app/models_node7
+            - inference_models_node8:/app/models_node8
+            - inference_models_node9:/app/models_node9
+            - inference_models_node10:/app/models_node10
+            - inference_models_node11:/app/models_node11
+            - inference_models_node12:/app/models_node12
+        command: ["flower-superlink", "--insecure"]
+        restart: on-failure
+
+    flower-supernode-node1:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node1
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "1"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node1:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9101"
+        restart: on-failure
+
+    flower-supernode-node2:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node2
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "2"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node2:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9102"
+        restart: on-failure
+
+    flower-supernode-node3:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node3
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "3"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node3:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9103"
+        restart: on-failure
+
+    flower-supernode-node4:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node4
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "4"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node4:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9104"
+        restart: on-failure
+
+    flower-supernode-node5:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node5
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "5"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node5:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9105"
+        restart: on-failure
+
+    flower-supernode-node6:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node6
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "6"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node6:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9106"
+        restart: on-failure
+
+    flower-supernode-node7:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node7
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "7"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node7:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9107"
+        restart: on-failure
+
+    flower-supernode-node8:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node8
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "8"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node8:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9108"
+        restart: on-failure
+
+    flower-supernode-node9:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node9
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "9"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node9:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9109"
+        restart: on-failure
+
+    flower-supernode-node10:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node10
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "10"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node10:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9110"
+        restart: on-failure
+
+    flower-supernode-node11:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node11
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "11"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node11:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9111"
+        restart: on-failure
+
+    flower-supernode-node12:
+        image: local-xapp-inference:latest
+        container_name: flower-supernode-node12
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            APP_ROOT: "/app"
+            PYTHONPATH: "/app"
+            NODE_ID: "12"
+            MONGO_URI: "mongodb://localhost:27017"
+            MONGO_DB: "iab_xapp"
+            MODEL_DIR: "/app/models"
+        volumes:
+            - inference_models_node12:/app/models
+        command:
+            - "flower-supernode"
+            - "--insecure"
+            - "--superlink=127.0.0.1:9092"
+            - "--clientappio-api-address=127.0.0.1:9112"
+        restart: on-failure
+
+    flower-scheduler:
+        image: local-xapp-inference:latest
+        container_name: flower-scheduler
+        network_mode: "host"
+        profiles: ["stage2-fl"]
+        depends_on:
+            flower-superlink:
+                condition: service_started
+        environment:
+            FL_FEDERATION: "local-deployment"
+            FL_ROUND_INTERVAL_S: "180"
+            FL_APP_PATH: "/app/flower-app"
+        command: ["bash", "/app/flower-app/run_hourly.sh"]
+        restart: on-failure
 
     # ==========================================================
     # 1. 5G Core Network (AMF, SMF, UPF, MySQL)

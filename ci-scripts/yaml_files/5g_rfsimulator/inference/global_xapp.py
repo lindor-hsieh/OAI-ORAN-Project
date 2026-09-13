@@ -1,36 +1,45 @@
 """
-global_xapp.py — Phase 5 Global xApp（compute_quotas() 為現行架構共用，main() 已被取代）
+global_xapp.py — Global xApp（Stage 2 起全新設計，取代舊版 relay→access ZMQ 配額廣播）
 
-**本檔案的 main()／create_push_sockets()／IPC PUSH 機制已被
-global_xapp_bridge.py 取代，不再是實際運作的 Global xApp 進程。**
-inference_server.py 現在的 relay/access 節點是直接用 ZMQ PUB/SUB
-（Node1/2 PUB 自己的分配、Node3/4/5 SUB 訂閱配額），不再透過本檔案的
-「輪詢 MongoDB → IPC PUSH」路徑。保留本檔案是因為 compute_quotas() 這個
-配額計算函式仍被 global_xapp_bridge.py 直接 import 重用，不是死碼。
+**架構定位**：跟 Local xApp（C，每 ~100ms 的節點內控制迴圈）對稱，這是一個
+跑在全域視角、節奏介於 Local xApp（ms 級）與 Global rApp（分鐘級 FedAvg）
+之間的協調迴圈（預設每 2 秒一輪）。職責是提供單一節點無法從自己的局部資料
+算出來的東西——「我在整個 12-node 樹狀拓樸裡，相對其他節點是不是被犧牲
+了」——並把這個資訊廣播回去，讓 Local DRL 的 Actor 有機會學會在決策時
+多考慮一點全域公平性。
 
-以下是舊架構（未實際部署）的職責描述，僅供歷史參考：
-  - 全域視野：每 200ms 從 MongoDB 讀取 Node1/Node2 最新動作記錄
-  - 計算 Node3/4/5 的 PRB 回傳配額（模擬 in-band IAB 回傳瓶頸）
-  - 透過 ZMQ PUSH 將配額下發給 Node3/4/5 C xApp
+**跟 C 層「Backhaul-aware 動態 PRB 預算」機制（gNB_scheduler_dlsch.c）的分工**：
+C 層機制依「節點自己 MT 的真實 backhaul 使用量」動態縮小該節點 DU 這一輪
+實際可用的 PRB 資源池大小，對 PF 與 DRL 一視同仁生效，是硬性的資源池限制。
+本檔案完全不碰資源池大小，只提供一個**軟性 state 特徵**（fairness_bias）
+給 DRL 當額外輸入——兩者作用在不同層次，天生不會疊加節流。
 
-配額計算邏輯（compute_quotas()，現行架構仍在用）：
-  Node1 服務 MT3 (→ Node3) 與 MT4 (→ Node4)，按 RNTI 排序分配：
-    - quota_node3 = Node1 第一個 UE (低 RNTI) 的 prb_abs
-    - quota_node4 = Node1 第二個 UE (高 RNTI) 的 prb_abs
-    - 若 Node1 只有 1 個 UE: quota_node3 = quota_node4 = total / 2
-  Node2 服務 MT5 (→ Node5)：
-    - quota_node5 = Node2 所有 UE prb_abs 之和
-  若 Node1/2 超過 DATA_STALE_S 秒無新資料，配額退回 106（全頻寬）。
+**跟舊版設計（已移除）的差異**：舊版 `global_xapp_bridge.py` 是 relay 節點
+（Node1/2）把自己的 PRB 分配透過 ZMQ PUB 廣播出去，由 bridge 算出配額後
+再 PUB 給 access 節點（Node3/4/5）「硬性裁切」自己的輸出。這個設計：
+  (a) 只是局部視角（relay 對自己直接子節點的猜測值），不是真正全域；
+  (b) 跟 C 層機制做的是同一件事（縮小可用資源），會雙重節流；
+  (c) 硬編碼在 2-relay/3-access 拓樸，無法套用到現在 4-relay/8-access。
+`compute_quotas()`／`global_xapp_bridge.py` 仍保留在磁碟供歷史參考，
+不再被任何 docker-compose 服務呼叫。
 
-舊版 ZMQ 端點（Global xApp BIND PUSH，C xApp CONNECT PULL，已不使用）：
-  - ipc:///tmp/zmq_node3_quota.ipc
-  - ipc:///tmp/zmq_node4_quota.ipc
-  - ipc:///tmp/zmq_node5_quota.ipc
+**運作方式**：
+  1. 每輪對 MongoDB 全部 `NUM_NODES` 個節點的 `node{i}_experiences`
+     collection 各自查詢最近 `GLOBAL_XAPP_LOOKBACK` 筆、排除
+     `is_idle=True` 的文件，取 `r_throughput` 欄位算平均吞吐量。
+     沒有資料的節點記為 None（不計入全域平均）。
+  2. `global_mean` = 有資料節點的平均吞吐量之平均值。
+  3. `fairness_bias_i = clip(global_mean / (mean_i + eps), BIAS_MIN, BIAS_MAX)`
+     ——吞吐量低於全域平均 → bias > 1（代表被犧牲，可以更積極）；
+     高於平均 → bias < 1。沒有資料的節點給中性值 1.0。
+  4. 額外算一個 `global_jfi`（Jain's Fairness Index，同一組平均吞吐量）
+     僅供人工觀察列印，不寫回 MongoDB——避免跟 `server_app.py` 每輪
+     FedAvg 各自算的 JFI 混淆成兩個不同時間粒度的「權威值」。
+  5. 透過 ZMQ PUB（bind `tcp://127.0.0.1:5560`）對每個節點送
+     `"node{i} " + json.dumps({"fairness_bias": bias})`。
 
-現行架構的 ZMQ 端點（見 global_xapp_bridge.py）：
-  Node1 PUB tcp://127.0.0.1:5561 ─┐
-                                   ├─→ global_xapp_bridge.py SUB → compute_quotas() → PUB tcp://127.0.0.1:5560 → Node3/4/5 SUB
-  Node2 PUB tcp://127.0.0.1:5562 ─┘
+所有例外都被捕捉並降級：單一節點查詢失敗不影響其他節點，本輪失敗不影響
+下一輪，MongoDB 整個連不上則等待重試（不崩潰退出，avoid crash-loop）。
 """
 
 from __future__ import annotations
@@ -39,11 +48,10 @@ import json
 import logging
 import os
 import signal
-import sys
 import time
-from datetime import datetime, timezone
 from typing import Optional
 
+import numpy as np
 import pymongo
 import zmq
 
@@ -51,20 +59,21 @@ import zmq
 # 設定常數
 # =============================================================================
 
-TOTAL_PRB: int    = 106
-MIN_QUOTA: int    = 10        # 避免 Node3/4/5 完全被餓死
-POLL_INTERVAL_S   = 0.2       # MongoDB 輪詢間隔（秒）
-DATA_STALE_S      = 5.0       # 超過此秒數無新資料則退回全頻寬
-LOG_INTERVAL      = 50        # 每 N 次輪詢印一次狀態
-
-QUOTA_ENDPOINTS: dict[int, str] = {
-    3: "ipc:///tmp/zmq_node3_quota.ipc",
-    4: "ipc:///tmp/zmq_node4_quota.ipc",
-    5: "ipc:///tmp/zmq_node5_quota.ipc",
-}
-
 MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB:  str = os.getenv("MONGO_DB",  "iab_xapp")
+MONGO_DB: str = os.getenv("MONGO_DB", "iab_xapp")
+
+NUM_NODES: int = int(os.getenv("GLOBAL_XAPP_NUM_NODES", "12"))
+INTERVAL_S: float = float(os.getenv("GLOBAL_XAPP_INTERVAL_S", "2.0"))
+LOOKBACK: int = int(os.getenv("GLOBAL_XAPP_LOOKBACK", "50"))
+
+# 必須跟 drl_agent.py 的 FAIRNESS_BIAS_MIN/MAX 一致，否則 Actor 收到的
+# state 特徵正規化區間會跟這裡廣播的原始值域對不上。
+BIAS_MIN: float = 0.5
+BIAS_MAX: float = 2.0
+NEUTRAL_BIAS: float = 1.0
+
+PUB_ENDPOINT: str = "tcp://127.0.0.1:5560"
+LOG_INTERVAL: int = 10  # 每 N 輪印一次全部節點的狀態摘要
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,102 +99,98 @@ def connect_mongo() -> Optional[pymongo.database.Database]:
         return None
 
 
-def get_latest_action(
-    col: pymongo.collection.Collection,
-    stale_threshold: float,
-) -> Optional[list[dict]]:
+def mean_recent_throughput(
+    db: pymongo.database.Database,
+    node_id: int,
+    lookback: int,
+) -> Optional[float]:
     """
-    取得該 collection 最新一筆含有 action 欄位的記錄。
-    若記錄時間早於 stale_threshold 秒前，回傳 None。
+    取得某節點最近 `lookback` 筆非閒置經驗的平均 r_throughput。
+    無資料或查詢失敗時回傳 None（呼叫端視為「沒有資料，給中性值」）。
     """
     try:
-        doc = col.find_one(
-            {"action": {"$exists": True, "$type": "array"}},
-            sort=[("timestamp", pymongo.DESCENDING)],
-            projection={"action": 1, "timestamp": 1, "_id": 0},
+        col = db[f"node{node_id}_experiences"]
+        docs = list(
+            col.find(
+                {"is_idle": {"$ne": True}, "r_throughput": {"$exists": True}},
+                projection={"r_throughput": 1, "_id": 0},
+            )
+            .sort("timestamp", pymongo.DESCENDING)
+            .limit(lookback)
         )
-    except pymongo.errors.PyMongoError:
+    except pymongo.errors.PyMongoError as exc:
+        log.debug("Node%d 查詢失敗: %s", node_id, exc)
         return None
 
-    if doc is None:
+    if not docs:
         return None
-
-    ts = doc.get("timestamp")
-    if isinstance(ts, datetime):
-        age = (datetime.now(timezone.utc) - ts.replace(tzinfo=timezone.utc)).total_seconds()
-        if age > stale_threshold:
-            return None
-
-    action = doc.get("action", [])
-    if not isinstance(action, list) or len(action) == 0:
-        return None
-    return action
+    return float(np.mean([d["r_throughput"] for d in docs]))
 
 
 # =============================================================================
-# 配額計算
+# 全域公平性偏差計算
 # =============================================================================
 
-def compute_quotas(
-    node1_action: Optional[list[dict]],
-    node2_action: Optional[list[dict]],
-) -> dict[int, int]:
+def compute_fairness_biases(
+    db: pymongo.database.Database,
+    num_nodes: int,
+    lookback: int,
+) -> tuple[dict[int, float], dict[int, Optional[float]], float]:
     """
-    根據 Node1/Node2 的最新 PRB 分配計算 Node3/4/5 的配額。
+    回傳 (fairness_biases, mean_throughputs, global_jfi)。
 
-    Args:
-        node1_action: Node1 的動作列表 [{"rnti": ..., "prb_abs": ...}, ...]
-        node2_action: Node2 的動作列表
-
-    Returns:
-        {3: quota_node3, 4: quota_node4, 5: quota_node5}
+    fairness_biases  : {node_id: bias}，全部 num_nodes 個節點皆有值
+                        （沒資料的節點給 NEUTRAL_BIAS）。
+    mean_throughputs : {node_id: mean_r_throughput or None}，供 log 用。
+    global_jfi        : Jain's Fairness Index（僅供監控列印）。
     """
-    quotas = {3: TOTAL_PRB, 4: TOTAL_PRB, 5: TOTAL_PRB}
+    mean_throughputs: dict[int, Optional[float]] = {}
+    for node_id in range(1, num_nodes + 1):
+        mean_throughputs[node_id] = mean_recent_throughput(db, node_id, lookback)
 
-    # Node3 & Node4 配額：由 Node1 的 MT PRB 分配決定
-    if node1_action:
-        sorted_ues = sorted(node1_action, key=lambda u: u.get("rnti", 0))
-        if len(sorted_ues) >= 2:
-            q3 = max(MIN_QUOTA, int(sorted_ues[0].get("prb_abs", TOTAL_PRB // 2)))
-            q4 = max(MIN_QUOTA, int(sorted_ues[1].get("prb_abs", TOTAL_PRB // 2)))
-        elif len(sorted_ues) == 1:
-            half = max(MIN_QUOTA, int(sorted_ues[0].get("prb_abs", TOTAL_PRB)) // 2)
-            q3 = q4 = half
+    valid_values = [v for v in mean_throughputs.values() if v is not None]
+
+    if not valid_values:
+        biases = {nid: NEUTRAL_BIAS for nid in mean_throughputs}
+        return biases, mean_throughputs, 0.0
+
+    global_mean = float(np.mean(valid_values))
+
+    biases: dict[int, float] = {}
+    eps = 1e-6
+    for node_id, mean_tp in mean_throughputs.items():
+        if mean_tp is None:
+            biases[node_id] = NEUTRAL_BIAS
         else:
-            q3 = q4 = TOTAL_PRB
-        quotas[3] = min(TOTAL_PRB, q3)
-        quotas[4] = min(TOTAL_PRB, q4)
+            raw_bias = global_mean / (mean_tp + eps)
+            biases[node_id] = float(np.clip(raw_bias, BIAS_MIN, BIAS_MAX))
 
-    # Node5 配額：由 Node2 的 MT PRB 分配決定（Node2 只有 1 個 MT）
-    if node2_action:
-        total = sum(u.get("prb_abs", 0) for u in node2_action)
-        quotas[5] = min(TOTAL_PRB, max(MIN_QUOTA, int(total)))
+    x = np.array(valid_values)
+    global_jfi = float(x.sum() ** 2 / (len(x) * (x ** 2).sum() + 1e-9))
 
-    return quotas
+    return biases, mean_throughputs, global_jfi
 
 
 # =============================================================================
 # ZMQ 發布
 # =============================================================================
 
-def create_push_sockets(ctx: zmq.Context) -> dict[int, zmq.Socket]:
-    socks: dict[int, zmq.Socket] = {}
-    for node_id, endpoint in QUOTA_ENDPOINTS.items():
-        sock = ctx.socket(zmq.PUSH)
-        sock.setsockopt(zmq.LINGER, 0)
-        sock.setsockopt(zmq.SNDHWM, 2)          # 限制排隊，避免記憶體爆炸
-        sock.bind(endpoint)
-        log.info("PUSH socket 已綁定至 %s (→ Node%d)", endpoint, node_id)
-        socks[node_id] = sock
-    return socks
+def create_pub_socket(ctx: zmq.Context) -> zmq.Socket:
+    sock = ctx.socket(zmq.PUB)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.SNDHWM, 20)
+    sock.bind(PUB_ENDPOINT)
+    log.info("PUB socket 已綁定至 %s", PUB_ENDPOINT)
+    return sock
 
 
-def send_quota(sock: zmq.Socket, quota: int, node_id: int) -> None:
-    msg = json.dumps({"quota": quota}, separators=(",", ":"))
-    try:
-        sock.send_string(msg, zmq.NOBLOCK)
-    except zmq.Again:
-        pass    # C xApp 尚未連線或 HWM 滿，靜默丟棄
+def publish_biases(sock: zmq.Socket, biases: dict[int, float]) -> None:
+    for node_id, bias in biases.items():
+        msg = f"node{node_id} " + json.dumps({"fairness_bias": bias}, separators=(",", ":"))
+        try:
+            sock.send_string(msg, zmq.NOBLOCK)
+        except zmq.Again:
+            pass  # HWM 滿，靜默丟棄，下一輪會送新值
 
 
 # =============================================================================
@@ -193,18 +198,9 @@ def send_quota(sock: zmq.Socket, quota: int, node_id: int) -> None:
 # =============================================================================
 
 def main() -> None:
-    """[已被取代] 見檔頭說明——實際部署請用 global_xapp_bridge.py，本函式不再被任何
-    docker-compose 服務呼叫，保留僅供參考。"""
     db = connect_mongo()
-    if db is None:
-        log.error("無法連線 MongoDB，程式退出")
-        sys.exit(1)
-
-    col1 = db["node1_experiences"]
-    col2 = db["node2_experiences"]
-
     ctx = zmq.Context()
-    socks = create_push_sockets(ctx)
+    sock = create_pub_socket(ctx)
 
     _running = True
 
@@ -214,49 +210,48 @@ def main() -> None:
         _running = False
 
     signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT,  _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
-    log.info("Global xApp 啟動，開始監控 Node1/Node2 回傳 PRB 分配")
+    log.info(
+        "Global xApp 啟動 | num_nodes=%d interval=%.1fs lookback=%d",
+        NUM_NODES, INTERVAL_S, LOOKBACK,
+    )
 
     tick = 0
-    last_quotas = {3: TOTAL_PRB, 4: TOTAL_PRB, 5: TOTAL_PRB}
-
     while _running:
         t0 = time.monotonic()
 
-        # 讀取最新動作
-        action1 = get_latest_action(col1, DATA_STALE_S)
-        action2 = get_latest_action(col2, DATA_STALE_S)
+        if db is None:
+            db = connect_mongo()
+            if db is None:
+                time.sleep(INTERVAL_S)
+                continue
 
-        # 計算配額
-        quotas = compute_quotas(action1, action2)
-        last_quotas = quotas
-
-        # 下發配額
-        for node_id, sock in socks.items():
-            send_quota(sock, quotas[node_id], node_id)
-
-        # 定期列印狀態
-        if tick % LOG_INTERVAL == 0:
-            n1_status = f"total={sum(u.get('prb_abs',0) for u in action1)}" if action1 else "stale"
-            n2_status = f"total={sum(u.get('prb_abs',0) for u in action2)}" if action2 else "stale"
-            log.info(
-                "Node1[%s] → quota3=%d quota4=%d | Node2[%s] → quota5=%d",
-                n1_status, quotas[3], quotas[4],
-                n2_status, quotas[5],
+        try:
+            biases, mean_throughputs, global_jfi = compute_fairness_biases(
+                db, NUM_NODES, LOOKBACK
             )
+            publish_biases(sock, biases)
+
+            if tick % LOG_INTERVAL == 0:
+                summary = " ".join(
+                    f"n{nid}={mean_throughputs[nid]:.2f}Mbps(bias={biases[nid]:.2f})"
+                    if mean_throughputs[nid] is not None
+                    else f"n{nid}=stale(bias={biases[nid]:.2f})"
+                    for nid in range(1, NUM_NODES + 1)
+                )
+                log.info("global_jfi=%.4f | %s", global_jfi, summary)
+        except Exception as exc:
+            # 任何非預期例外都不能讓這個常駐 process 掛掉——降級成本輪跳過。
+            log.warning("本輪計算失敗，跳過: %s", exc)
+
         tick += 1
-
-        # 精確間隔控制
         elapsed = time.monotonic() - t0
-        sleep_s = max(0.0, POLL_INTERVAL_S - elapsed)
-        time.sleep(sleep_s)
+        time.sleep(max(0.0, INTERVAL_S - elapsed))
 
-    # 清理
-    for sock in socks.values():
-        sock.close()
+    sock.close()
     ctx.term()
-    log.info("Global xApp 已關閉。最後配額: %s", last_quotas)
+    log.info("Global xApp 已關閉。")
 
 
 if __name__ == "__main__":

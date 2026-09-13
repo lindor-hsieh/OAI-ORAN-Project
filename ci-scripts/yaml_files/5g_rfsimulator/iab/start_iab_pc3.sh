@@ -58,6 +58,20 @@ sudo ip link set macvlan-br up
 sudo ip route replace 192.168.88.128/25 dev macvlan-br
 echo -e "${GREEN}  macvlan-br 192.168.88.3/24 已就緒${NC}"
 
+# GTP-U(2152/2153)/SCTP 進 iab_internal_net 的永久放行規則（DOCKER-USER 永遠先於
+# Docker 自動生成的 DOCKER chain 執行，且不會被 docker compose down/up 清空或改寫）。
+# 用子網（192.168.75.0/24，docker-compose-iab-pc3.yaml 裡固定寫死）比對，
+# 不能用 bridge 介面名稱（br-xxxxx）比對，因為每次 docker compose down 重來
+# 都會重新產生一個新的隨機 bridge 名稱，寫死介面名稱的規則下次重啟就會失效。
+echo -e "${CYAN}[0/6] 套用 iab_internal_net GTP-U/SCTP 永久放行規則 (DOCKER-USER)...${NC}"
+INTERNAL_SUBNET="192.168.75.0/24"
+for proto_args in "udp --dport 2152" "udp --dport 2153" "sctp"; do
+    if ! sudo iptables -C DOCKER-USER -d "$INTERNAL_SUBNET" -p $proto_args -j ACCEPT 2>/dev/null; then
+        sudo iptables -I DOCKER-USER -d "$INTERNAL_SUBNET" -p $proto_args -j ACCEPT
+    fi
+done
+echo -e "${GREEN}  iab_internal_net GTP-U/SCTP 放行規則已就緒${NC}"
+
 echo -e "${CYAN}[SSH] 等待 PC1 SSH 連線...${NC}"
 _wait=0
 until ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; do

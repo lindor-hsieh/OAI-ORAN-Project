@@ -416,3 +416,37 @@ n = sscanf(params, "%9s %ms", varname, &varval);
 **修復**：在 PC2、PC3 上補跑 `sudo ninja rfsimulator`，確認三主機 `librfsimulator.so` 時間戳都新於 `simulator.c` 後，重新做一次乾淨的三主機清空重啟，逐一確認 `bhload` 模組在 PC1（Node2）、PC2（Node4）、PC3（Node11）都成功註冊，才產出第三次、真正有效的 Stage 1 數據（見 PF.md）。
 
 **教訓（已寫進 CLAUDE.md 第 7 節）**：`rsync` 完原始碼只是把檔案搬過去，不代表 PC2/PC3 已經吃到修改——一定要重編**這次修改實際影響到的全部 build target**，不能只重編「這一輪明確有改動原始碼的那幾個 target」；一份原始碼檔案的修改可能橫跨好幾輪 debug session（`simulator.c` 這次就橫跨了兩輪：先移動 `init_bhload_telnetcmd()` 呼叫位置、後來又在裡面用到重新命名後的 `bhload_query_cmd`），每一輪收工前都要重新檢查全部相關檔案的「原始碼時間戳 vs 編譯產物時間戳」，不能只看「這一輪自己改了哪些檔案」就推斷該重編哪些 target。這次能發現，某種程度上是運氣好——剛好使用者追問 UE17 狀態、UE17 現場複測結果比預期更差，才回頭起疑；如果沒有這個巧合，這個「三分之一節點生效」的錯誤基準可能會被當成正式數據一路沿用到 Stage 2~5 的比較，屆時才發現會需要重做全部後續量測。
+
+---
+
+## 2026-09-13 — Stage 2（avg FL）上線除錯過程：CPU 資源競爭、volume 名稱誤用、累積系統狀態
+
+Stage 2 是第一個讓全部 12 個 Local rApp 同時做真實 DRL 推論+背景訓練、且首次接上 Global xApp（全域公平性廣播）+ Global rApp（Flower FedAvg）的階段。上線過程遇到三個獨立問題，最終數據見 `experiment_results/avgFL.md`。
+
+### 問題一：PC1 CPU 資源競爭導致 FlexRIC 崩潰（現象一復現）
+
+第一次讓 Scenario R 真實流量+全部 12 個 xApp/inference 同時上線後，約 100 秒內全部 12 個 xApp 容器開始快速自我重啟（watchdog 觸發：「30 秒未收到 MAC indication」），`docker stats` 顯示 PC1 load average 一度飆到 37（16 核心主機），`top` 顯示 12 個 `inference-nodeN` 的 python3 process 各佔 30~40% CPU（GRU 訓練迴圈），同時 Donor CU/DU + Node2/7/8 三組 RT-priority（`chrt -f 80`）softmodem process 各佔 100%+ CPU。FlexRIC 隨後真的崩潰一次（`docker inspect RestartCount` 0→1，log 出現 `[NEAR-RIC]: WARNING: Pending event timeout`），但幸運地是 docker `restart: always` 讓它自己恢復、DU/MT/CU 全程沒有進入「現象二」的 assoc_rb_tree_extract 崩潰迴圈。
+
+**根因**：Stage 1 PF baseline 從未同時測過「全部 12 個 xApp 真實運作」與「PC1 本身也扛著 Donor+3 組 RT-priority RAN 節點」這兩件事疊加的情境（PF baseline 停用全部 xApp），CPU 資源競爭導致 RT-priority 執行緒的排程延遲累積、間接拖慢 MAC indication 送達 xApp 的時效，觸發連鎖 watchdog 重連，最終壓垮 FlexRIC 的 pending event queue。
+
+**修復**：`docker-compose-iab-server.yaml` 幫全部 12 個 `inference-nodeN` 容器加上 `cpuset: "12-15"`，把 DRL 推論/訓練負載硬性限制在 4 個核心，物理隔離於 RT-priority 執行緒之外。套用後 load average 從 37 降回 7~9，之後 15 分鐘正式量測全程未再復發。
+
+### 問題二：清空 checkpoint 時誤用 compose service-local key 名稱，實際 volume 從未被清到
+
+Stage 2 要求切換 `REWARD_MODE` 前必須清空模型 checkpoint。第一次清空時用 `docker run --rm -v inference_models_node1:/models alpine rm -f ...`——這個 `inference_models_node1` 是 `docker-compose-iab-server.yaml` 裡 service 底下 `volumes:` 區塊的**內部 key 名稱**，但該 volume 定義區塊實際用 `name:` 覆寫成 `iab-xapp-model-node1`（見檔案最下面的頂層 `volumes:` 區塊）。用內部 key 名稱掛載，Docker 會直接建立一個全新的、空白的、名字剛好叫 `inference_models_node1` 的野生 volume，跟服務實際掛載的 `iab-xapp-model-node1` 完全無關——清空指令「成功執行」、`ls` 也顯示空的，但服務重啟後讀到的仍是舊 checkpoint（`train_steps=940, lambda=10.0`，明顯是切換前 `lagrangian` 模式殘留的舊值，不是預期的冷啟動 `train_steps=0, lambda=0.0`）。
+
+**發現方式**：檢查新啟動的 `inference-node1` log，`模型已從 /app/models/model_node1.pt 載入 (訓練步數: 940, lambda=10.0000)`，數值明顯不是清空後該有的樣子，回頭用 `docker volume ls` 才發現兩個名稱並存。
+
+**修復**：改用 `docker volume ls` 確認的實際名稱（`iab-xapp-model-nodeN`）清空，並清掉誤建立的 12 個野生 `inference_models_nodeN` volume（`docker volume rm`）。**教訓（已寫進 `iab/run_stage2_fl.sh` 的註解）**：docker-compose 的 `volumes:` 區塊如果用了 `name:` 覆寫，service 裡引用的 key 名稱就只是本地別名，不是實際的 Docker volume 名稱——清空/操作 volume 前一定要先 `docker volume ls` 或 `docker inspect` 確認實際名稱，不能直接套用 compose 檔裡看到的 key。
+
+### 問題三：長時間偵錯累積的系統狀態，導致個別 UE（UE13/UE14）資料面完全斷線——靠繼續 debug 排除不了，乾淨重啟才是正解
+
+在追查 Stage 2 量測數據時，發現 UE13、UE14（皆掛在 Node11, PC3）的 `measure_stage.py` 取樣結果是 100% 零吞吐量、100% ping 失敗。往下查：DU11 的 MAC 層對這兩個 UE 的統計顯示 RSRP -44dB（訊號極好）、0 BLER、且 MAC TX/RX bytes 持續在增加（無線鏈路本身完全健康），MT/DU/CU 容器 RestartCount 皆為 0（沒有崩潰過），CU 的 DNAT table 對 Node11 的映射也正確對應到 MT11 當下的 tunnel IP——代表問題出在 GTP-U/PFCP 層某處，但沿著這條線往下查（UPF/SMF log 搜尋、tcpdump）沒有找到直接證據。
+
+**使用者的決定性介入**：與其繼續往下挖，使用者直接要求「清空並重啟系統，才知道問題出在哪」。三主機依序 `docker compose down` 全部清空、重新用 `run_local_pc{1,2,3}.sh` 啟動後，**全部 17 個 UE（含先前完全斷線的 UE13/14、與歷史上最差的 UE17）現場 ping 測試皆為 0% 封包遺失**，問題完全消失，且完全沒有另外做任何針對 UE13/14 的手動修補。
+
+**判讀**：這次的斷線並非結構性/RF 問題，而是長時間 debug session 中累積的手動介入（多次容器重啟、DNAT 重新套用、iptables 補丁、FlexRIC 崩潰後的恢復流程）造成 GTP-U/PFCP 層某種難以用單一指令診斷出的 stale 狀態。**教訓**：偵錯進行到一定深度、且累積了大量手動介入後，若某個問題的根因遲遲找不到但個別元件（容器本身、RF 鏈路）都顯示健康，應該優先考慮「整體系統狀態已經劣化到超出繼續 debug 能排除的範圍」，做一次完整乾淨重啟（三主機依序 down 再依序啟動）往往比繼續往下挖更快、更可靠；這跟本文件更早的「FlexRIC 崩潰規律」章節建議的復原流程是同一個道理，只是這次連 FlexRIC 自己都沒崩潰，斷線的是更下層、更難用單一 log 診斷的資料面狀態。
+
+### 待釐清事項：F1AP 跨主機路由
+
+本次除錯過程中，較早的討論串一度描述「PC2/PC3 access 節點的 F1-C/F1-U 位址綁定在 internal bridge IP，CU 所在主機若無明確路由會導致 SCTP association 卡在 COOKIE_WAIT」、並描述了對應的 `ip route add` 修復動作，但事後檢查 `docker-compose-iab-pc2.yaml`／`docker-compose-iab-pc3.yaml` 的 git diff，**這個修改實際上並不存在於目前的檔案內容裡**（可能是討論串中途的 context 被截斷、修改動作未真正落地存檔）。由於本次除錯後續的多次乾淨重啟（含最終量測前的驗證）都確認 Node5/6（PC2）、Node9~12（PC3）的 access 節點 F1AP 連線與資料面全部正常運作，**目前無法確認這個路由問題是否曾經真實存在、或是否已被其他修復（例如 `DOCKER-USER` iptables 規則）間接解決**。如果未來又遇到類似症狀（access 節點 F1AP SCTP association 卡在 COOKIE_WAIT），這是一個可以優先檢查的方向，但目前不建議在沒有重現該症狀的情況下就盲目補一個未經驗證的路由規則進去。

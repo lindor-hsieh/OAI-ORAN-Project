@@ -69,7 +69,7 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
 * **Near-RT RIC (C 語言)**：使用 FlexRIC 作為 E2 代理伺服器與 xApp 框架。
 * **Non-RT RIC & AI (Python)**：規劃透過 Flower Framework 進行階層式聯邦學習 (Hierarchical FL)，並透過 ZeroMQ 建立跨語言 IPC 通訊。
 
-> **目前實作現況**：只做到 Local xApp + Local rApp 這一層（純 Local-only DRL）。**Global xApp 配額機制與 Flower 聯邦學習尚未針對 12-node 拓樸重建**——`global_xapp.py`／`global_xapp_bridge.py`／`inference/flower-app/` 仍是舊 5-node 拓樸的版本，`docker-compose-iab-server.yaml` 目前不含 `global-xapp-bridge`／`flower-*` 服務定義。舊 5-node 版本的完整設計細節（PUB/SUB 配額機制、Flower SuperLink/SuperNode 部署、client/server app 邏輯）保留在 `HISTORY.md` 供未來重新設計 cluster FL 時參考架構（見第 3 節五階段實驗路線圖）。
+> **目前實作現況**（2026-09-13 更新）：Local xApp + Local rApp + Global xApp + Global rApp 四個元件皆已針對 12-node 拓樸重建完成並上線（Stage 2 avg FL，見 `experiment_results/avgFL.md`）。**Global xApp 已改版為全域公平性軟性廣播機制**（非舊版 5-node 的 relay→access 配額裁切設計，見下方元件定義），`docker-compose-iab-server.yaml` 已新增 `global-xapp`／`flower-superlink`／`flower-supernode-node{1..12}`／`flower-scheduler` 服務定義，全部掛在 `profiles: ["stage2-fl"]` 底下（Stage 1 PF 重跑時不受影響）。舊版 5-node 配額廣播機制的設計細節保留在 `HISTORY.md` 供歷史參考，但**不再是需要復原的架構**——新設計已確認優於舊版（見下方元件定義的理由說明）。
 
 ### 核心控制元件定義
 
@@ -81,7 +81,14 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
    * **職責（雙重角色）**：
      * **Near-RT 推論（毫秒級）**：接收 Local xApp 的 ZeroMQ 請求，執行 DRL Actor 網路 forward pass，回傳 PRB 權重陣列，並將 State/Action/Reward 非同步寫入 MongoDB。
      * **Non-RT Fine-tuning（秒/分鐘級）**：從 MongoDB 讀取歷史資料，執行本地模型微調（`inference_server.py` 背景訓練執行緒 `_train_worker`，每 60 秒一輪）。
-3. **Global xApp / Global rApp（Flower Server）**：待針對 12-node 拓樸重建，見第 3 節。
+3. **Global xApp（全域公平性軟性廣播，Stage 2~5 全程固定存在）**：
+   * **實作**：獨立 Python process（`global_xapp.py`），每 `GLOBAL_XAPP_INTERVAL_S`（預設 2 秒）讀一次 MongoDB 全部 12 個節點最近 `GLOBAL_XAPP_LOOKBACK`（預設 50）筆經驗，算出每個節點的平均吞吐量與全域平均的落差，換算成 `fairness_bias = clip(global_mean / (node_mean + eps), 0.5, 2.0)`，透過 ZMQ PUB 廣播給全部 12 個 Local rApp（topic `nodeN`）。
+   * **與 Stage 1 完成的「Backhaul-aware 動態 PRB 預算」機制（C 層，`gNB_scheduler_dlsch.c`）的分工**：兩者刻意作用在不同軸，不會衝突——C 層依「該節點自己 MT 的真實忙碌度」硬性縮小 DU 可用 PRB 池上限（單節點局部視角，PF 排程器也吃得到，是排程器的輸入約束）；Global xApp 依「全域相對落後程度」提供**純軟性 state 特徵**給 DRL Actor（單節點看不到的全域視角，只有跑 DRL 的階段才吃得到，不做任何硬性 PRB 裁切）。舊版 5-node 拓樸的「Global xApp」設計（relay 對自己的 access 子節點做局部配額裁切）已確認是錯誤方向——那本質上跟 C 層機制做同一件事（節流 DU 可用資源），只是一個用量測值、一個用父節點猜測值，同時上線會造成雙重節流；新設計改讓 Global xApp 專注做 C 層機制做不到的事（全域視角），完全消除了這個衝突。
+   * **常數**：`state_vec[48]` = active_ratio，`state_vec[49]` = 正規化後的 `fairness_bias`（`(clip(bias,0.5,2.0)-0.5)/1.5`），`STATE_DIM=50` 維持不變（非破壞性變更，只是把原本恆為 1.0 的舊版 `prb_quota_ratio` 欄位換成有意義的語意）。
+4. **Global rApp（Flower ServerApp/ClientApp，聚合策略隨 Stage 而變）**：
+   * **實作**：`inference/flower-app/iab_fl/`，`server_app.py`（`FL_NUM_NODES=12`）+ `client_app.py`，透過 Flower SuperLink（`flower-superlink`）+ 12 個 SuperNode（`flower-supernode-node{1..12}`，`--clientappio-api-address` 分別綁定 `9101~9112`）部署，`flower-scheduler` 每 `FL_ROUND_INTERVAL_S`（預設 180 秒）觸發一輪 `flwr run`。
+   * **Stage 2（本階段）**：標準 FedAvg，全部 12 節點一起聚合，聚合後的權重寫回共用的 `model_nodeN.pt` checkpoint，Local rApp 背景執行緒偵測到 mtime 變化即熱重載。已加上 `ZeroDivisionError` 防呆（全部節點 `num-examples=0` 時跳過本輪聚合，不崩潰、不誤把空 ArrayRecord 廣播出去覆蓋掉有效權重）。
+   * **Stage 3~5**：只換 `server_app.py` 的聚合邏輯（cluster FL / 自訂 FL），`client_app.py`／Global xApp／Local xApp+Local rApp 皆不變，見第 3 節路線圖。
 
 ### 與 3GPP IAB / O-RAN 標準規格的差異（誠實揭露，供論文方法論限制章節引用）
 
@@ -128,7 +135,7 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 | Stage | 策略 | Global 層（配額協調/FL 聚合） | Local 層（單節點 DRL） | 狀態 |
 |---|---|---|---|---|
 | 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**（2026-09-13 三度重測，見 `experiment_results/PF.md`：併發 JFI=0.3303、17 UE 平均吞吐量約 6.45 Mbps、平均 RTT 224.23 ms，15 分鐘全程三主機零新增崩潰——**這份數據是 backhaul-aware 機制在三台主機全部真正生效後的正式基準**。前兩次量測皆已作廢：第一次忘記停用 xApp；第二次雖已停用 xApp，但事後發現 PC2/PC3 的 `librfsimulator.so` 忘記重新編譯（只重編了 nr-uesoftmodem/nr-softmodem/telnetsrv，見第 7 節新增的 rsync 後置檢查規則），導致只有 PC1 節點的機制真正生效，PC2/PC3 全部節點仍是 no-op；三主機皆確認 `bhload` 模組成功註冊後才產出本次數據。**UE17 現場複測 ICMP 100% 封包遺失、iperf3 完全無法建立傳輸**，是三主機機制全部真正介入後 Node4（UE17 直連 relay，同時中繼 Node11+Node12）三重負載疊加的極端案例，詳見 PF.md「UE17 特別說明」；是 Stage 2~5 的比較對象） |
-| 2 | avg FL + 最基礎 DRL | Global xApp+Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | 未開始 |
+| 2 | avg FL + 最基礎 DRL | Global xApp（全域公平性軟性廣播，Stage 2~5 全程固定）+ Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | **已完成**（2026-09-13，見 `experiment_results/avgFL.md`：JFI=0.3976 對比 PF 的 0.3303（改善 +20.4%）、17 UE 平均吞吐量 6.58 Mbps 對比 PF 的 6.45 Mbps（持平略升）、平均 RTT 360.70 ms 對比 PF 的 224.23 ms（**惡化 +60.9%，判斷主因是 DRL Actor 推論延遲疊加進 MAC 排程週期，尚未達成 RTT 單調遞增要求**），15 分鐘全程三主機 FlexRIC/CU/DU/MT 零新增崩潰。過程中發現並修復 4 個 root cause 等級基礎設施問題（PC2/PC3 F1AP 跨主機路由、`DOCKER-USER` chain GTP-U/SCTP 放行規則、PC1 CPU 資源競爭導致 FlexRIC 崩潰、累積系統狀態導致個別 UE 斷線），詳見 avgFL.md） |
 | 3 | cluster FL + 最基礎 DRL | Global xApp+Global rApp：Cluster FL，依角色分兩群聚合：relay cluster（Node1~4）、access cluster（Node5~12）各自獨立 FedAvg | Local xApp+Local rApp：最基礎 DRL（同 Stage 2，模型不變，只有 Global 聚合方式不同） | 未開始 |
 | 4 | 自訂 FL + 最基礎 DRL | Global xApp+Global rApp：自訂聚合演算法（介面待設計） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2/3） | 未開始 |
 | 5 | 自訂 FL + 改良版 DRL | Global xApp+Global rApp：自訂聚合演算法（同 Stage 4，不變） | Local xApp+Local rApp：改良版 DRL（`REWARD_MODE=lagrangian`，重新啟用 Lagrangian JFI 限制機制） | 未開始 |
@@ -162,11 +169,11 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
   - **2026-09-12**：回歸測試（13/13 E2、17/17 UE 附著、iperf3 sanity check）與正式 15 分鐘量測通過，過程中發現並根除三個 root cause bug（詳見 HISTORY.md 對應日期條目）：telnetsrv 的 `recv()` 錯誤值處理不完整導致的 buffer overflow 崩潰、CU UID 分配器耗盡時的整數溢位崩潰、CU 對同一 DU ID 的 F1 association 記錄在異常斷線後永久不清除導致的連線永久拒絕。但這輪的 `PF.md` **事後查出 backhaul-aware 機制其實整段是靜默 no-op**（`bhload` 命令命名撞上 telnetsrv 保留字導致 MT 端 SIGSEGV，見下方 HISTORY.md 條目），數據已作廢。
   - **2026-09-13**：修復 `bhload` 命名衝突（改名 `get`→`query`，並補上 `telnetsrv.c::setgetvar()` 的 NULL 防呆）、修復 PC2/PC3 漏編譯 `rfsimulator` target 導致機制只有三分之一節點真正生效的問題後，三度重測才產出真正有效的基準（`experiment_results/PF.md`：JFI=0.3303、平均吞吐量 6.45 Mbps、平均 RTT 224.23 ms）。PF 排程器本身不需要額外開發（它本來就不讀任何自訂 state），縮小可用 PRB 池這件事對 PF 排程器是透明的。
 
-* **Stage 2（avg FL + 最基礎 DRL）**：
-  - 這是第一個要接上 Global xApp/Global rApp 的階段，`global_xapp.py`／`global_xapp_bridge.py`／`inference/flower-app/` 都要先針對 12-node 拓樸重建（目前是舊 5-node 版本，尚未重建）。
-  - 建議評估是否要讓 Local DRL 的 state 多一個「這次排程週期實際可用 PRB 數量／106 的比例」特徵，讓 Actor 能感知 backhaul 緊繃程度、提前做出更聰明的決策（而不是每次都假設有滿的 106 可用，被動被縮減）——這是可選的優化，不是正確性必要條件（縮減是 C 語言層強制生效的，DRL 不知道這個特徵也不會違規，只是可能學得比較慢/比較不精準）。若要加，`STATE_DIM` 會變動，屬於破壞性變更。
-  - 啟動這個 Stage 前，**MongoDB 經驗與模型 checkpoint 要重新清空**：一來 `REWARD_MODE` 從 lagrangian 切到 throughput_only（既有規則），二來如果上面那條也一起做了，環境本身的 state/action 動態都變了，舊經驗不能混用。
-  - 全網 JFI（`compute_global_jfi()`，舊版已有但只做監控）如果要在這個階段就開始納入聚合權重或做為額外訊號，需要明確決定；如果沒有，`avgFL.md` 的全網 JFI 表現可能改善有限，屬於預期內、不是 bug。
+* **Stage 2（avg FL + 最基礎 DRL）**：**已完成**（2026-09-13，見 `experiment_results/avgFL.md`）。
+  - Global xApp 改版為全域公平性軟性廣播（取代舊版 5-node relay→access 配額裁切設計，理由與新舊設計差異見第 2 節元件定義），`global_xapp.py` 已重寫，`inference/flower-app/` 已針對 12-node 拓樸驗證（`FL_NUM_NODES=12`），`global_xapp_bridge.py` 已標記為過期但保留在磁碟（未經授權不刪除檔案）。
+  - 沒有加「這次排程週期實際可用 PRB 數量／106 的比例」這個 state 特徵——評估後判斷 Global xApp 的 `fairness_bias` 已經是全域視角的間接訊號，優先級較低，`STATE_DIM=50` 維持不變。若後續 Stage 發現 Local DRL 對 backhaul 緊繃程度不夠敏感，可以再評估加回。
+  - 啟動前已執行 MongoDB 經驗與模型 checkpoint 清空（`REWARD_MODE` 從 lagrangian 切到 throughput_only）。**踩坑記錄**：docker-compose 的 volume 有 `name:` 覆寫（例如 `inference_models_node1` 這個 compose 內部 key 實際對應到 Docker volume `iab-xapp-model-node1`），第一次清空時誤用 compose key 名稱掛載，建立了一個全新的空白同名 volume，實際的 checkpoint volume 完全沒被清到——之後全部用 `docker volume ls` 確認過實際名稱才修正。清空 volume 一定要先用 `docker volume ls`／`docker inspect` 確認實際名稱，不能直接套用 compose 檔裡的 service-local key。
+  - 全網 JFI 目前只做監控（`global_xapp.py` 計算並印出 `global_jfi`，不寫回 Mongo、不納入聚合權重），`avgFL.md` 的 JFI 改善（0.3303→0.3976）主要來自 Local DRL 感知 `fairness_bias` 後的行為調整，不是 Global rApp 聚合階段做了額外處理。
 
 * **Stage 3（cluster FL + 最基礎 DRL）**：
   - Local 模型架構跟 Stage 2 完全相同，只換 Global 聚合的分群方式，訓練資料/checkpoint 是否需要清空，取決於「換聚合方式」算不算破壞性變更——建議清空，避免 Stage 2 殘留的聚合結果污染 Stage 3 的量測（FL 聚合的效果評估需要乾淨的起點）。
@@ -244,7 +251,14 @@ bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc2
 bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc3.sh
 ```
 
-驗證：`docker logs flexric 2>&1 | grep -c "E2 SETUP-REQUEST"` 應為 `13`（1 donor + 12 node）。
+驗證：`docker logs flexric 2>&1 | grep -c "E2 SETUP-REQUEST"` 應為 `13`（1 donor + 12 node）。**強烈建議**：三主機都跑起來後，先對全部 17 個 UE 做一次現場 `docker exec <container> ping -c 2 <ext-dn-IP>` 確認 0% 封包遺失，再進行任何量測——長時間偵錯累積的手動介入可能讓個別 UE 處於「容器存活但資料面斷線」的狀態，靠繼續 debug 往往找不到，乾淨重啟（三主機依序 down 再依序啟動）通常是最快的解法。
+
+### 啟動 Stage 2 起的 Global 層（avg FL / cluster FL / 自訂 FL）
+```bash
+# 前置：三主機 RAN 基礎設施（run_local_pc{1,2,3}.sh）已就緒、13/13 E2、12/12 xApp
+REWARD_MODE=throughput_only bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_stage2_fl.sh
+```
+這支腳本會停止並清空 12 個 `inference-nodeN` 的 MongoDB 經驗與模型 checkpoint、用指定的 `REWARD_MODE` 重新啟動、並帶起 `global-xapp`／`flower-superlink`／`flower-supernode-node{1..12}`／`flower-scheduler`（`profiles: ["stage2-fl"]`，Stage 1 PF 重跑時不受影響）。Stage 3/4 只需改 `server_app.py` 聚合邏輯後直接重跑；Stage 5 改用 `REWARD_MODE=lagrangian`。
 
 ---
 
@@ -292,7 +306,18 @@ MAX_BUF_INFO = 2,000,000 bytes（drl_agent.py，dl_buffer_info 正規化上限�
 
 `reward_calculator.py` 中的所有吞吐量計算均以其 `MAX_BSR` 為分母；`drl_agent.py` 的 state 編碼另有一組獨立常數。若未來修改 Rate Limiter 的觸發間隔，這些常數必須同步調整。
 
-**目前 reward 現況**：`inference_server.py` 唯一呼叫 `reward_calculator.py::compute_lagrangian_reward()`（`R = R_tp + λ·(JFI_raw − JFI_MIN)`，`JFI_MIN=0.8291`，λ 由 `drl_agent.py` 自適應更新，範圍 `[0, LAMBDA_MAX=10.0]`）。同檔案裡的 `compute_reward`/`compute_reward_breakdown`（純加權和版本，`W_THROUGHPUT=1.0, W_FAIRNESS=0.0, W_DELAY=0.0`）目前**未被呼叫**，是五階段實驗路線圖 Stage 2~4「陽春 reward」的候選實作（見第 3 節）。
+**State vector 第 49 維（`fairness_bias`，Stage 2 起改版，取代舊版 2026-07-09 的 `prb_quota_ratio`）**：
+
+```
+FAIRNESS_BIAS_MIN = 0.5（drl_agent.py，Global xApp 廣播值域下限）
+FAIRNESS_BIAS_MAX = 2.0（drl_agent.py，Global xApp 廣播值域上限）
+GLOBAL_XAPP_INTERVAL_S = 2.0（global_xapp.py，每幾秒重算一次全部節點的 fairness_bias，預設值）
+GLOBAL_XAPP_LOOKBACK = 50（global_xapp.py，計算節點平均吞吐量時往回看幾筆經驗，預設值）
+```
+
+`state_vec[49] = (clip(fairness_bias, FAIRNESS_BIAS_MIN, FAIRNESS_BIAS_MAX) - FAIRNESS_BIAS_MIN) / (FAIRNESS_BIAS_MAX - FAIRNESS_BIAS_MIN)`，正規化到 `[0, 1]`。`state_vec[48]` = active_ratio（`n / MAX_UE_COUNT`）不受影響。
+
+**目前 reward 現況**：`REWARD_MODE` 環境變數控制（`docker-compose-iab-server.yaml` 全部 12 個 `inference-nodeN` 服務接上 `${REWARD_MODE:-lagrangian}`）。預設 `lagrangian`：`inference_server.py` 呼叫 `reward_calculator.py::compute_lagrangian_reward()`（`R = R_tp + λ·(JFI_raw − JFI_MIN)`，`JFI_MIN=0.8291`，λ 由 `drl_agent.py` 自適應更新，範圍 `[0, LAMBDA_MAX=10.0]`）。設成 `throughput_only`（Stage 2~4 使用）：改呼叫 `compute_reward_breakdown()`（純加權和版本，`W_THROUGHPUT=1.0, W_FAIRNESS=0.0, W_DELAY=0.0`），`drl_agent.py` 跳過 λ 更新（恆為 `LAMBDA_INIT=0.0`）；此路徑產生的 MongoDB 經驗文件**不含** `lambda_applied` 鍵（`_build_rl_experience()` 已改為條件式寫入，避免 `KeyError`）。
 
 ### FlexRIC 崩潰規律與重啟流程
 

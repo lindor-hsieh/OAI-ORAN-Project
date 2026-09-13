@@ -1,10 +1,10 @@
 # =============================================================================
 # Dockerfile — Local xApp Python 推論伺服器 (Phase 5 Flower ServerApp/ClientApp 版本)
 #
-# 5 個節點共用同一個 image，以環境變數 NODE_ID 區分入口；同一份 image 也用來跑
-# Phase 5 的 flower-superlink / flower-supernode-nodeN / flower-scheduler 服務，
+# 12 個節點共用同一個 image，以環境變數 NODE_ID 區分入口；同一份 image 也用來跑
+# global-xapp / flower-superlink / flower-supernode-nodeN / flower-scheduler 服務，
 # 由 docker-compose 的 command: 覆蓋不同入口，不需要另建 image。
-# 演進路徑：Phase 3 啟發式 → Phase 4 DRL Actor-Critic → Phase 5 Flower ServerApp/ClientApp
+# 演進路徑：Phase 3 啟發式 → Phase 4 DRL Actor-Critic → Stage 2 起 Global xApp（全域公平性廣播）+ Flower ServerApp/ClientApp（FedAvg）
 # =============================================================================
 
 FROM python:3.11-slim

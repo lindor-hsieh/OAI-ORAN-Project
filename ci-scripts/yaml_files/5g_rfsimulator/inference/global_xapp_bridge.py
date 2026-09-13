@@ -1,5 +1,14 @@
 """
-global_xapp_bridge.py — Phase 5 Global xApp 橋接 process
+global_xapp_bridge.py — Phase 5 Global xApp 橋接 process（Stage 2 起已完全棄用）
+
+**Stage 2 起：本檔案不再被任何 docker-compose 服務呼叫，且 import 已失效
+（`global_xapp.py` 已改寫為全新的全域公平性廣播設計，不再有 DATA_STALE_S／
+TOTAL_PRB／compute_quotas()）。理由見 global_xapp.py 檔頭說明：這裡描述的
+relay→access 配額裁切機制，跟 C 層「Backhaul-aware 動態 PRB 預算」機制做
+的是同一件事、會雙重節流，且硬編碼在舊版 2-relay/3-access 拓樸。保留本檔
+案僅供歷史參考，不刪除。**
+
+以下是舊版（5-node 拓樸）的職責描述：
 
 職責：
   補齊 inference_server.py 裡 relay（Node1/2）PUB 與 access（Node3/4/5）SUB

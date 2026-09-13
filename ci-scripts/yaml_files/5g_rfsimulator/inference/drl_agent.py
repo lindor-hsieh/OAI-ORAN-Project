@@ -15,7 +15,7 @@ drl_agent.py — DRL Actor-Critic Agent for Local PRB Allocation
   隱藏狀態開始（見 train_on_batch()）。詳見 DRL_DESIGN.md。
 
 State Space (固定長度向量，不足補零)：
-  [norm_bsr_0, norm_cqi_0, norm_buf_0, norm_bsr_1, norm_cqi_1, norm_buf_1, ..., active_ratio, prb_quota_ratio]
+  [norm_bsr_0, norm_cqi_0, norm_buf_0, norm_bsr_1, norm_cqi_1, norm_buf_1, ..., active_ratio, fairness_bias]
   長度 = MAX_UE_COUNT * 3 + 2 = 50
 
   norm_buf（dl_buffer_info，真實 RLC 佇列位元組數）：norm_bsr（Δtbs）與
@@ -23,10 +23,15 @@ State Space (固定長度向量，不足補零)：
   跳過無資料的 UE，見 gNB_scheduler_dlsch.c），無法區分「無資料可傳」與
   「有資料但通道差/PRB 不足」。norm_buf 不受「是否被排程」影響。
 
-  prb_quota_ratio（2026-07-09 新增）：Global xApp 回傳配額（access node 專屬，
-  relay node 恆為 1.0）。舊設計裡配額只在 Actor 輸出「之後」拿來裁切分配，
-  Actor 本身不知道限制存在；現在讓它變成輸入特徵，Actor 有機會提前學會在
-  配額緊的時候別分配過滿。
+  fairness_bias（Stage 2 起改版，取代舊版 2026-07-09 的 prb_quota_ratio）：
+  由獨立的 Global xApp process（global_xapp.py）每隔數秒讀取全部 12 個節點
+  最近的 MongoDB 經驗，算出「本節點吞吐量相對全域平均的落差」並廣播回來
+  （低於全域平均 → bias > 1，代表被犧牲、可以更積極）。這是純粹的 state
+  輸入特徵，不做任何硬性 PRB 裁切——資源池大小仍完全由 C 層「Backhaul-aware
+  動態 PRB 預算」機制（gNB_scheduler_dlsch.c）獨立決定，兩者不會疊加節流。
+  全部 12 個節點（relay/access 皆同）都接收同一套機制，無特殊分支。收到
+  訊號前預設中性值 1.0。正規化：原始 bias 落在 [0.5, 2.0]，寫入 state 前線性
+  映射到 [0, 1]（見 encode_state()）。
 
 Action Space：
   各 UE 的 PRB 分配比例 [0, 1]，總和為 1.0
@@ -59,7 +64,11 @@ from reward_calculator import JFI_MIN, REWARD_MODE
 # =============================================================================
 
 MAX_UE_COUNT: int = 16
-STATE_DIM: int = MAX_UE_COUNT * 3 + 2   # [bsr, cqi, buf] × N + active_ratio + prb_quota_ratio
+STATE_DIM: int = MAX_UE_COUNT * 3 + 2   # [bsr, cqi, buf] × N + active_ratio + fairness_bias
+
+# fairness_bias 正規化區間（Global xApp 廣播的原始值域），見 encode_state()
+FAIRNESS_BIAS_MIN: float = 0.5
+FAIRNESS_BIAS_MAX: float = 2.0
 
 MAX_BSR: float = 1_000_000.0            # DL delta-TBS 正規化上限 (bytes/100ms, ≈80 Mbps)
                                          # C xApp rate limiter 每 10 個 MAC callback 才送一次 ZMQ，
@@ -197,7 +206,7 @@ class DRLAgent:
 
         # 每 ~100ms 推論一次（由 InferenceServer 呼叫），Actor 隱藏狀態
         # 跨呼叫持久化
-        allocations = agent.infer(ues, prb_quota_ratio)
+        allocations = agent.infer(ues, fairness_bias)
 
         # 每 TRAIN_INTERVAL_S 秒訓練一次（由背景執行緒呼叫），用時間連續的
         # 經驗序列，訓練時隱藏狀態一律歸零重新開始
@@ -274,15 +283,16 @@ class DRLAgent:
     def encode_state(
         self,
         ues: list[dict],
-        prb_quota_ratio: float = 1.0,
+        fairness_bias: float = 1.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         將 UE 列表編碼為固定長度的 numpy 向量。
 
         Args:
-            ues             : UE 狀態列表
-            prb_quota_ratio : Global xApp 回傳配額比例 (quota/total_prb)，
-                              relay node 或無限制時傳 1.0（預設值）。
+            ues           : UE 狀態列表
+            fairness_bias : Global xApp 廣播的全域公平性偏差，原始值域
+                            [FAIRNESS_BIAS_MIN, FAIRNESS_BIAS_MAX]，尚未收到
+                            廣播或無資料時傳中性值 1.0（預設值）。
 
         回傳：
             state_vec : (STATE_DIM,)  float32
@@ -306,8 +316,11 @@ class DRLAgent:
 
         # 活躍 UE 比例作為全域 context 特徵
         state_vec[MAX_UE_COUNT * 3] = n / MAX_UE_COUNT
-        # Global xApp 回傳配額比例（2026-07-09 新增）
-        state_vec[MAX_UE_COUNT * 3 + 1] = float(np.clip(prb_quota_ratio, 0.0, 1.0))
+        # Global xApp 廣播的全域公平性偏差，線性映射 [BIAS_MIN,BIAS_MAX] → [0,1]
+        clipped_bias = np.clip(fairness_bias, FAIRNESS_BIAS_MIN, FAIRNESS_BIAS_MAX)
+        state_vec[MAX_UE_COUNT * 3 + 1] = float(
+            (clipped_bias - FAIRNESS_BIAS_MIN) / (FAIRNESS_BIAS_MAX - FAIRNESS_BIAS_MIN)
+        )
 
         return state_vec, mask_vec
 
@@ -332,14 +345,14 @@ class DRLAgent:
     def infer(
         self,
         ues: list[dict],
-        prb_quota_ratio: float = 1.0,
+        fairness_bias: float = 1.0,
     ) -> tuple[list[dict], np.ndarray]:
         """
         執行 DRL Actor 推論，回傳 PRB 分配結果與比例向量。
 
         Args:
-            ues             : [{"rnti": int, "bsr": int, "wb_cqi": int}, ...]
-            prb_quota_ratio : Global xApp 回傳配額比例，見 encode_state()
+            ues           : [{"rnti": int, "bsr": int, "wb_cqi": int}, ...]
+            fairness_bias : Global xApp 廣播的全域公平性偏差，見 encode_state()
 
         Returns:
             allocations   : [{"rnti": int, "prb_abs": int}, ...]
@@ -349,7 +362,7 @@ class DRLAgent:
             return [], np.zeros(MAX_UE_COUNT, dtype=np.float32)
 
         n = min(len(ues), MAX_UE_COUNT)
-        state_vec, mask_vec = self.encode_state(ues, prb_quota_ratio)
+        state_vec, mask_vec = self.encode_state(ues, fairness_bias)
         state_t, mask_t = self._to_tensors(state_vec, mask_vec)
 
         self.actor.eval()

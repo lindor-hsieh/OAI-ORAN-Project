@@ -7,6 +7,12 @@ inference_server.py — Local xApp Python 推論伺服器（Phase 4 DRL 版本�
   - 計算複合獎勵函數，建構完整的 (s, a, r, s') 強化學習經驗
   - 非同步批次寫入 MongoDB，供訓練執行緒讀取
   - 背景執行緒定期從 MongoDB 讀取經驗，執行 Actor-Critic 離線訓練
+  - Stage 2 起：訂閱 Global xApp（`global_xapp.py`）的全域公平性廣播
+    （ZMQ SUB，`tcp://127.0.0.1:5560`），把 `fairness_bias` 編碼進 state
+    vector 第 49 維，純軟性 state 特徵，不做任何硬性 PRB 裁切（見
+    `_fairness_sub_worker()`／`_current_fairness_bias()`）。模型週期性由
+    Global rApp（Flower FedAvg）聚合後的權重熱重載，見 `_train_worker()`
+    對 checkpoint mtime 的偵測邏輯。
 
 推論策略（漸進切換）：
   Phase 3 啟發式 (BSR 比例加權) ← 冷啟動 or DRL 尚未收集足夠資料時
@@ -135,17 +141,15 @@ class InferenceServer:
         self._drl_inferences: int = 0
         self._heuristic_inferences: int = 0
 
-        # Phase 5: Global xApp 整合（IAB 回傳配額軟性約束）。
-        # Node1/2（relay）將自己的 PRB 分配透過 ZMQ PUB 廣播出去；
-        # Node3/4/5（access）SUB 一個由獨立 bridge process（見
-        # global_xapp_bridge.py）彙整 Node1/2 分配後算出的配額，
-        # 以 effective_prb = min(106, quota) 限制自己實際可用的 PRB。
-        self._is_relay: bool = node_id in (1, 2)
-        self._alloc_pub_sock: Optional[zmq.Socket] = None   # Node1/2: publish allocs
-        self._quota_sub_sock: Optional[zmq.Socket] = None   # Node3/4/5: receive quota
-        self._prb_quota: int = total_prb                    # default: no restriction
-        self._quota_lock = threading.Lock()
-        self._quota_thread: Optional[threading.Thread] = None
+        # Stage 2 起：Global xApp 全域公平性廣播（取代舊版 relay→access ZMQ
+        # 配額裁切機制——舊機制跟 C 層「Backhaul-aware 動態 PRB 預算」機制
+        # 做的是同一件事、會雙重節流，已移除）。全部 12 個節點對稱地當
+        # Global xApp（獨立 process，見 global_xapp.py）的 SUB client，收到
+        # 的是純軟性 state 特徵（fairness_bias），不做任何硬性 PRB 裁切。
+        self._fairness_sub_sock: Optional[zmq.Socket] = None
+        self._fairness_bias: float = 1.0                    # 中性值，收到廣播前預設
+        self._fairness_lock = threading.Lock()
+        self._fairness_thread: Optional[threading.Thread] = None
 
         # 訓練保護：記錄上一輪訓練時的 MongoDB 筆數，無新資料則跳過
         self._last_train_mongo_count: int = 0
@@ -170,21 +174,14 @@ class InferenceServer:
         self._zmq_sock.bind(self.zmq_endpoint)
         self._log.info("ZMQ REP socket 已綁定至 %s", self.zmq_endpoint)
 
-        # Phase 5: relay nodes publish allocations; access nodes receive quota
-        if self._is_relay:
-            alloc_port = 5560 + self.node_id  # Node1→5561, Node2→5562
-            self._alloc_pub_sock = self._zmq_ctx.socket(zmq.PUB)
-            self._alloc_pub_sock.setsockopt(zmq.LINGER, 0)
-            self._alloc_pub_sock.setsockopt(zmq.SNDHWM, 5)
-            self._alloc_pub_sock.bind(f"tcp://127.0.0.1:{alloc_port}")
-            self._log.info("[Global] Alloc PUB bound: tcp://127.0.0.1:%d", alloc_port)
-        else:
-            self._quota_sub_sock = self._zmq_ctx.socket(zmq.SUB)
-            self._quota_sub_sock.setsockopt(zmq.LINGER, 0)
-            self._quota_sub_sock.setsockopt(zmq.RCVTIMEO, 500)
-            self._quota_sub_sock.setsockopt_string(zmq.SUBSCRIBE, f"node{self.node_id}")
-            self._quota_sub_sock.connect("tcp://127.0.0.1:5560")
-            self._log.info("[Global] Quota SUB connected: topic=node%d", self.node_id)
+        # Stage 2 起：全部 12 個節點對稱地訂閱 Global xApp 的全域公平性廣播
+        # （global_xapp.py 綁定 tcp://127.0.0.1:5560，見該檔頭說明）。
+        self._fairness_sub_sock = self._zmq_ctx.socket(zmq.SUB)
+        self._fairness_sub_sock.setsockopt(zmq.LINGER, 0)
+        self._fairness_sub_sock.setsockopt(zmq.RCVTIMEO, 500)
+        self._fairness_sub_sock.setsockopt_string(zmq.SUBSCRIBE, f"node{self.node_id}")
+        self._fairness_sub_sock.connect("tcp://127.0.0.1:5560")
+        self._log.info("[Global xApp] Fairness SUB connected: topic=node%d", self.node_id)
 
     def _init_mongo(self) -> None:
         """建立 MongoDB 連線；失敗時降級為不持久化模式。"""
@@ -208,50 +205,45 @@ class InferenceServer:
             self._mongo_col = None
 
     # -------------------------------------------------------------------------
-    # Phase 5: Global xApp quota 接收執行緒
+    # Stage 2: Global xApp 全域公平性廣播接收執行緒
     # -------------------------------------------------------------------------
 
-    def _quota_sub_worker(self) -> None:
-        """背景執行緒：接收 Global xApp bridge 算出的 PRB 配額（僅 access nodes）。"""
-        assert self._quota_sub_sock is not None
-        self._log.info("[Global] Quota receive thread started (Node%d)", self.node_id)
+    def _fairness_sub_worker(self) -> None:
+        """背景執行緒：接收 Global xApp 算出的全域公平性偏差（全部 12 節點對稱）。"""
+        assert self._fairness_sub_sock is not None
+        self._log.info("[Global xApp] Fairness receive thread started (Node%d)", self.node_id)
         while self._running:
             try:
-                msg = self._quota_sub_sock.recv_string()
-                # Format: "node{id} {json}" e.g. "node3 {"quota":40}"
+                msg = self._fairness_sub_sock.recv_string()
+                # Format: "node{id} {json}" e.g. "node3 {"fairness_bias":1.4}"
                 parts = msg.split(" ", 1)
                 if len(parts) == 2:
                     data = json.loads(parts[1])
-                    quota = int(data.get("quota", self.total_prb))
-                    quota = max(5, min(self.total_prb, quota))
-                    with self._quota_lock:
-                        old = self._prb_quota
-                        self._prb_quota = quota
-                    if quota != old:
-                        self._log.info("[Global] PRB quota updated: %d → %d", old, quota)
+                    bias = float(data.get("fairness_bias", 1.0))
+                    bias = max(0.5, min(2.0, bias))
+                    with self._fairness_lock:
+                        old = self._fairness_bias
+                        self._fairness_bias = bias
+                    if abs(bias - old) > 1e-6:
+                        self._log.debug("[Global xApp] fairness_bias updated: %.3f → %.3f", old, bias)
             except zmq.Again:
                 pass  # timeout, keep looping
             except (json.JSONDecodeError, ValueError):
                 pass
             except Exception as exc:
                 if self._running:
-                    self._log.debug("[Global] Quota thread error: %s", exc)
+                    self._log.debug("[Global xApp] Fairness thread error: %s", exc)
 
-    def _current_quota_ratio(self) -> float:
+    def _current_fairness_bias(self) -> float:
         """
-        回傳目前有效的回傳配額比例，作為 encode_state()/infer() 的
-        全域配額 state 特徵（見 drl_agent.py 的 prb_quota_ratio 參數）。
+        回傳目前有效的全域公平性偏差，作為 encode_state()/infer() 的
+        state 特徵（見 drl_agent.py 的 fairness_bias 參數）。
 
-        relay nodes（Node1/2）不受配額限制，恆為 1.0；access nodes
-        （Node3/4/5）依 _quota_sub_worker() 收到的最新配額換算比例，
-        讓 Actor 在輸出分配「之前」就能感知配額緊繃程度，而不只是
-        像 Phase 5a 那樣事後被裁切。
+        全部 12 個節點（relay/access 皆同）對稱地依 _fairness_sub_worker()
+        收到的最新值回傳，純軟性輸入，不做任何硬性 PRB 裁切。
         """
-        if self._is_relay:
-            return 1.0
-        with self._quota_lock:
-            quota = self._prb_quota
-        return quota / self.total_prb
+        with self._fairness_lock:
+            return self._fairness_bias
 
     # -------------------------------------------------------------------------
     # MongoDB 批次寫入（背景執行緒）
@@ -484,9 +476,9 @@ class InferenceServer:
 
         if use_drl:
             try:
-                quota_ratio = self._current_quota_ratio()
+                fairness_bias = self._current_fairness_bias()
                 with self._model_lock:
-                    allocations, action_ratios = self._agent.infer(ues, prb_quota_ratio=quota_ratio)
+                    allocations, action_ratios = self._agent.infer(ues, fairness_bias=fairness_bias)
                 self._drl_inferences += 1
                 return allocations, action_ratios
             except Exception as exc:
@@ -536,7 +528,7 @@ class InferenceServer:
 
         # 編碼當前狀態 S_t（作為 S' ）
         next_state_vec, next_mask_vec = self._agent.encode_state(
-            curr_ues, prb_quota_ratio=self._current_quota_ratio()
+            curr_ues, fairness_bias=self._current_fairness_bias()
         )
 
         doc: dict[str, Any] = {
@@ -557,7 +549,6 @@ class InferenceServer:
             "jfi_raw":       result["jfi_raw"],
             "r_fairness":    result["r_fairness"],
             "r_delay":       result["r_delay"],
-            "lambda_applied": result["lambda_applied"],
             # 閒置轉換標記（r_throughput≈0，2026-07-09 起閒置轉換也會寫入
             # MongoDB，讓 GRU 訓練資料分佈與推論時實際遇到的分佈一致；
             # training_pipeline.py 用這個欄位排除閒置樣本不計入 JFI 平均）
@@ -565,6 +556,13 @@ class InferenceServer:
             # 推論模式（供事後分析）
             "used_drl":      self._agent.is_trained,
         }
+        # "lambda_applied" 只在 REWARD_MODE=lagrangian 時存在（見
+        # compute_lagrangian_reward()）；compute_reward_breakdown()（throughput_only）
+        # 不會回傳這個 key。刻意用「這個 key 是否存在」而非「值是否為 0」當作
+        # 事後判斷這筆經驗用的是哪種 reward 模式的依據，所以這裡不能塞一個
+        # 預設值進去，只在 result 裡真的有這個 key 時才寫入文件。
+        if "lambda_applied" in result:
+            doc["lambda_applied"] = result["lambda_applied"]
         return doc
 
     # -------------------------------------------------------------------------
@@ -606,14 +604,14 @@ class InferenceServer:
         )
         self._reload_thread.start()
 
-        # 背景執行緒 4：Global xApp 配額接收（access nodes only）
-        if not self._is_relay and self._quota_sub_sock is not None:
-            self._quota_thread = threading.Thread(
-                target=self._quota_sub_worker,
+        # 背景執行緒 4：Global xApp 全域公平性廣播接收（全部 12 節點對稱）
+        if self._fairness_sub_sock is not None:
+            self._fairness_thread = threading.Thread(
+                target=self._fairness_sub_worker,
                 daemon=True,
-                name=f"quota-sub-node{self.node_id}",
+                name=f"fairness-sub-node{self.node_id}",
             )
-            self._quota_thread.start()
+            self._fairness_thread.start()
 
         self._log.info(
             "Node %d 推論伺服器啟動 | 初始模式: %s | 等待 C xApp 請求...",
@@ -673,49 +671,13 @@ class InferenceServer:
                     allocations, action_ratios = self._infer(ues)
                     self._total_inferences += 1
 
-                    # ── Phase 5a: 回傳限制配額（access nodes only）────────
-                    if not self._is_relay and allocations:
-                        with self._quota_lock:
-                            quota = self._prb_quota
-                        if quota < self.total_prb:
-                            total_alloc = sum(a["prb_abs"] for a in allocations)
-                            if total_alloc > quota and total_alloc > 0:
-                                n_alloc = len(allocations)
-                                remaining = quota
-                                capped = []
-                                for idx, a in enumerate(allocations):
-                                    if idx == n_alloc - 1:
-                                        prb = max(1, remaining)
-                                    else:
-                                        prb = max(1, int(a["prb_abs"] * quota / total_alloc))
-                                        remaining -= prb
-                                    capped.append({"rnti": a["rnti"], "prb_abs": prb})
-                                allocations = capped
-                                # Recompute action_ratios to reflect actual execution
-                                action_ratios = np.array(
-                                    [a["prb_abs"] / self.total_prb for a in allocations]
-                                    + [0.0] * (MAX_UE_COUNT - len(allocations)),
-                                    dtype=np.float32,
-                                )
-
-                    # ── Phase 5b: 發布分配給 Global xApp bridge（relay nodes only）
-                    if self._is_relay and self._alloc_pub_sock is not None:
-                        try:
-                            pub_msg = json.dumps(
-                                {"node_id": self.node_id, "allocations": allocations},
-                                separators=(",", ":"),
-                            )
-                            self._alloc_pub_sock.send_string(pub_msg, zmq.NOBLOCK)
-                        except Exception:
-                            pass
-
                     # ── 暫存本步狀態（下一步計算獎勵用）─────────────────
                     if ues and allocations:
                         self._prev_ues = ues
                         self._prev_allocations = allocations
                         self._prev_state_vec, self._prev_mask_vec = (
                             self._agent.encode_state(
-                                ues, prb_quota_ratio=self._current_quota_ratio()
+                                ues, fairness_bias=self._current_fairness_bias()
                             )
                         )
                         self._prev_action_ratios = action_ratios
@@ -804,10 +766,8 @@ class InferenceServer:
             except Exception as exc:
                 self._log.warning("關閉時模型儲存失敗: %s", exc)
 
-        if self._alloc_pub_sock is not None:
-            self._alloc_pub_sock.close()
-        if self._quota_sub_sock is not None:
-            self._quota_sub_sock.close()
+        if self._fairness_sub_sock is not None:
+            self._fairness_sub_sock.close()
         if self._zmq_sock is not None:
             self._zmq_sock.close()
         if self._zmq_ctx is not None:

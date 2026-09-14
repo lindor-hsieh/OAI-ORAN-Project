@@ -126,6 +126,10 @@ def train(msg: Message, context: Context) -> Message:
         {
             "num-examples": num_examples,
             "mean_reward": float(metrics.get("mean_reward", 0.0)),
+            # Stage 3 soft clustering 需要在 server 端依 NODE_ID 查 role_ratio_i，
+            # Flower 內部的 node id 跟本專案的 NODE_ID(1~12) 沒有已知對應關係，
+            # 所以由 client 端自己在 metrics 帶出來（見 CLAUDE.md 第 3 節）。
+            "node_id": NODE_ID,
         }
     )
     content = RecordDict({"arrays": reply_arrays, "metrics": reply_metrics})

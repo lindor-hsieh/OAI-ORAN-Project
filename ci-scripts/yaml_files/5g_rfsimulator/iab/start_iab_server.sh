@@ -137,7 +137,7 @@ configure_and_start_local_access_du() {
     local MT_TUNNEL_IP=$(docker exec $MT_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
 
     # CU 就在本機，直接下 DNAT 指令，不需要 SSH 通知
-    docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP \
+    docker exec -u 0 rfsim5g-donor-cu iptables -t nat -I OUTPUT 1 -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP \
         && echo -e "   ${GREEN}CU DNAT rule applied: $DU_DOCKER_IP → $MT_TUNNEL_IP${NC}"
 
     docker exec -u 0 $MT_NAME sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -232,6 +232,45 @@ declare -A LOCAL_ACCESS_DU_IP=( [7]="192.168.76.12" [8]="192.168.76.13" )
 declare -A LOCAL_ACCESS_MT_NAME=( [7]="rfsim5g-iab-mt-7" [8]="rfsim5g-iab-mt-8" )
 declare -A LOCAL_ACCESS_DU_NAME=( [7]="rfsim5g-iab-du-7" [8]="rfsim5g-iab-du-8" )
 
+reassert_local_access_dnat_and_routes() {
+    # [2026-09-14 新增] 同 start_iab_pc2.sh/start_iab_pc3.sh 的說明：MT 的
+    # oaitun_ue1 tunnel 偶爾會在初次設定完成後自發性重新建立 PDU session，
+    # 把先前設好的 DNAT/71/72/default 路由重置掉，需要重新斷言。PC1 本機就是
+    # CU 所在主機，不需要 SSH，直接下指令。
+    for n in 7 8; do
+        local mt_ip=$(docker exec ${LOCAL_ACCESS_MT_NAME[$n]} ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        [ -z "$mt_ip" ] && continue
+        docker exec -u 0 rfsim5g-donor-cu iptables -t nat -I OUTPUT 1 -d ${LOCAL_ACCESS_DU_IP[$n]} -p udp --dport 2152 -j DNAT --to-destination $mt_ip
+        docker exec -u 0 ${LOCAL_ACCESS_MT_NAME[$n]} ip route replace 192.168.71.0/24 via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+        docker exec -u 0 ${LOCAL_ACCESS_MT_NAME[$n]} ip route replace 192.168.72.0/24 via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+        docker exec -u 0 ${LOCAL_ACCESS_MT_NAME[$n]} ip route del default 2>/dev/null
+        docker exec -u 0 ${LOCAL_ACCESS_MT_NAME[$n]} ip route add default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+    done
+}
+
+verify_and_heal_local_ues() {
+    # 自我修復迴圈，同 start_iab_pc2.sh/start_iab_pc3.sh 的版本，這裡管 UE5~8。
+    local ues=(5 6 7 8)
+    local ext_dn_ip="192.168.72.135"
+    for attempt in 1 2 3 4 5; do
+        local all_ok=true
+        for i in "${ues[@]}"; do
+            if ! docker exec rfsim5g-end-ue-$i ping -c 1 -W 2 $ext_dn_ip >/dev/null 2>&1; then
+                all_ok=false
+            fi
+        done
+        if [ "$all_ok" = true ]; then
+            echo -e "   ${GREEN}[HEAL] 全部 UE5~8 連通性正常（第 ${attempt} 次檢查）${NC}"
+            return 0
+        fi
+        echo -e "   ${YELLOW}[HEAL] 第 ${attempt} 次檢查發現連通性異常，重新斷言路由/DNAT 規則後等待重試...${NC}"
+        reassert_local_access_dnat_and_routes
+        sleep 15
+    done
+    echo -e "   ${RED}[HEAL] 重試 5 次後仍有 UE 連不通，需要人工檢查${NC}"
+    return 1
+}
+
 for n in 7 8; do
     $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "${LOCAL_ACCESS_MT_NAME[$n]}"
     COUNT=0
@@ -252,6 +291,9 @@ for i in 5 6 7 8; do
     $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "rfsim5g-end-ue-$i"
     wait_for_local_ue "rfsim5g-end-ue-$i"
 done
+
+echo -e "${CYAN}驗證 + 自我修復 UE5~8 連通性...${NC}"
+verify_and_heal_local_ues
 
 # ==========================================
 # 4. 啟動 Python 推論伺服器 (Node 1~12，全部集中在 PC1)

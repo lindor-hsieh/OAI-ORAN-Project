@@ -1,5 +1,9 @@
 #!/bin/bash
-# run_stage2_fl.sh — Stage 2 (avg FL) 起、Global 層固定的重跑輔助腳本
+# run_stage2_fl.sh — Stage 2 起、Global 層的通用重跑輔助腳本
+#
+# 檔名沿用歷史命名（避免破壞既有文件引用），但服務範圍是「Stage 2 起任何
+# FL 模式」，不只 Stage 2——用 FL_MODE 切換聚合邏輯（avg=Stage 2 標準
+# FedAvg／cluster=Stage 3 Soft/Weighted Clustered FL，見 CLAUDE.md 第 3 節）。
 #
 # 假設 PC1/PC2/PC3 的 RAN 基礎設施（run_local_pc{1,2,3}.sh）已經跑起來、
 # 13/13 E2、12/12 xApp 皆已就緒。這支腳本只處理「切換 stage」需要的部分：
@@ -9,25 +13,32 @@
 #      key 名稱 inference_models_nodeN——兩者不同，用錯會清到不存在的
 #      volume，見 CLAUDE.md 第 3 節 Stage 2 踩坑記錄）
 #   3. 用指定的 REWARD_MODE 重新啟動 12 個 inference-nodeN 容器
-#   4. 啟動 Global xApp + Flower FL 服務（profiles: stage2-fl）
+#   4. 用指定的 FL_MODE 啟動/重建 Global xApp + Flower FL 服務（profiles: stage2-fl）
 #
 # 用法：
-#   REWARD_MODE=throughput_only bash iab/run_stage2_fl.sh
+#   REWARD_MODE=throughput_only bash iab/run_stage2_fl.sh                        # Stage 2（avg FL，預設）
+#   FL_MODE=cluster REWARD_MODE=throughput_only bash iab/run_stage2_fl.sh        # Stage 3（cluster FL）
 #
-# Stage 3/4 只需要改 flower-app/iab_fl/server_app.py 的聚合邏輯，
-# REWARD_MODE 維持 throughput_only，此腳本不用改直接重跑即可。
-# Stage 5 改用 REWARD_MODE=lagrangian 重跑。
+# Stage 4 只需要改 flower-app/iab_fl/server_app.py 的自訂聚合邏輯，此腳本
+# 不用再改直接重跑即可；Stage 5 改用 REWARD_MODE=lagrangian 重跑。
+#
+# 注意：改過 server_app.py/client_app.py 的原始碼後，這支腳本不會自動重建
+# image——因為 inference/Dockerfile 是用 COPY 把原始碼烤進
+# local-xapp-inference:latest（不是 bind mount），改完程式碼要先手動
+# `docker build -t local-xapp-inference:latest ./inference` 再跑這支腳本，
+# 否則容器裡還是舊程式碼。
 
 set -e
 cd "$(dirname "$0")/.."
 
 REWARD_MODE="${REWARD_MODE:-throughput_only}"
+FL_MODE="${FL_MODE:-avg}"
 COMPOSE_FILE="docker-compose-iab-server.yaml"
 DC="docker compose -f $COMPOSE_FILE"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
-echo -e "${CYAN}[run_stage2_fl] REWARD_MODE=${REWARD_MODE}${NC}"
+echo -e "${CYAN}[run_stage2_fl] REWARD_MODE=${REWARD_MODE} FL_MODE=${FL_MODE}${NC}"
 
 echo -e "${CYAN}[1/4] 停止全部 12 個 inference-nodeN 容器...${NC}"
 $DC stop inference-node{1..12}
@@ -44,11 +55,15 @@ echo -e "${GREEN}  checkpoint / 經驗已清空${NC}"
 echo -e "${CYAN}[3/4] 用 REWARD_MODE=${REWARD_MODE} 重新啟動 inference-nodeN...${NC}"
 REWARD_MODE="$REWARD_MODE" $DC up -d --force-recreate inference-node{1..12}
 
-echo -e "${CYAN}[4/4] 啟動 Global xApp + Flower FL 服務...${NC}"
-$DC --profile stage2-fl up -d global-xapp flower-superlink flower-supernode-node{1..12} flower-scheduler
+echo -e "${CYAN}[4/4] 用 FL_MODE=${FL_MODE} 啟動/重建 Global xApp + Flower FL 服務...${NC}"
+# --force-recreate 是必要的：flower-superlink 的 FL_MODE 環境變數可能跟上次
+# 執行不同（例如從 avg 切到 cluster），若容器已存在，`up -d` 不會重建既有容器、
+# 環境變數不會生效。
+FL_MODE="$FL_MODE" $DC --profile stage2-fl up -d --force-recreate \
+    global-xapp flower-superlink flower-supernode-node{1..12} flower-scheduler
 
 echo -e "${GREEN}==================================================${NC}"
-echo -e "${GREEN} Stage 2+ 服務已就緒（REWARD_MODE=${REWARD_MODE}）${NC}"
+echo -e "${GREEN} Stage 2+ 服務已就緒（REWARD_MODE=${REWARD_MODE}, FL_MODE=${FL_MODE}）${NC}"
 echo -e "${GREEN}==================================================${NC}"
 echo -e "${YELLOW}下一步（量測前，務必先做，見 CLAUDE.md 第 3 節）：${NC}"
 echo "  1. bash scenarios/setup_iperf_servers.sh"

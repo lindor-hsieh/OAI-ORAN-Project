@@ -133,7 +133,7 @@ services:
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --telnetsrv --backhaul-mt-telnet-port 9193 --backhaul-mt-telnet-addr 192.168.74.10 --log_config.global_log_options level,nocolor,time
+        command: sh -c "ip route add 192.168.88.1/32 via 192.168.74.1 2>/dev/null; exec chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4048 --telnetsrv --backhaul-mt-telnet-port 9193 --backhaul-mt-telnet-addr 192.168.74.10 --log_config.global_log_options level,nocolor,time"
 
     # ========================================== 
     # IAB Node 6 (access) — 子節點掛在 relay Node 1 底下
@@ -184,7 +184,7 @@ services:
             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/libtelnetsrv.so:/usr/local/lib/libtelnetsrv.so:ro
             - /usr/local/lib/flexric/libmac_sm.so:/usr/local/lib/flexric/libmac_sm.so
             - /usr/local/lib/flexric/libkpm_sm.so:/usr/local/lib/flexric/libkpm_sm.so
-        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4049 --telnetsrv --backhaul-mt-telnet-port 9194 --backhaul-mt-telnet-addr 192.168.74.11 --log_config.global_log_options level,nocolor,time
+        command: sh -c "ip route add 192.168.88.1/32 via 192.168.74.1 2>/dev/null; exec chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --rfsimulator.serverport 4049 --telnetsrv --backhaul-mt-telnet-port 9194 --backhaul-mt-telnet-addr 192.168.74.11 --log_config.global_log_options level,nocolor,time"
 
     # ========================================== 
     # IAB Node 7 (access) — 子節點掛在 relay Node 2 底下

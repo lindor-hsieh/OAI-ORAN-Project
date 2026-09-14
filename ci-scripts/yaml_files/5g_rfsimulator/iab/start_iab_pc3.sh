@@ -125,7 +125,7 @@ configure_and_start_access_du() {
 
     local MT_TUNNEL_IP=$(docker exec $MT_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
 
-    local CU_CMD="docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP"
+    local CU_CMD="docker exec -u 0 rfsim5g-donor-cu iptables -t nat -I OUTPUT 1 -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP"
     CU_MAGIC_COMMANDS+="\n${CU_CMD}"
 
     if [ "$SSH_AVAILABLE" = true ]; then
@@ -180,18 +180,58 @@ reapply_dnat_rules() {
         echo -e "   DU${n} (${ACCESS_DU_IP[$n]}) → MT${n} tunnel: ${ip:-MISSING}"
         [ -z "$ip" ] && ok=false
         CMDS="$CMDS
-docker exec -u 0 rfsim5g-donor-cu iptables -t nat -A OUTPUT -d ${ACCESS_DU_IP[$n]} -p udp --dport 2152 -j DNAT --to-destination ${ip}"
+docker exec -u 0 rfsim5g-donor-cu iptables -t nat -I OUTPUT 1 -d ${ACCESS_DU_IP[$n]} -p udp --dport 2152 -j DNAT --to-destination ${ip}"
     done
     if [ "$ok" = false ]; then
         echo -e "   ${RED}[DNAT] 有 MT tunnel IP 缺失${NC}"
         return 1
     fi
-    # 注意：不 flush OUTPUT table，只補規則（PC2 那邊已經 flush 過，避免互相清掉對方的規則）
+    # 注意：不 flush OUTPUT table，只用 -I OUTPUT 1 插入到最前面補規則——2026-09-14
+    # 已確認 PC2 端原本會在 start_iab_pc2.sh 的 reapply_dnat_rules() 整批 flush OUTPUT
+    # table，是「哪個主機腳本最後跑完，其他主機 access 節點就斷資料面」這個 race
+    # condition 的主要來源，PC2 端已同步修掉（見 start_iab_pc2.sh 對應註解），三個
+    # 主機現在都只補規則、不做整批清空。
     if [ "$SSH_AVAILABLE" = true ]; then
         ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "$CMDS" 2>/dev/null \
             && echo -e "   ${GREEN}[DNAT] 全部規則已更新 ✓${NC}" \
             || echo -e "   ${RED}[DNAT] SSH 更新失敗，請手動執行${NC}"
     fi
+}
+
+reassert_mt_routes() {
+    # [2026-09-14 新增] 同 start_iab_pc2.sh 的說明：MT 的 oaitun_ue1 tunnel 偶爾會在
+    # 初次設定完成後自發性重新建立 PDU session，把先前設好的 71/72/default 自訂
+    # 路由重置掉，不是腳本沒跑到，是跑完之後又被重置，需要重新斷言。
+    for n in 9 10 11 12; do
+        docker exec -u 0 ${ACCESS_MT_NAME[$n]} ip route replace $CN_SUBNET via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+        docker exec -u 0 ${ACCESS_MT_NAME[$n]} ip route replace $DN_SUBNET via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+        docker exec -u 0 ${ACCESS_MT_NAME[$n]} ip route del default 2>/dev/null
+        docker exec -u 0 ${ACCESS_MT_NAME[$n]} ip route add default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+    done
+}
+
+verify_and_heal_ues() {
+    # 自我修復迴圈，同 start_iab_pc2.sh 的版本，這裡管 UE9~16。
+    local ues=(9 10 11 12 13 14 15 16)
+    local ext_dn_ip="192.168.72.135"
+    for attempt in 1 2 3 4 5; do
+        local all_ok=true
+        for i in "${ues[@]}"; do
+            if ! docker exec rfsim5g-end-ue-$i ping -c 1 -W 2 $ext_dn_ip >/dev/null 2>&1; then
+                all_ok=false
+            fi
+        done
+        if [ "$all_ok" = true ]; then
+            echo -e "   ${GREEN}[HEAL] 全部 UE9~16 連通性正常（第 ${attempt} 次檢查）${NC}"
+            return 0
+        fi
+        echo -e "   ${YELLOW}[HEAL] 第 ${attempt} 次檢查發現連通性異常，重新斷言路由/DNAT 規則後等待重試...${NC}"
+        reassert_mt_routes
+        reapply_dnat_rules
+        sleep 15
+    done
+    echo -e "   ${RED}[HEAL] 重試 5 次後仍有 UE 連不通，需要人工檢查${NC}"
+    return 1
 }
 
 wait_for_ue() {
@@ -246,6 +286,9 @@ for i in 9 10 11 12 13 14 15 16; do
 done
 
 reapply_dnat_rules
+
+echo -e "\n${CYAN}[6/6] 驗證 + 自我修復 UE9~16 連通性...${NC}"
+verify_and_heal_ues
 
 echo -e "\n${YELLOW}====================================================${NC}"
 if [ "$SSH_AVAILABLE" = true ]; then

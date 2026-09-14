@@ -447,6 +447,49 @@ Stage 2 要求切換 `REWARD_MODE` 前必須清空模型 checkpoint。第一次�
 
 **判讀**：這次的斷線並非結構性/RF 問題，而是長時間 debug session 中累積的手動介入（多次容器重啟、DNAT 重新套用、iptables 補丁、FlexRIC 崩潰後的恢復流程）造成 GTP-U/PFCP 層某種難以用單一指令診斷出的 stale 狀態。**教訓**：偵錯進行到一定深度、且累積了大量手動介入後，若某個問題的根因遲遲找不到但個別元件（容器本身、RF 鏈路）都顯示健康，應該優先考慮「整體系統狀態已經劣化到超出繼續 debug 能排除的範圍」，做一次完整乾淨重啟（三主機依序 down 再依序啟動）往往比繼續往下挖更快、更可靠；這跟本文件更早的「FlexRIC 崩潰規律」章節建議的復原流程是同一個道理，只是這次連 FlexRIC 自己都沒崩潰，斷線的是更下層、更難用單一 log 診斷的資料面狀態。
 
-### 待釐清事項：F1AP 跨主機路由
+### 待釐清事項：F1AP 跨主機路由——2026-09-14 已確認並補回 git
 
-本次除錯過程中，較早的討論串一度描述「PC2/PC3 access 節點的 F1-C/F1-U 位址綁定在 internal bridge IP，CU 所在主機若無明確路由會導致 SCTP association 卡在 COOKIE_WAIT」、並描述了對應的 `ip route add` 修復動作，但事後檢查 `docker-compose-iab-pc2.yaml`／`docker-compose-iab-pc3.yaml` 的 git diff，**這個修改實際上並不存在於目前的檔案內容裡**（可能是討論串中途的 context 被截斷、修改動作未真正落地存檔）。由於本次除錯後續的多次乾淨重啟（含最終量測前的驗證）都確認 Node5/6（PC2）、Node9~12（PC3）的 access 節點 F1AP 連線與資料面全部正常運作，**目前無法確認這個路由問題是否曾經真實存在、或是否已被其他修復（例如 `DOCKER-USER` iptables 規則）間接解決**。如果未來又遇到類似症狀（access 節點 F1AP SCTP association 卡在 COOKIE_WAIT），這是一個可以優先檢查的方向，但目前不建議在沒有重現該症狀的情況下就盲目補一個未經驗證的路由規則進去。
+本次除錯過程中，較早的討論串一度描述「PC2/PC3 access 節點的 F1-C/F1-U 位址綁定在 internal bridge IP，CU 所在主機若無明確路由會導致 SCTP association 卡在 COOKIE_WAIT」、並描述了對應的 `ip route add` 修復動作，但事後檢查 `docker-compose-iab-pc2.yaml`／`docker-compose-iab-pc3.yaml` 的 git diff，**這個修改實際上並不存在於目前的檔案內容裡**（可能是討論串中途的 context 被截斷、修改動作未真正落地存檔）。當時判讀為「無法確認這個路由問題是否曾經真實存在」。
+
+**2026-09-14 更新（已確認、已修復）**：在 Stage 2/3 除錯收尾、逐一比對 PC1 git 版本與 PC2/PC3 實際執行版本的 `docker-compose-iab-pc{2,3}.yaml` 時，發現兩台主機的**全部 8 個 access 節點 DU**（PC2 的 Node5,6；PC3 的 Node9~12）的 `command:` 都是 `sh -c "ip route add 192.168.88.1/32 via <該主機 internal bridge gateway> 2>/dev/null; exec chrt -f 80 ...nr-softmodem..."`，而不是 PC1 git 版本裡單純的 `chrt -f 80 ...nr-softmodem...`——這證實了当初的修復**確實存在且目前仍在線上運作**，只是從未被寫回 git，導致 PC1 的 git 歷史一直顯示這個修復「不存在」。已將這個 `ip route add` 前綴補回 PC1 的 `docker-compose-iab-pc2.yaml`／`docker-compose-iab-pc3.yaml`（`diff` 確認與 PC2/PC3 實際執行版本逐字元相同），解決了這個長期懸而未決的「待釐清事項」。**教訓**：定期用 `diff <(ssh pc2/pc3 cat <file>) <PC1 本機檔案>` 直接比對，比翻找討論串記錄可靠得多——這次就是靠這個方法在幾秒內確認並修復，而不是繼續猜測。
+
+---
+
+## 2026-09-14 — Stage 3（soft clustered FL）上線除錯：三個獨立 root cause，外加 avgFL.md 舊數據作廢重測
+
+實作 Stage 3 `IABClusterFedAvg`（`server_app.py`/`client_app.py`）並驗證正確後（獨立離線數學測試全部通過、線上零例外），量測階段遇到極不穩定的環境（容器隨機崩潰、DNAT/路由規則隨機失效、每次壞的節點都不一樣），花了一整個 session 才定位到三個完全獨立的 root cause。過程中也發現 Stage 2（`avgFL.md`）舊數據其實混入了一個既有 bug，判定作廢重測。
+
+### Root cause 1：`REWARD_MODE` 從未傳到 `flower-supernode-nodeN`，Stage 2 舊數據混入 lagrangian 污染
+
+`docker-compose-iab-server.yaml` 的 12 個 `flower-supernode-nodeN` 服務（負責 FL 觸發的本地訓練路徑：`client_app.py::train()` → `training_pipeline.py` → `drl_agent.py::train_on_batch()`）從 Stage 2 上線以來就**沒有** `REWARD_MODE` 環境變數——`drl_agent.py` 用 `os.getenv("REWARD_MODE", "lagrangian")` 讀取，沒設就悄悄用預設值 `lagrangian`，導致這條訓練路徑一直在跑 Lagrangian 限制式（λ 自適應更新），即使 `inference-nodeN`（近即時推論、每 60 秒背景訓練的主要路徑）正確吃到 `REWARD_MODE=throughput_only`。`avgFL.md` 當時的驗證方法（檢查 MongoDB 經驗文件缺少 `lambda_applied` 鍵）只驗證到 `inference-nodeN` 這一側，抓不到 `flower-supernode-nodeN` 這條路徑的問題。
+
+**影響範圍**：`flower-supernode-nodeN` 的訓練頻率遠低於 `inference-nodeN`（需要 200 筆連續原始經驗才會觸發，`inference-nodeN` 每 60 秒就跑一次），實務上是「疊加在正確配置的主要訓練迴圈上的次要污染源」，不是整份 `avgFL.md` 數據作廢的等級，但仍是既有 bug，且原本舊版 `avgFL.md` 的 RTT 惡化（224→360ms）有一部分可能歸因於此。
+
+**修復**：`docker-compose-iab-server.yaml` 12 個 `flower-supernode-nodeN` 服務都加上 `REWARD_MODE: "${REWARD_MODE:-lagrangian}"`（跟 `inference-nodeN` 同款寫法）。修復後重測 Stage 2，確認 `flower-supernode-node1` 全程 `lambda=0.0000`。
+
+### Root cause 2：`start_iab_pc2.sh` 對 CU 的 NAT OUTPUT table 做無條件整批 flush，會砍掉其他主機已寫好的 DNAT 規則
+
+`start_iab_pc2.sh` 在**兩個地方**對 `rfsim5g-donor-cu` 的 `iptables -t nat -F OUTPUT` 整批清空：一次是拿它當「等待 CU 就緒」的探測指令（`until ssh ... "iptables -t nat -F OUTPUT"`），一次是收尾的 `reapply_dnat_rules()` 函式開頭。這個 flush 沒有時序保護——只要它在 PC1（Node7/8）或 PC3（Node9~12）已經把自己的 DNAT 規則寫進 CU 之後才跑，就會把那些規則整批砍掉且沒有人補回來，造成「哪個主機的腳本最後跑完，其他主機的 access 節點就斷資料面」這種隨執行順序而變、難以重現定位的症狀。`start_iab_pc3.sh` 原本已經注意到這個風險、刻意不 flush，但沒有意識到問題其實出在 PC2 自己身上。
+
+**額外發現的次要問題**：即使不流水線 flush，單純用 `-A OUTPUT`（append）也不夠——一旦某節點 MT 的 tunnel IP 因為 PDU session 自發性重建而改變（詳見 root cause 3 之外的觀察：MT 有時會在初次設定完成後自己重新建立 tunnel，把舊的 71/72/default 自訂路由跟著沖掉），舊的 DNAT 規則會殘留在 chain 較前面的位置、比新規則有更高比對優先權，造成「路由設對了、CU 規則卻還是指到舊 IP」的假象。
+
+**修復**：
+1. `start_iab_pc2.sh`／`start_iab_pc3.sh`／`start_iab_server.sh` 全部改用 `iptables -t nat -I OUTPUT 1 ...`（插入到最前面），不再有任何 `-F OUTPUT`；「等待 CU 就緒」的探測指令改成無害的 `docker exec -u 0 rfsim5g-donor-cu true`。
+2. 三個腳本收尾都新增 `verify_and_heal_ues()` / `verify_and_heal_local_ues()` 自我修復迴圈：對自己負責的 UE 做 ping 驗證，失敗就呼叫 `reassert_mt_routes()`（重新斷言 MT 的 71/72/default 路由）+ `reapply_dnat_rules()`，最多重試 5 次、每次間隔 15 秒。
+
+### Root cause 3：cpuset 過度擁擠（27 個 process 塞 4 核心）造成 CU 隨機崩潰——這是本次除錯最久才定位到的一個
+
+在修完 root cause 1、2 之後，乾淨重啟仍然偶爾出現 `rfsim5g-donor-cu` 隨機崩潰（`RestartCount` 無故增加），且崩潰後波及的節點每次不同，一度懷疑是腳本啟動順序問題（PC2/PC3 同時起跑互相干擾），改成完全依序啟動（PC1 基礎設施→PC2 完整跑完→PC3 完整跑完→PC1 E2 等待+xApp）後仍然重現，證明跟啟動順序無關。回頭比對「今天新增了什麼設定」才發現：本次除錯過程中，作者把 Stage 2 就有的 `inference-nodeN` 專用 `cpuset: "12-15"`（4 核心，2026-09-13 root cause 修復，長期驗證穩定）誤以為「Global xApp/Flower FL 服務也應該做同樣的 CPU 隔離」，額外把 `global-xapp`／`flower-superlink`／12 個 `flower-supernode-nodeN`／`flower-scheduler`（共 15 個服務）全部也加上同一組 `cpuset: "12-15"`，變成 27 個 process 擠在同一組 4 核心。`mpstat` 檢查瞬時 CPU 使用率並不誇張（該組核心平均僅 30% 上下），完全沒有「CPU 用滿了」的直觀訊號，這也是為什麼一開始沒往這個方向懷疑——真正的機制是偶發性的排程延遲尖峰（大量 Python process 的 GIL/GC pause 跟外面共用實體核心），足以讓 RT-priority 的 CU/DU SCTP/RRC 計時器偶爾錯過期限而觸發 crash-restart，CU 一旦重建，所有依賴它當下 netns 的 DNAT/路由設定就全部失效，表現出來就是 root cause 2 那種「NAT/路由查起來都對、卻還是斷」的假象——這也解釋了為什麼修完 root cause 2 之後症狀還會偶發重現。
+
+**驗證方式（A/B 對照，非猜測）**：把新加的 15 個 cpuset 設定移除，只保留原本的 12 個 `inference-nodeN`，重新依序做一次三主機乾淨重啟——`rfsim5g-donor-cu` 全程 `RestartCount` 維持 0，三個自我修復迴圈（root cause 2 的產物）全部一次檢查就通過，不需要任何人工介入。之後 Stage 2、Stage 3 兩次完整 15 分鐘正式量測，三主機全部容器 `RestartCount` 全程維持 0。
+
+**修復**：`docker-compose-iab-server.yaml` 移除今天新加的 15 個 `cpuset: "12-15"`，只保留原本 12 個 `inference-nodeN` 的設定；並在該處註解加上警告，避免未來又無條件套用同一組隔離設定到其他容器。完整排查步驟已寫進 `CLAUDE.md` 第 7 節「容器隨機崩潰／連線隨機斷線排查指南」。
+
+**教訓**：
+1. 幫容器加 `cpuset` 隔離之前，要先確認「這組核心目前已經塞了多少 process」，不能看到 CPU 使用率不高就假設還有空間——排程延遲尖峰不會反映在粗粒度的平均使用率上。
+2. 這次三個 root cause 混在一起，症狀高度重疊（都表現成「某些節點資料面斷線、隨機、修了又復發」），單靠繼續往下挖 NAT/路由邏輯永遠只能治標；真正定位靠的是「回想今天到底新改了什麼」+ A/B 對照實驗，跟本文件更早條目的教訓完全一致。
+3. 除錯過程中一度嘗試在 PC2/PC3 沒有安裝 `conntrack` 工具的情況下手動 flush conntrack，指令直接失敗（`executable file not found`）——這個平台的 base image 本來就不含 `conntrack` CLI，之前腳本裡的 `conntrack -F 2>/dev/null || true` 其實一直是靜默 no-op，這點也順便記錄下來，避免以後重蹈覆轍去依賴一個不存在的工具。
+
+### Stage 2（avgFL.md）舊數據作廢，重測結果
+
+修完 root cause 1（`REWARD_MODE` 缺口）後，判定舊版 `avgFL.md` 的數據混入 lagrangian 污染，不能視為乾淨的 `throughput_only` 基準，決定重測。修完全部三個 root cause、確認三主機 15 分鐘全程零崩潰、量測前 17/17 UE 現場 ping 0% 封包遺失後，Stage 2、Stage 3 依序重新量測，結果與方法論限制見 `experiment_results/avgFL.md`、`experiment_results/clusterFL.md` 最新版本；`CLAUDE.md` 第 3 節路線圖表格已同步更新為重測後的數字。

@@ -78,6 +78,15 @@ services:
     #   推論/訓練負載硬性限制在 4 個核心內、跟 RT-priority 的 DU/MT 執行緒
     #   物理隔離後，load average 降回 7~9，未再復發。詳見
     #   experiment_results/avgFL.md「上線前的清理與除錯過程」第 3 點。
+    #
+    #   ⚠️ 2026-09-14 教訓：不要無條件把其他容器（Global xApp／Flower FL
+    #   服務）也加進同一組 "12-15"！這裡是 12 個 inference-nodeN 專用、已
+    #   驗證穩定的隔離區，曾經誤把 global-xapp/flower-superlink/12 個
+    #   flower-supernode-nodeN/flower-scheduler（共 15 個服務）也塞進同一組
+    #   4 核心（變成 27 個 process 擠 4 核心），造成 rfsim5g-donor-cu 隨機
+    #   崩潰，且瞬時 CPU 使用率看起來完全不誇張（mpstat 平均僅 30% 上下）、
+    #   很難聯想到是 cpuset 過度擁擠。新增容器隔離前先確認這組核心目前塞了
+    #   多少 process，見 CLAUDE.md 第 7 節「容器隨機崩潰排查指南」第 1 點。
     # ==========================================================
     inference-node1:
         image: local-xapp-inference:latest
@@ -596,6 +605,12 @@ services:
         command: ["python3", "global_xapp.py"]
         restart: on-failure
 
+    # FL_MODE 是 server_app.py::main() 決定 instantiate IABFedAvg（avg，Stage 2，
+    # 預設值）還是 IABClusterFedAvg（cluster，Stage 3）的開關，比照 REWARD_MODE
+    # 的既有模式，見 CLAUDE.md 第 3 節。PYTHONUNBUFFERED=1 是 2026-09-14 除錯
+    # Stage 3 時補上的——沒有這個，server_app.py 裡的 print() 會卡在這個長駐
+    # process 的 stdio buffer 裡，docker logs 永遠看不到，很難確認到底套用的
+    # 是哪個 FL_MODE、聚合有沒有真的跑。
     flower-superlink:
         image: local-xapp-inference:latest
         container_name: flower-superlink
@@ -607,7 +622,9 @@ services:
         environment:
             APP_ROOT: "/app"
             PYTHONPATH: "/app"
+            PYTHONUNBUFFERED: "1"
             FL_NUM_NODES: "12"
+            FL_MODE: "${FL_MODE:-avg}"
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR_NODE1: "/app/models_node1"
@@ -638,6 +655,17 @@ services:
         command: ["flower-superlink", "--insecure"]
         restart: on-failure
 
+    # ==========================================================
+    # 全部 12 個 flower-supernode-nodeN 都有 REWARD_MODE（2026-09-14 root
+    # cause 修復）：這條路徑（client_app.py::train() -> training_pipeline.py
+    # -> drl_agent.py::train_on_batch()）原本沒有這個環境變數，`drl_agent.py`
+    # 用 os.getenv("REWARD_MODE", "lagrangian") 讀不到就悄悄用預設值
+    # lagrangian，即使 inference-nodeN 那條路徑正確吃到 throughput_only 也一樣
+    # ——導致 Stage 2/3 量測一度混入 lagrangian 污染（2026-09-13 舊版
+    # avgFL.md 因此作廢重測）。補上這行，跟 inference-nodeN 用同一個
+    # REWARD_MODE 環境變數。詳見 CLAUDE.md 第 3 節 Stage 2 條目、
+    # HISTORY.md 2026-09-14 條目 root cause 1。
+    # ==========================================================
     flower-supernode-node1:
         image: local-xapp-inference:latest
         container_name: flower-supernode-node1
@@ -653,6 +681,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node1:/app/models
         command:
@@ -677,6 +706,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node2:/app/models
         command:
@@ -701,6 +731,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node3:/app/models
         command:
@@ -725,6 +756,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node4:/app/models
         command:
@@ -749,6 +781,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node5:/app/models
         command:
@@ -773,6 +806,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node6:/app/models
         command:
@@ -797,6 +831,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node7:/app/models
         command:
@@ -821,6 +856,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node8:/app/models
         command:
@@ -845,6 +881,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node9:/app/models
         command:
@@ -869,6 +906,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node10:/app/models
         command:
@@ -893,6 +931,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node11:/app/models
         command:
@@ -917,6 +956,7 @@ services:
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
         volumes:
             - inference_models_node12:/app/models
         command:

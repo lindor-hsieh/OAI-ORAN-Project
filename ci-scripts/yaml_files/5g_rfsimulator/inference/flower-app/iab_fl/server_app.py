@@ -13,10 +13,14 @@ Stage 2 起套用於 12-node 拓樸（`FL_NUM_NODES=12`），程式邏輯本身�
   - 啟動時嘗試從 Node1 現有 checkpoint 讀取初始權重當作第一輪的種子
     （沒有的話用隨機初始化）——僅影響第一輪的 bootstrap，之後每輪都是
     上一輪真正聚合後的結果。
-  - IABFedAvg：標準 FedAvg（依各節點回傳的 num-examples 加權平均 actor/
-    critic 權重），聚合完成後額外從 MongoDB 計算全網 Jain's Fairness
-    Index 並記錄到這輪的 metrics——**目前僅供監控／log，尚未實作
-    JFI-guided 的聚合權重調整**（見 CLAUDE.md 第五階段待開發項目）。
+  - IABFedAvg（FL_MODE=avg，預設值，Stage 2）：標準 FedAvg（依各節點回傳的
+    num-examples 加權平均 actor/critic 權重），聚合完成後額外從 MongoDB
+    計算全網 Jain's Fairness Index 並記錄到這輪的 metrics——**目前僅供
+    監控／log，尚未實作 JFI-guided 的聚合權重調整**（見 CLAUDE.md 第五階段
+    待開發項目）。
+  - IABClusterFedAvg（FL_MODE=cluster，Stage 3）：Soft/Weighted Clustered
+    FedAvg，依每個節點的連續角色比例 ROLE_RATIO 算出 relay/access 兩個原型
+    模型後，依各節點自己的比例混合廣播，取代硬性二分群，見 CLAUDE.md 第 3 節。
   - 強制全部 NUM_NODES 個節點參與（min_train_nodes=min_available_nodes=NUM_NODES）。
   - 聚合完成後把最終權重寫回全部 NUM_NODES 個節點的 checkpoint（不只是送出
     initial_arrays 的那個節點），讓各節點的 InferenceServer._reload_worker
@@ -46,6 +50,23 @@ JFI_LOOKBACK: int = 100  # 每節點取最近 N 筆 reward 算 JFI 代理值
 
 MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB: str = os.getenv("MONGO_DB", "iab_xapp")
+
+# Stage 3（2026-09-13 設計定案，見 CLAUDE.md 第 3 節）：FL_MODE=avg 是 Stage 2
+# 標準 FedAvg（預設值，維持既有行為不變）；FL_MODE=cluster 是 Soft/Weighted
+# Clustered FL——兩種聚合邏輯並存，用這個環境變數切換，比照 REWARD_MODE 的既有模式。
+FL_MODE: str = os.getenv("FL_MODE", "avg")
+
+# role_ratio_i = 直連 UE 數量 / (直連 UE 數量 + 透過下游 DU 節點間接服務的 UE 數量)。
+# 結構性常數，依現行 12-node 拓樸算出，不需即時量測：Node1~3 純 relay（下游都是
+# 其他有 DU 的節點）；Node4 混合（直連 UE17 + 經 Node11/12 服務的 UE13~16）；
+# Node5~12 純 access（下游都是純 UE）。混合節點的存在正是 Stage 3 從硬性二分群
+# 改為連續加權的動機，見 CLAUDE.md 第 3 節 Stage 3 段落。
+ROLE_RATIO: dict[int, float] = {
+    1: 0.0, 2: 0.0, 3: 0.0,
+    4: 0.2,  # UE17 直連(1) / (UE17(1) + 經 Node11,12 服務的 UE13~16(4)) = 1/5
+    5: 1.0, 6: 1.0, 7: 1.0, 8: 1.0,
+    9: 1.0, 10: 1.0, 11: 1.0, 12: 1.0,
+}
 
 app = ServerApp()
 
@@ -96,6 +117,48 @@ def compute_global_jfi(db: pymongo.database.Database) -> float:
     return float(x.sum() ** 2 / (len(x) * (x ** 2).sum() + 1e-9))
 
 
+def _attach_global_jfi(db: pymongo.database.Database | None, metrics: MetricRecord | None) -> None:
+    """算全網 JFI 並寫回這輪的 metrics（Stage 2 IABFedAvg／Stage 3 IABClusterFedAvg 共用，
+    目前僅供監控／log，尚未實作 JFI-guided 的聚合權重調整）。"""
+    if metrics is None:
+        return
+    jfi = 0.0
+    if db is not None:
+        try:
+            jfi = compute_global_jfi(db)
+        except Exception:
+            jfi = 0.0
+    metrics["global_jfi"] = jfi
+
+
+def _weighted_average_flat(items: list[tuple[dict, float]]) -> dict | None:
+    """items = [(flat_state_dict, weight), ...]。回傳權重總和 > 0 時的逐 key 加權平均；
+    權重總和 <= 0（例如這一側全部節點 num-examples=0）時回傳 None，代表這一側這輪
+    沒有新資料可聚合（呼叫端要比照 Stage 2 的 ZeroDivisionError 降級語意處理）。"""
+    positive = [(flat, w) for flat, w in items if w > 0]
+    total = sum(w for _, w in positive)
+    if total <= 0:
+        return None
+    keys = positive[0][0].keys()
+    return {k: sum(flat[k] * w for flat, w in positive) / total for k in keys}
+
+
+def _apply_weights_to_node(node_id: int, actor_sd: dict, critic_sd: dict) -> None:
+    """單節點 checkpoint 安全寫入（Stage 2/3 共用，是廣播邏輯裡風險最高的部分）。
+
+    **關鍵**：先 `agent.load()` 讀回該節點目前的 train_steps／optimizer 狀態，才套用
+    聚合後的 actor/critic 權重——若用全新 DRLAgent 直接覆寫存檔，train_steps 會被
+    重置為 0，導致 `DRLAgent.load()` 算出的 `is_trained = train_steps > 0` 變成
+    False，`_reload_worker` 下次熱重載時會誤判模型「尚未訓練」，整個 InferenceServer
+    悄悄退回 BSR 啟發式，等於讓這一輪 FL 聚合的成果完全作廢（見 Stage A smoke test）。
+    """
+    agent = DRLAgent(node_id=node_id, model_dir=_model_dir_for_node(node_id))
+    agent.load()
+    agent.actor.load_state_dict(actor_sd)
+    agent.critic.load_state_dict(critic_sd)
+    agent.save()  # 原子寫入，見 drl_agent.py
+
+
 class IABFedAvg(FedAvg):
     """標準 FedAvg（依 num-examples 加權平均）+ JFI 監控 log（不影響聚合權重）。"""
 
@@ -119,15 +182,7 @@ class IABFedAvg(FedAvg):
             )
             arrays, metrics = None, MetricRecord({"num-examples": 0})
 
-        jfi = 0.0
-        if self._db is not None:
-            try:
-                jfi = compute_global_jfi(self._db)
-            except Exception:
-                jfi = 0.0
-
-        if metrics is not None:
-            metrics["global_jfi"] = jfi
+        _attach_global_jfi(self._db, metrics)
 
         return arrays, metrics
 
@@ -143,6 +198,96 @@ class IABFedAvg(FedAvg):
                 "num-examples=0，跳過本輪 evaluate 聚合"
             )
             return None
+
+
+class IABClusterFedAvg(IABFedAvg):
+    """Soft/Weighted Clustered FedAvg（Stage 3，2026-09-13 設計定案，見 CLAUDE.md 第 3 節）。
+
+    不是硬性把節點分兩群各自 FedAvg，而是依每個節點的連續角色比例 role_ratio_i
+    （見 ROLE_RATIO）算出 relay/access 兩個「原型」模型，再依每個節點自己的
+    role_ratio_i 混合廣播——硬性二分群是 role_ratio_i∈{0,1} 時的特例。
+
+    繼承 IABFedAvg 而非直接繼承 FedAvg：aggregate_evaluate()（跟分群無關的
+    診斷用 eval_loss 平均）直接沿用不用重寫；只覆寫 aggregate_train()。
+
+    `self._last_w_relay`/`self._last_w_access` 是這個 strategy 實例跟 main() 之間
+    的資料通道——Flower 的 Result 物件只能裝一個 ArrayRecord，裝不下「兩個原型」，
+    所以 aggregate_train() 算完直接存在 self 上，main() 在 strategy.start() 結束後
+    直接讀這兩個屬性做混合廣播，不透過 aggregate_train() 的回傳值。
+    """
+
+    def __init__(self, db: pymongo.database.Database | None, **kwargs) -> None:
+        super().__init__(db=db, **kwargs)
+        self._last_w_relay: dict | None = None
+        self._last_w_access: dict | None = None
+
+    def aggregate_train(self, server_round, replies):
+        replies = list(replies)  # 要走訪計算 relay/access 兩組加權，必須先物化成 list
+
+        relay_items: list[tuple[dict, float]] = []
+        access_items: list[tuple[dict, float]] = []
+        total_num_examples = 0
+
+        for msg in replies:
+            metrics = msg.content["metrics"]
+            node_id = int(metrics["node_id"])
+            num_examples = float(metrics["num-examples"])
+            total_num_examples += int(num_examples)
+            role = ROLE_RATIO.get(node_id, 1.0)
+            flat = msg.content["arrays"].to_torch_state_dict()
+            relay_items.append((flat, (1.0 - role) * num_examples))
+            access_items.append((flat, role * num_examples))
+
+        w_relay = _weighted_average_flat(relay_items) if relay_items else None
+        w_access = _weighted_average_flat(access_items) if access_items else None
+
+        if w_relay is not None:
+            self._last_w_relay = w_relay
+        if w_access is not None:
+            self._last_w_access = w_access
+
+        if w_relay is None and w_access is None:
+            print(
+                f"[server_app] Round {server_round}: 全部節點 num-examples=0"
+                "（尚無足夠訓練資料），跳過本輪聚合（cluster 模式）"
+            )
+            arrays, metrics_out = None, MetricRecord({"num-examples": 0})
+        else:
+            # 這個 arrays 只是滿足 Flower 內部 Result.arrays 非空判斷用，main()
+            # 廣播時看的是 self._last_w_relay/_last_w_access，不是這個回傳值。
+            arrays = ArrayRecord(w_relay if w_relay is not None else w_access)
+            metrics_out = MetricRecord({"num-examples": total_num_examples})
+
+        _attach_global_jfi(self._db, metrics_out)
+
+        return arrays, metrics_out
+
+
+def _broadcast_cluster_weights(w_relay: dict | None, w_access: dict | None) -> None:
+    """把 relay/access 兩個原型依每個節點的 role_ratio_i 混合後寫回各自 checkpoint。
+
+    W_i(廣播) = (1-role_ratio_i)·W_relay + role_ratio_i·W_access
+
+    任一原型為 None（該側這輪沒有新資料，見 _weighted_average_flat）時整段退化用
+    另一個原型；兩者皆 None 時全部節點這輪都不更新（等同 Stage 2 no-op 語意）。
+    """
+    if w_relay is None and w_access is None:
+        print("[server_app] 本次執行沒有任何一輪成功聚合（cluster 模式，全程無訓練資料），跳過廣播")
+        return
+
+    for node_id in range(1, NUM_NODES + 1):
+        role = ROLE_RATIO.get(node_id, 1.0)
+        try:
+            if w_relay is None:
+                mixed = w_access
+            elif w_access is None:
+                mixed = w_relay
+            else:
+                mixed = {k: (1.0 - role) * w_relay[k] + role * w_access[k] for k in w_relay}
+            actor_sd, critic_sd = _split_flat_state_dict(mixed)
+            _apply_weights_to_node(node_id, actor_sd, critic_sd)
+        except Exception as exc:
+            print(f"[server_app] 廣播聚合權重至 Node{node_id} 失敗（cluster 模式）: {exc}")
 
 
 def _seed_initial_arrays() -> ArrayRecord:
@@ -173,11 +318,7 @@ def _broadcast_aggregated_weights(arrays: ArrayRecord) -> None:
     actor_sd, critic_sd = _split_flat_state_dict(flat)
     for node_id in range(1, NUM_NODES + 1):
         try:
-            agent = DRLAgent(node_id=node_id, model_dir=_model_dir_for_node(node_id))
-            agent.load()  # 保留該節點目前的 train_steps／optimizer 狀態
-            agent.actor.load_state_dict(actor_sd)
-            agent.critic.load_state_dict(critic_sd)
-            agent.save()  # 原子寫入，見 drl_agent.py
+            _apply_weights_to_node(node_id, actor_sd, critic_sd)
         except Exception as exc:
             print(f"[server_app] 廣播聚合權重至 Node{node_id} 失敗: {exc}")
 
@@ -196,7 +337,8 @@ def main(grid: Grid, context: Context) -> None:
     except pymongo.errors.PyMongoError:
         db = None
 
-    strategy = IABFedAvg(
+    strategy_cls = IABClusterFedAvg if FL_MODE == "cluster" else IABFedAvg
+    strategy = strategy_cls(
         db=db,
         fraction_train=1.0,
         fraction_evaluate=1.0,
@@ -204,6 +346,7 @@ def main(grid: Grid, context: Context) -> None:
         min_evaluate_nodes=NUM_NODES,
         min_available_nodes=NUM_NODES,
     )
+    print(f"[server_app] FL_MODE={FL_MODE}（strategy={strategy_cls.__name__}）")
 
     result = strategy.start(
         grid=grid,
@@ -219,7 +362,12 @@ def main(grid: Grid, context: Context) -> None:
     # 否則每個節點的 agent.actor.load_state_dict() 會因缺 key 直接拋例外
     # （已在真實驗證中發生過一次）。沒有任何一輪真正聚合成功，代表這次
     # `flwr run` 完全沒有新東西可以分享，維持各節點目前的權重不變即可。
-    if result.arrays:
+    if FL_MODE == "cluster":
+        # cluster 模式的 result.arrays 只是滿足 Flower 內部非空判斷用（見
+        # IABClusterFedAvg.aggregate_train()），真正廣播看的是 strategy 實例上
+        # 存的兩個原型，不是 result.arrays。
+        _broadcast_cluster_weights(strategy._last_w_relay, strategy._last_w_access)
+    elif result.arrays:
         _broadcast_aggregated_weights(result.arrays)
     else:
         print("[server_app] 本次執行沒有任何一輪成功聚合（全程無訓練資料），跳過廣播")

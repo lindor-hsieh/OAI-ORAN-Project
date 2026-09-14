@@ -69,7 +69,7 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
 * **Near-RT RIC (C 語言)**：使用 FlexRIC 作為 E2 代理伺服器與 xApp 框架。
 * **Non-RT RIC & AI (Python)**：規劃透過 Flower Framework 進行階層式聯邦學習 (Hierarchical FL)，並透過 ZeroMQ 建立跨語言 IPC 通訊。
 
-> **目前實作現況**（2026-09-13 更新）：Local xApp + Local rApp + Global xApp + Global rApp 四個元件皆已針對 12-node 拓樸重建完成並上線（Stage 2 avg FL，見 `experiment_results/avgFL.md`）。**Global xApp 已改版為全域公平性軟性廣播機制**（非舊版 5-node 的 relay→access 配額裁切設計，見下方元件定義），`docker-compose-iab-server.yaml` 已新增 `global-xapp`／`flower-superlink`／`flower-supernode-node{1..12}`／`flower-scheduler` 服務定義，全部掛在 `profiles: ["stage2-fl"]` 底下（Stage 1 PF 重跑時不受影響）。舊版 5-node 配額廣播機制的設計細節保留在 `HISTORY.md` 供歷史參考，但**不再是需要復原的架構**——新設計已確認優於舊版（見下方元件定義的理由說明）。
+> **目前實作現況**（2026-09-14 更新）：Local xApp + Local rApp + Global xApp + Global rApp 四個元件皆已針對 12-node 拓樸重建完成並上線，Stage 2（avg FL，見 `experiment_results/avgFL.md`）與 Stage 3（soft cluster FL，見 `experiment_results/clusterFL.md`）皆已完成量測。**Global xApp 已改版為全域公平性軟性廣播機制**（非舊版 5-node 的 relay→access 配額裁切設計，見下方元件定義），`docker-compose-iab-server.yaml` 已新增 `global-xapp`／`flower-superlink`／`flower-supernode-node{1..12}`／`flower-scheduler` 服務定義，全部掛在 `profiles: ["stage2-fl"]` 底下（Stage 1 PF 重跑時不受影響）。舊版 5-node 配額廣播機制的設計細節保留在 `HISTORY.md` 供歷史參考，但**不再是需要復原的架構**——新設計已確認優於舊版（見下方元件定義的理由說明）。Stage 2 的數據於 2026-09-14 重測過一次（見 `HISTORY.md` 對應條目），目前 `avgFL.md`／`clusterFL.md` 皆為重測後的乾淨版本。
 
 ### 核心控制元件定義
 
@@ -85,10 +85,11 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
    * **實作**：獨立 Python process（`global_xapp.py`），每 `GLOBAL_XAPP_INTERVAL_S`（預設 2 秒）讀一次 MongoDB 全部 12 個節點最近 `GLOBAL_XAPP_LOOKBACK`（預設 50）筆經驗，算出每個節點的平均吞吐量與全域平均的落差，換算成 `fairness_bias = clip(global_mean / (node_mean + eps), 0.5, 2.0)`，透過 ZMQ PUB 廣播給全部 12 個 Local rApp（topic `nodeN`）。
    * **與 Stage 1 完成的「Backhaul-aware 動態 PRB 預算」機制（C 層，`gNB_scheduler_dlsch.c`）的分工**：兩者刻意作用在不同軸，不會衝突——C 層依「該節點自己 MT 的真實忙碌度」硬性縮小 DU 可用 PRB 池上限（單節點局部視角，PF 排程器也吃得到，是排程器的輸入約束）；Global xApp 依「全域相對落後程度」提供**純軟性 state 特徵**給 DRL Actor（單節點看不到的全域視角，只有跑 DRL 的階段才吃得到，不做任何硬性 PRB 裁切）。舊版 5-node 拓樸的「Global xApp」設計（relay 對自己的 access 子節點做局部配額裁切）已確認是錯誤方向——那本質上跟 C 層機制做同一件事（節流 DU 可用資源），只是一個用量測值、一個用父節點猜測值，同時上線會造成雙重節流；新設計改讓 Global xApp 專注做 C 層機制做不到的事（全域視角），完全消除了這個衝突。
    * **常數**：`state_vec[48]` = active_ratio，`state_vec[49]` = 正規化後的 `fairness_bias`（`(clip(bias,0.5,2.0)-0.5)/1.5`），`STATE_DIM=50` 維持不變（非破壞性變更，只是把原本恆為 1.0 的舊版 `prb_quota_ratio` 欄位換成有意義的語意）。
-4. **Global rApp（Flower ServerApp/ClientApp，聚合策略隨 Stage 而變）**：
+4. **Global rApp（Flower ServerApp/ClientApp，聚合策略隨 `FL_MODE` 切換）**：
    * **實作**：`inference/flower-app/iab_fl/`，`server_app.py`（`FL_NUM_NODES=12`）+ `client_app.py`，透過 Flower SuperLink（`flower-superlink`）+ 12 個 SuperNode（`flower-supernode-node{1..12}`，`--clientappio-api-address` 分別綁定 `9101~9112`）部署，`flower-scheduler` 每 `FL_ROUND_INTERVAL_S`（預設 180 秒）觸發一輪 `flwr run`。
-   * **Stage 2（本階段）**：標準 FedAvg，全部 12 節點一起聚合，聚合後的權重寫回共用的 `model_nodeN.pt` checkpoint，Local rApp 背景執行緒偵測到 mtime 變化即熱重載。已加上 `ZeroDivisionError` 防呆（全部節點 `num-examples=0` 時跳過本輪聚合，不崩潰、不誤把空 ArrayRecord 廣播出去覆蓋掉有效權重）。
-   * **Stage 3~5**：只換 `server_app.py` 的聚合邏輯（cluster FL / 自訂 FL），`client_app.py`／Global xApp／Local xApp+Local rApp 皆不變，見第 3 節路線圖。
+   * **`FL_MODE=avg`（Stage 2，預設值）**：`IABFedAvg`，標準 FedAvg，全部 12 節點一起聚合，聚合後的權重寫回共用的 `model_nodeN.pt` checkpoint，Local rApp 背景執行緒偵測到 mtime 變化即熱重載。已加上 `ZeroDivisionError` 防呆（全部節點 `num-examples=0` 時跳過本輪聚合，不崩潰、不誤把空 ArrayRecord 廣播出去覆蓋掉有效權重）。
+   * **`FL_MODE=cluster`（Stage 3）**：`IABClusterFedAvg`（繼承 `IABFedAvg`），依 `role_ratio_i` 加權聚合出 relay/access 兩個原型再依各節點自己的比例混合廣播，取代單一全域平均；`client_app.py::train()` 的回覆多帶一個 `node_id` 欄位供 server 端分組。兩個 strategy class 並存於同一份 `server_app.py`，`main()` 依環境變數決定 instantiate 哪一個，兩者的 `_seed_initial_arrays()`／checkpoint 廣播底層寫入邏輯（`_apply_weights_to_node()`）共用。完整設計、公式、量測結果見第 3 節路線圖與 `experiment_results/clusterFL.md`。
+   * **Stage 4~5**：只再換 `server_app.py` 的聚合邏輯（自訂 FL），`client_app.py`／Global xApp／Local xApp+Local rApp 皆不變，見第 3 節路線圖。
 
 ### 與 3GPP IAB / O-RAN 標準規格的差異（誠實揭露，供論文方法論限制章節引用）
 
@@ -128,15 +129,15 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 
 > 開發 xApp 規則：每開發完一個 xApp，先編譯 FlexRIC xApp 和 OAI RAN with E2 Agent，編譯過了才進下一個/才能審核（見第 6 節建置指令）。
 
-### 五階段實驗路線圖（規劃中，尚未實作）
+### 五階段實驗路線圖（Stage 1~3 已完成，Stage 4~5 規劃中）
 
 目標：在同一組流量+路徑損耗場景下，依序驗證 5 個遞增複雜度的控制策略，**每一階的實驗數據（TCP-DL、Latency、UDP-DL/UL、Jain's Fairness Index 等）都必須贏過前一階**，最終逼近吞吐量理論上限。
 
 | Stage | 策略 | Global 層（配額協調/FL 聚合） | Local 層（單節點 DRL） | 狀態 |
 |---|---|---|---|---|
 | 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**（2026-09-13 三度重測，見 `experiment_results/PF.md`：併發 JFI=0.3303、17 UE 平均吞吐量約 6.45 Mbps、平均 RTT 224.23 ms，15 分鐘全程三主機零新增崩潰——**這份數據是 backhaul-aware 機制在三台主機全部真正生效後的正式基準**。前兩次量測皆已作廢：第一次忘記停用 xApp；第二次雖已停用 xApp，但事後發現 PC2/PC3 的 `librfsimulator.so` 忘記重新編譯（只重編了 nr-uesoftmodem/nr-softmodem/telnetsrv，見第 7 節新增的 rsync 後置檢查規則），導致只有 PC1 節點的機制真正生效，PC2/PC3 全部節點仍是 no-op；三主機皆確認 `bhload` 模組成功註冊後才產出本次數據。**UE17 現場複測 ICMP 100% 封包遺失、iperf3 完全無法建立傳輸**，是三主機機制全部真正介入後 Node4（UE17 直連 relay，同時中繼 Node11+Node12）三重負載疊加的極端案例，詳見 PF.md「UE17 特別說明」；是 Stage 2~5 的比較對象） |
-| 2 | avg FL + 最基礎 DRL | Global xApp（全域公平性軟性廣播，Stage 2~5 全程固定）+ Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | **已完成**（2026-09-13，見 `experiment_results/avgFL.md`：JFI=0.3976 對比 PF 的 0.3303（改善 +20.4%）、17 UE 平均吞吐量 6.58 Mbps 對比 PF 的 6.45 Mbps（持平略升）、平均 RTT 360.70 ms 對比 PF 的 224.23 ms（**惡化 +60.9%，判斷主因是 DRL Actor 推論延遲疊加進 MAC 排程週期，尚未達成 RTT 單調遞增要求**），15 分鐘全程三主機 FlexRIC/CU/DU/MT 零新增崩潰。過程中發現並修復 4 個 root cause 等級基礎設施問題（PC2/PC3 F1AP 跨主機路由、`DOCKER-USER` chain GTP-U/SCTP 放行規則、PC1 CPU 資源競爭導致 FlexRIC 崩潰、累積系統狀態導致個別 UE 斷線），詳見 avgFL.md） |
-| 3 | cluster FL + 最基礎 DRL | Global xApp+Global rApp：Cluster FL，依角色分兩群聚合：relay cluster（Node1~4）、access cluster（Node5~12）各自獨立 FedAvg | Local xApp+Local rApp：最基礎 DRL（同 Stage 2，模型不變，只有 Global 聚合方式不同） | 未開始 |
+| 2 | avg FL + 最基礎 DRL | Global xApp（全域公平性軟性廣播，Stage 2~5 全程固定）+ Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | **已完成（2026-09-14 重測版，取代 2026-09-13 舊版本）**，見 `experiment_results/avgFL.md`：JFI=0.4779 對比 PF 的 0.3303（**改善 +44.7%**）、17 UE 平均吞吐量 8.40 Mbps 對比 PF 的 6.45 Mbps（**改善 +30.2%**）、平均 RTT 296.07 ms 對比 PF 的 224.23 ms（**惡化 +32.1%，尚未達成 RTT 單調遞增要求，判斷主因同舊版本——DRL Actor 推論延遲疊加進 MAC 排程週期**），15 分鐘全程三主機 FlexRIC/CU/DU/MT 零新增崩潰。**重測原因**：2026-09-13 舊版本的 `flower-supernode-nodeN` 訓練路徑其實一直缺 `REWARD_MODE` 環境變數、悄悄跑 lagrangian，加上另外兩個會導致資料面隨機斷線的基礎設施問題（CU NAT table 被無條件 flush、cpuset 過度擁擠造成 CU 隨機崩潰）修復後決定重測，三個 root cause 完整記錄見 `HISTORY.md` 2026-09-14 條目 |
+| 3 | soft cluster FL + 最基礎 DRL | Global xApp+Global rApp：Soft/Weighted Clustered FL——依節點連續角色比例 `role_ratio_i`（見下方公式）加權聚合出 relay/access 兩個原型模型，每個節點依自己的 `role_ratio_i` 混合接收兩個原型；硬性二分群是 `role_ratio∈{0,1}` 時的特例（2026-09-13 討論定案，取代原本 relay/access 硬分兩群設計，動機見下方 Node4 說明） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2，模型不變，只有 Global 聚合方式不同） | **已完成**（2026-09-14，見 `experiment_results/clusterFL.md`：JFI=0.4163、17 UE 平均吞吐量 6.30 Mbps、平均 RTT 372.57 ms，皆**低於** avg FL（Stage 2）的 0.4779／8.40 Mbps／296.07 ms，**尚未達成單調遞增要求**，15 分鐘全程三主機零新增崩潰。**重要方法論限制**：量測全程 FL 觸發訓練幾乎每輪都因經驗數量不足而跳過聚合，`IABFedAvg`／`IABClusterFedAvg` 在這 15 分鐘視窗內幾乎沒有機會做出有意義的非零權重聚合，Stage 2/3 觀察到的差異主要反映 12 個節點各自獨立訓練軌跡的隨機變異，不能直接歸因為聚合演算法本身有問題（聚合公式已經過離線數學驗證）；為何落後與後續調整方向待下一輪討論，詳見 clusterFL.md） |
 | 4 | 自訂 FL + 最基礎 DRL | Global xApp+Global rApp：自訂聚合演算法（介面待設計） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2/3） | 未開始 |
 | 5 | 自訂 FL + 改良版 DRL | Global xApp+Global rApp：自訂聚合演算法（同 Stage 4，不變） | Local xApp+Local rApp：改良版 DRL（`REWARD_MODE=lagrangian`，重新啟用 Lagrangian JFI 限制機制） | 未開始 |
 
@@ -148,7 +149,7 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 * Stage 2~4 底層用的是**同一個**陽春 DRL（只差 FL 聚合方式），不是三種不同的模型。
 * 「改進版 DRL」= 重新啟用現有的 Lagrangian 機制。**`REWARD_MODE` 開關已實作完成**（2026-09-12）：環境變數預設 `lagrangian`（維持現行行為，`inference_server.py` 呼叫 `reward_calculator.py::compute_lagrangian_reward()`，`R = R_tp + λ·(JFI_raw − JFI_MIN)`，λ 由 `drl_agent.py::train_on_batch()` 自適應更新）；設成 `throughput_only` 時改呼叫 `compute_reward_breakdown()`（純 throughput，`W_THROUGHPUT=1.0, W_FAIRNESS=0, W_DELAY=0`），且 `drl_agent.py` 會跳過 λ 更新（恆為 `LAMBDA_INIT=0.0`）。用法：`REWARD_MODE=throughput_only bash iab/run_local_pc1.sh`（12 個 `inference-nodeN` 服務的 `docker-compose-iab-server.yaml` 都已接上 `${REWARD_MODE:-lagrangian}`）。**切換 REWARD_MODE 前務必清空 MongoDB 經驗與模型 checkpoint**，reward 語意改變不能混在同一批訓練資料裡（沿用既有先例）。
 * **不寫死、隨時可單獨跑任一 stage**：每個 stage 要能透過環境變數/CLI flag 獨立選擇（例如 `FL_MODE=none|avg|cluster|custom` + `REWARD_MODE=throughput_only|lagrangian`），不是「一定要照順序、前面沒做完後面就不能跑」的線性相依關係——不論開發進度到哪，都要能重跑任何一個 stage 的數據。
-* Stage 3 的 cluster 分群邏輯可參考 `inference/DRL_METHODOLOGY_PLAN.md`（舊 5-node 版本的 relay/access 分群設計，需要重新推導成 4/8 分群；分群理由本來是「relay 中繼下游流量、access 直接面對 UE，結構不同」——這個理由在加入下方 backhaul-aware PRB 預算機制後仍然成立，因為 relay 的下游是「其他有 DU 的節點」、access 的下游是「純 UE」，性質確實不同，但兩者現在都同樣會被 backhaul 使用量壓縮 PRB 預算，不是只有 relay 才有這個約束）。
+* Stage 3 的分群邏輯**已從硬性 4/8 二分群改為連續角色比例加權**（2026-09-13 討論定案，理由見下方 Node4 說明）。`inference/DRL_METHODOLOGY_PLAN.md` 記錄的舊 5-node 硬分群設計僅供架構參考，**不再是 Stage 3 要重新推導的目標**——分群理由本來是「relay 中繼下游流量、access 直接面對 UE，結構不同」，這個理由本身仍成立（relay 的下游是「其他有 DU 的節點」、access 的下游是「純 UE」），但硬性二分在 Node4 這種混合角色節點上會強迫模型偏向其中一種下游型態、犧牲另一種下游的吞吐量，改用連續角色比例後兩種下游都能被正確反映，且對更大規模拓樸（未來可能出現更多混合角色節點）不需要重新手動定義分群邊界，可直接推廣。
 * Global xApp／Flower FL 的完整舊版部署細節（SuperLink/SuperNode 拓樸、client/server app 邏輯）在 `HISTORY.md`，復原時可直接參考架構，但節點數/角色分群需要重新推導成新的 12-node 拓樸。
 
 ### 環境層新增機制：Backhaul-aware 動態 PRB 預算（五階段共用，2026-09-12 設計討論）
@@ -169,15 +170,39 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
   - **2026-09-12**：回歸測試（13/13 E2、17/17 UE 附著、iperf3 sanity check）與正式 15 分鐘量測通過，過程中發現並根除三個 root cause bug（詳見 HISTORY.md 對應日期條目）：telnetsrv 的 `recv()` 錯誤值處理不完整導致的 buffer overflow 崩潰、CU UID 分配器耗盡時的整數溢位崩潰、CU 對同一 DU ID 的 F1 association 記錄在異常斷線後永久不清除導致的連線永久拒絕。但這輪的 `PF.md` **事後查出 backhaul-aware 機制其實整段是靜默 no-op**（`bhload` 命令命名撞上 telnetsrv 保留字導致 MT 端 SIGSEGV，見下方 HISTORY.md 條目），數據已作廢。
   - **2026-09-13**：修復 `bhload` 命名衝突（改名 `get`→`query`，並補上 `telnetsrv.c::setgetvar()` 的 NULL 防呆）、修復 PC2/PC3 漏編譯 `rfsimulator` target 導致機制只有三分之一節點真正生效的問題後，三度重測才產出真正有效的基準（`experiment_results/PF.md`：JFI=0.3303、平均吞吐量 6.45 Mbps、平均 RTT 224.23 ms）。PF 排程器本身不需要額外開發（它本來就不讀任何自訂 state），縮小可用 PRB 池這件事對 PF 排程器是透明的。
 
-* **Stage 2（avg FL + 最基礎 DRL）**：**已完成**（2026-09-13，見 `experiment_results/avgFL.md`）。
+* **Stage 2（avg FL + 最基礎 DRL）**：**已完成**（2026-09-14 重測版，取代 2026-09-13 舊版本，見 `experiment_results/avgFL.md`）。
   - Global xApp 改版為全域公平性軟性廣播（取代舊版 5-node relay→access 配額裁切設計，理由與新舊設計差異見第 2 節元件定義），`global_xapp.py` 已重寫，`inference/flower-app/` 已針對 12-node 拓樸驗證（`FL_NUM_NODES=12`），`global_xapp_bridge.py` 已標記為過期但保留在磁碟（未經授權不刪除檔案）。
   - 沒有加「這次排程週期實際可用 PRB 數量／106 的比例」這個 state 特徵——評估後判斷 Global xApp 的 `fairness_bias` 已經是全域視角的間接訊號，優先級較低，`STATE_DIM=50` 維持不變。若後續 Stage 發現 Local DRL 對 backhaul 緊繃程度不夠敏感，可以再評估加回。
   - 啟動前已執行 MongoDB 經驗與模型 checkpoint 清空（`REWARD_MODE` 從 lagrangian 切到 throughput_only）。**踩坑記錄**：docker-compose 的 volume 有 `name:` 覆寫（例如 `inference_models_node1` 這個 compose 內部 key 實際對應到 Docker volume `iab-xapp-model-node1`），第一次清空時誤用 compose key 名稱掛載，建立了一個全新的空白同名 volume，實際的 checkpoint volume 完全沒被清到——之後全部用 `docker volume ls` 確認過實際名稱才修正。清空 volume 一定要先用 `docker volume ls`／`docker inspect` 確認實際名稱，不能直接套用 compose 檔裡的 service-local key。
-  - 全網 JFI 目前只做監控（`global_xapp.py` 計算並印出 `global_jfi`，不寫回 Mongo、不納入聚合權重），`avgFL.md` 的 JFI 改善（0.3303→0.3976）主要來自 Local DRL 感知 `fairness_bias` 後的行為調整，不是 Global rApp 聚合階段做了額外處理。
+  - 全網 JFI 目前只做監控（`global_xapp.py` 計算並印出 `global_jfi`，不寫回 Mongo、不納入聚合權重），`avgFL.md` 的 JFI 改善主要來自 Local DRL 感知 `fairness_bias` 後的行為調整，不是 Global rApp 聚合階段做了額外處理。
+  - **2026-09-14 重測**：發現 `flower-supernode-nodeN`（FL 觸發訓練路徑）從未拿到 `REWARD_MODE` 環境變數、一直悄悄跑 `lagrangian`，加上另兩個會導致資料面隨機斷線的基礎設施問題（見下方 Stage 3 條目的三個 root cause 說明），修復後判定舊數據作廢、重新量測。重測版 JFI/吞吐量皆優於舊版本，RTT 仍未達成單調遞增，詳見 `avgFL.md`。
 
-* **Stage 3（cluster FL + 最基礎 DRL）**：
-  - Local 模型架構跟 Stage 2 完全相同，只換 Global 聚合的分群方式，訓練資料/checkpoint 是否需要清空，取決於「換聚合方式」算不算破壞性變更——建議清空，避免 Stage 2 殘留的聚合結果污染 Stage 3 的量測（FL 聚合的效果評估需要乾淨的起點）。
-  - `DRL_METHODOLOGY_PLAN.md` 提到的舊版分群邏輯要重新推導成 4/8 分群（relay 4 個、access 8 個），確認 `min_train_nodes`/`min_evaluate_nodes` 等 Flower 參數有沒有跟著調整。
+* **Stage 3（soft cluster FL + 最基礎 DRL）**：**已完成**（2026-09-14，見 `experiment_results/clusterFL.md`）。設計定案於 2026-09-13。
+  - Local 模型架構跟 Stage 2 完全相同，只換 Global 聚合的分群方式；量測前已清空 MongoDB 經驗與模型 checkpoint。
+  - **設計緣起（Node4 邊界案例）**：Node4 的 DU 同時中繼給 Node11/Node12（各帶 2 個 UE，共 4 個）、也直接服務 UE17，是唯一橫跨 relay/access 兩種下游型態的節點。若強制二選一硬分群，Node4 的模型會被拉去擬合單一下游型態、犧牲另一種下游的吞吐量表現，跟本階段「單調遞增總吞吐量」的驗收目標衝突；改用連續角色比例後不需要對混合節點做人工判定，機制本身也不寫死拓樸大小，可直接推廣到未來更大規模、更多混合角色節點的 IAB 樹。
+  - **`role_ratio_i` 定義**（結構性，依拓樸算出、不需即時量測，可重現）：
+    ```
+    role_ratio_i = 直連 UE 數量 / (直連 UE 數量 + 透過下游 DU 節點間接服務的 UE 數量)
+    ```
+    現行 12-node 拓樸代入結果：Node1,2,3（純 relay，無直連 UE）= `0`；**Node4 = 1/5 = 0.2**（直連 UE17 共 1 個，加上經 Node11/12 服務的 UE13~16 共 4 個）；Node5~12（純 access）= `1`。已寫成 `server_app.py::ROLE_RATIO` 常數字典。
+  - **聚合公式**（`n_i` 沿用既有 FedAvg 樣本數權重）：
+    ```
+    W_relay  = Σ_i (1 - role_ratio_i) · n_i · ΔW_i  /  Σ_i (1 - role_ratio_i) · n_i     (i ∈ 全部 12 節點)
+    W_access = Σ_i    role_ratio_i    · n_i · ΔW_i  /  Σ_i    role_ratio_i    · n_i     (i ∈ 全部 12 節點)
+    ```
+  - **廣播公式**（每個節點依自己的 `role_ratio_i` 混合兩個原型，取代原本「整份模型歸某一群」的做法）：
+    ```
+    W_i(廣播回去) = (1 - role_ratio_i) · W_relay + role_ratio_i · W_access
+    ```
+    Node1~3 拿到近乎純 `W_relay`、Node5~12 拿到近乎純 `W_access`、Node4 拿到 `0.8·W_relay + 0.2·W_access` 的個人化混合，不需要二選一。硬性二分群是 `role_ratio_i∈{0,1}` 時的特例，論文方法論章節可註明本設計為 Clustered FL 的 soft/weighted 推廣版（類似 Multi-Center FL 的 soft assignment、或 APFL 的模型插值精神，插值對象換成 relay/access 兩個原型）。
+  - **實作**：`server_app.py` 新增 `IABClusterFedAvg`（繼承 `IABFedAvg`，只覆寫 `aggregate_train()`，`aggregate_evaluate()` 沿用父類別），跟原本的 `IABFedAvg`（Stage 2）並存，用 `FL_MODE=avg|cluster` 環境變數切換（`main()` 依此決定 instantiate 哪個 strategy class），比照 `REWARD_MODE` 的既有模式；`min_train_nodes`/`min_evaluate_nodes` 等 Flower 參數維持對全部 12 節點的門檻（因為現在是全體節點都貢獻進兩個原型，不是子集分群，不需要拆成 4/8 兩組門檻）。
+  - **`client_app.py` 有一個必要的最小改動，跟原本「完全不變」的假設不同**：`train()` 的回覆 metrics 多加一個 `node_id` 整數欄位——Server 端要依 `role_ratio_i` 分組加權，必須知道每筆回覆來自哪個實體節點，但 Flower 的 `Message` 內部 node id 是 SuperLink 指派的亂數、跟本專案的 `NODE_ID`（1~12）沒有已知對應關係，只能由 client 端自己在 metrics 帶出來。`evaluate()` 的回覆不受影響（跟分群無關）。
+  - **正確性驗證**：獨立的純 Python 離線數學驗證腳本（不依賴 Docker/Flower，可直接測 `_weighted_average_flat()` 加權平均與混合廣播公式），涵蓋已知輸入下的正確性與邊界情況（某一側全部節點 `num-examples=0`、Node4 混合節點的廣播值介於兩原型之間且不等於任一純原型），全部通過。
+  - **量測結果**：JFI=0.4163、17 UE 平均吞吐量 6.30 Mbps、平均 RTT 372.57 ms，三項皆**低於** avg FL（Stage 2）、尚未達成單調遞增要求；15 分鐘全程三主機零新增崩潰。**重要方法論限制**：量測全程 FL 觸發訓練幾乎每輪都因經驗數量不足（`training_pipeline.py` 需要 200 筆連續原始經驗）而跳過聚合，`IABFedAvg`／`IABClusterFedAvg` 在單次 15 分鐘視窗內幾乎沒有機會做出有意義的非零權重聚合——Stage 2/3 觀察到的差異主要反映 12 個節點各自獨立訓練軌跡的隨機變異，不能直接歸因為聚合演算法本身有問題（聚合公式已經過離線數學驗證）。為何落後、後續怎麼調整（拉長量測視窗／降低訓練門檻等）待下一輪討論，詳見 `clusterFL.md`。
+  - **上線過程額外定位並修復三個獨立的基礎設施 root cause**（完整過程見 `HISTORY.md` 2026-09-14 條目，這裡只列結論，之後遇到「容器隨機崩潰／連線隨機斷線」都應先照第 7 節「容器隨機崩潰排查指南」排查，不要重新從頭摸索）：
+    1. `flower-supernode-nodeN` 從未拿到 `REWARD_MODE` 環境變數，一直悄悄跑 `lagrangian`——已補上 `REWARD_MODE: "${REWARD_MODE:-lagrangian}"`（同 `inference-nodeN` 寫法）。
+    2. `start_iab_pc2.sh` 對 CU 的 NAT OUTPUT table 做無條件整批 flush，若時序上晚於其他主機寫入自己的 DNAT 規則，會把那些規則整批砍掉——三個 `start_iab_*.sh` 腳本全部改用 `iptables -t nat -I OUTPUT 1 ...`（插入不清空），並加上 `verify_and_heal_ues()` 自我修復迴圈。
+    3. 誤把 Global xApp/Flower FL 共 15 個服務也加上跟 `inference-nodeN` 相同的 `cpuset: "12-15"`，27 個 process 塞 4 核心造成 `rfsim5g-donor-cu` 隨機崩潰——已移除，只保留原本 12 個 `inference-nodeN` 的設定。
 
 * **Stage 4（自訂 FL + 最基礎 DRL）**：
   - 自訂聚合演算法介面要先設計出來（目前 CLAUDE.md 標註「待設計」），建議設計時就把「要不要把全網 JFI 或 backhaul 緊繃程度也當作聚合權重的輸入」一併考慮進去，呼應第 3 節開頭「Global 智慧分配」要解決的是全網協調問題，不能只是換一種模型平均方式。
@@ -242,16 +267,24 @@ sudo ./build_oai --gNB --nrUE --build-e2 --ninja -w USRP -C --cmake-opt -DE2AP_V
 > **PC2（Ubuntu 20.04）額外需求**（三台主機唯一不是 24.04 的，除錯過程見 HISTORY.md）：`libuhd-dev`（focal 原生倉庫有）、`libyaml-cpp-dev` 需從源碼建置 0.8.0（原生只有 0.6.2，OAI CMake 需要新版 ALIAS target 支援）、CMake 需用 Kitware 倉庫裝到 3.28.3（原生 3.16.3 太舊）、GCC 需用 `ppa:ubuntu-toolchain-r/test` 裝 gcc-13/g++-13 並設為預設（原生 9.4.0 編譯 AVX512 SIMD 會報錯）。**執行期額外需求**：`nr-uesoftmodem`/`nr-softmodem` 連結 host 的 `libssl.so.1.1`，但容器基底只有 `libssl3`，需把 `/usr/lib/x86_64-linux-gnu/{libssl,libcrypto}.so.1.1` 複製進 `cmake_targets/ran_build/build/`（此檔案不在版控裡，`ran_build` 目錄重建後要重做）。
 
 ### 一鍵啟動三主機系統
-```bash
-# PC1（先啟動，CN5G/FlexRIC/MongoDB/Donor CU-DU/全部 xApp+inference）
-bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc1.sh
 
-# PC2、PC3（等 PC1 完成後，兩台可同時執行）
+**建議做法（2026-09-14 驗證更穩定）：完全依序啟動，不要三台同時跑**——先讓 PC1 的基礎設施（不含 E2 等待、不含 xApp 啟動）單獨跑完，再依序（不要同時）跑 PC2、PC3，最後回 PC1 做 E2 等待＋啟動 xApp：
+
+```bash
+# 1. PC1 基礎設施（CN5G/FlexRIC/MongoDB/Donor CU-DU/Node2,7,8），跑完才繼續下一步
+bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/start_iab_server.sh
+
+# 2. PC2 完全跑完，才換 PC3（不要背景同時跑兩台）
 bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc2.sh
 bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc3.sh
+
+# 3. 回 PC1：等待 13/13 E2、啟動全部 xApp
+bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/run_local_pc1.sh --skip-server
 ```
 
-驗證：`docker logs flexric 2>&1 | grep -c "E2 SETUP-REQUEST"` 應為 `13`（1 donor + 12 node）。**強烈建議**：三主機都跑起來後，先對全部 17 個 UE 做一次現場 `docker exec <container> ping -c 2 <ext-dn-IP>` 確認 0% 封包遺失，再進行任何量測——長時間偵錯累積的手動介入可能讓個別 UE 處於「容器存活但資料面斷線」的狀態，靠繼續 debug 往往找不到，乾淨重啟（三主機依序 down 再依序啟動）通常是最快的解法。
+**舊式三台同時跑的寫法**（`run_local_pc1.sh`（完整版）+ PC2/PC3 同時執行）理論上也能動，且過去多次量測都是這樣起的，但 2026-09-14 debug 過程中觀察到三台完全同時起跑時偶爾會出現 CU/DU 隨機崩潰（根因見第 7 節「容器隨機崩潰排查指南」第 1、2 點，不是這個同時啟動的寫法本身的 bug），目前**沒有辦法**100%排除同時啟動時的競爭條件，所以正式量測前建議一律用上面的依序寫法。
+
+驗證：`docker logs flexric 2>&1 | grep -c "E2 SETUP-REQUEST"` 應為 `13`（1 donor + 12 node）；`docker inspect --format '{{.RestartCount}}' rfsim5g-donor-cu` 應為啟動前的原值（沒有新增崩潰）。**每次啟動或切換 stage 後、跑 15 分鐘量測前，一定要先對全部 17 個 UE 做一次現場 `docker exec <container> ping -c 2 <ext-dn-IP>` 確認 0% 封包遺失**——這是低成本前置檢查，能在花 15 分鐘量測之前就抓到連線缺陷，長時間偵錯累積的手動介入也可能讓個別 UE 處於「容器存活但資料面斷線」的狀態，靠繼續 debug 往往找不到，乾淨重啟（依上面的依序寫法）通常是最快的解法；若同一個節點反覆發生一樣的連通性問題（乾淨重啟後還是壞），才需要深入排查是否有真正的程式碼或設定 bug（見第 7 節）。
 
 ### 啟動 Stage 2 起的 Global 層（avg FL / cluster FL / 自訂 FL）
 ```bash
@@ -335,6 +368,15 @@ GLOBAL_XAPP_LOOKBACK = 50（global_xapp.py，計算節點平均吞吐量時往�
 2. `inference_server.py` 啟動時會自動從 `/app/models/model_nodeX.pt` 載入 checkpoint，訓練進度與 MongoDB experience 不會丟失。
 
 **已知過期、待更新的輔助腳本**：`iab/monitor_drl.sh`、`iab/watchdog.sh`、`iab/drl_report.py`、`iab/check_convergence.py`、`iab/iab_perf_test.sh` 仍是雙主機期的 PC2-only（帳號/IP 已過期）、Node1~5／UE1~6 寫死版本，尚未針對三主機 12-node/17-UE 拓樸更新，跑五階段實驗路線圖前需要先處理。
+
+### 容器隨機崩潰／連線隨機斷線排查指南（2026-09-14 定案）
+
+如果三主機乾淨重啟後，`rfsim5g-donor-cu`／DU／MT **隨機**崩潰或重啟（`docker inspect --format '{{.RestartCount}}'` 不斷增加，且每次壞掉的節點都不一樣、跟「哪個腳本最後跑完」看起來沒有固定關係），依照以下順序排查，不要一開始就假設是既有 RAN C code 的問題：
+
+1. **先檢查是不是 `cpuset` 把太多 process 塞進同一組核心**：`docker-compose-iab-server.yaml` 目前只有全部 12 個 `inference-nodeN` 服務釘在 `cpuset: "12-15"`（4 核心，Stage 2 上線時就有的既有設計，長期驗證穩定）。**任何要新增 cpuset 隔離的容器（例如 Global xApp／Flower FL 服務），都不能無條件套用同一組 `"12-15"`**——2026-09-14 debug session 曾經把 `global-xapp`／`flower-superlink`／12 個 `flower-supernode-nodeN`／`flower-scheduler`（共 15 個服務）也全部加上 `cpuset: "12-15"`，變成同一組 4 核心要塞 27 個 process，即使瞬時 CPU 使用率看起來不誇張（`mpstat` 平均只有 30% 上下），仍然造成偶發性的排程延遲尖峰，讓 RT-priority 的 CU/DU SCTP/RRC 計時器偶爾錯過期限而 crash-restart，進而讓所有依賴 CU 當下 netns 的 DNAT/路由設定失效——這正是「不管怎麼修 NAT/路由、過一陣子又壞、每次壞的節點都不一樣」這種難以定位症狀的真正源頭。**排查方法**：`docker inspect --format '{{.HostConfig.CpusetCpus}}' <container>` 列出目前所有容器的 cpuset 分組，數一數同一組核心裡總共塞了多少 process，跟核心數（`nproc`）比較是否明顯失衡；懷疑是這個原因時，直接把新加的 cpuset 限制拿掉做 A/B 對照（拿掉後乾淨重啟，觀察 CU RestartCount 是否維持 0），比繼續往下挖 NAT/路由邏輯快得多。
+2. **確認 CU 的 NAT OUTPUT table 沒有被意外整批清空**：`iab/start_iab_pc2.sh`／`start_iab_pc3.sh`／`start_iab_server.sh` 的 DNAT 規則寫入邏輯全部使用 `iptables -t nat -I OUTPUT 1 ...`（插入到最前面），**不會**、也**不能**對整條 `OUTPUT` chain 做 `-F` 全部清空——早期版本 PC2 的腳本會在自己的收尾步驟對 CU 的 NAT OUTPUT table 做無條件 `-F`，只要這個 flush 跑在其他主機已經寫好自己節點 DNAT 規則**之後**，就會把其他主機的規則整批砍掉，且沒有人會補回來，造成跟第 1 點類似的「隨機哪個節點斷線」症狀（但成因完全不同：這個是規則被砍，第 1 點是 CU 本身真的 crash）。三個腳本現在都已改成「不 flush、只在最前面插入」，若未來又看到類似症狀，先確認相關腳本有沒有被還原成舊版的 flush 寫法。
+3. **確認三主機啟動順序**：即使上述兩點都排除，仍建議依序（不要三台完全同時）執行：先跑 `bash iab/start_iab_server.sh`（只做 PC1 基礎設施＋Node2/7/8，不等 E2、不啟動 xApp）→ 等它完全跑完 → 依序（不要同時）跑 PC2、PC3 各自的 `run_local_pc{2,3}.sh` 並各自等到完全跑完 → 最後跑 `bash iab/run_local_pc1.sh --skip-server`（只做 E2 等待＋啟動 xApp）。這個順序讓三主機的 CU 操作完全不重疊，實測比三台同時起跑更穩定（2026-09-14 驗證：依序啟動後，15 分鐘正式量測全程 CU/DU/MT RestartCount 維持 0）。
+4. **自我修復機制**：三個 `start_iab_*.sh` 腳本收尾都有 `verify_and_heal_ues()`／`verify_and_heal_local_ues()`，會對自己負責的 UE 做 ping 驗證，失敗時自動重新斷言 MT 路由＋CU DNAT 規則，最多重試 5 次（每次間隔 15 秒）。若腳本印出「重試 5 次後仍有 UE 連不通，需要人工檢查」，通常代表當時 CU 或該節點的 DU/MT 剛好處於第 1、2 點描述的不穩定狀態，等它穩定後手動重跑一次 `docker exec -u 0 <mt> ip route replace ...`＋CU 端 `iptables -t nat -I OUTPUT 1 ...`（或直接重跑該主機的腳本）通常就會通。
 
 ---
 

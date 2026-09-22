@@ -267,11 +267,41 @@ reassert_mt_routes() {
     done
 }
 
+# [2026-09-18 新增] UE 自己的預設路由偶爾會在 PDU session 自發重建後消失
+# （`ip route show` 只剩 12.1.1.0/24 這條 kernel scope 路由，default 不見），
+# 跟 MT/DU 端的 tunnel IP 飄移是同一類「自發重建但沒人跟著補」問題，但這個
+# 是 UE 自己這一側缺路由，reassert_mt_routes/reapply_dnat_rules 都不會動到
+# UE 容器本身，不會修到這個。現場已經在三台主機上都各自遇過一次（見
+# HISTORY.md 2026-09-18 條目），這裡補進自我修復迴圈，不用每次都靠人工補。
+fix_ue_default_routes() {
+    for i in "$@"; do
+        docker exec -u 0 "rfsim5g-end-ue-${i}" ip route replace default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+    done
+}
+
+# [2026-09-18 新增] Random Access process pool 耗盡（OAI 內部固定 4 格陣列，
+# gNB_scheduler_RA.c:719 "no free RA process"）是一種路由/DNAT 重新斷言完全
+# 救不回來的獨立崩潰模式——子節點會卡在 PRACH/RAR 重試迴圈，直到該 DU 被
+# 重啟為止（見 HISTORY.md 2026-09-18 Node2 案例、本次 session PC3 Node9~12
+# 案例）。這裡本機直接檢查 Node1,3,4(relay)+Node5,6(access) 五個 DU 的 log，
+# 有就重啟，5~10 秒即可恢復。
+heal_ra_exhaustion_local() {
+    for du in rfsim5g-iab-du-1 rfsim5g-iab-du-3 rfsim5g-iab-du-4 rfsim5g-iab-du-5 rfsim5g-iab-du-6; do
+        local hits
+        hits=$(docker logs --since 90s "$du" 2>&1 | grep -c "no free RA process" || true)
+        if [ "${hits:-0}" -gt 0 ]; then
+            echo -e "   ${YELLOW}[RA-HEAL] $du 偵測到 RA process pool 耗盡（${hits} 次），重啟...${NC}"
+            docker restart "$du" >/dev/null 2>&1
+            sleep 10
+        fi
+    done
+}
+
 verify_and_heal_ues() {
     # 自我修復迴圈：ping 全部本機負責的 UE，任何一個失敗就重新斷言 MT 路由 +
-    # 重新套用 CU DNAT 規則，最多重試 5 次（每次間隔 15 秒）。目的是讓
-    # run_local_pc2.sh 這一次執行就把「MT tunnel 重建導致路由消失」這種瞬時
-    # 不穩定自己修好，不需要每次都靠外部重新整個三主機重啟才會通。
+    # 重新套用 CU DNAT 規則 + UE 自己的預設路由，最多重試 5 次（每次間隔 15
+    # 秒）。目的是讓 run_local_pc2.sh 這一次執行就把「MT tunnel 重建導致路由
+    # 消失」這種瞬時不穩定自己修好，不需要每次都靠外部重新整個三主機重啟才會通。
     local ues=(1 2 3 4)  # UE17 是 Node4 relay 直連，機制跟 access 節點不同，這裡不含
     local ext_dn_ip="192.168.72.135"
     for attempt in 1 2 3 4 5; do
@@ -288,6 +318,10 @@ verify_and_heal_ues() {
         echo -e "   ${YELLOW}[HEAL] 第 ${attempt} 次檢查發現連通性異常，重新斷言路由/DNAT 規則後等待重試...${NC}"
         reassert_mt_routes
         reapply_dnat_rules
+        fix_ue_default_routes "${ues[@]}"
+        if [ "$attempt" -ge 3 ]; then
+            heal_ra_exhaustion_local
+        fi
         sleep 15
     done
     echo -e "   ${RED}[HEAL] 重試 5 次後仍有 UE 連不通，需要人工檢查${NC}"
@@ -353,6 +387,12 @@ for i in 1 2 3 4 17; do
 done
 
 reapply_dnat_rules
+
+# UE17 不在 verify_and_heal_ues() 的 ping 重試範圍內（機制跟 access 節點不同，
+# 見上方註解），但一樣會遇到「預設路由消失」這個 UE 端通用問題（見
+# HISTORY.md 2026-09-18 條目），這裡單獨補一次，不影響 verify_and_heal_ues()
+# 既有的範疇設計。
+fix_ue_default_routes 17
 
 echo -e "\n${CYAN}[6/6] 驗證 + 自我修復 UE1~4 連通性...${NC}"
 verify_and_heal_ues

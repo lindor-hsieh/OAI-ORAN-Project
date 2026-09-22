@@ -1,18 +1,24 @@
 """
 drl_agent.py — DRL Actor-Critic Agent for Local PRB Allocation
 
-架構（2026-07-09 起：MLP → GRU）：
-  - Actor Network : GRU + MLP head + Masked Softmax → PRB 分配比例
-  - Critic Network: GRU + MLP head → 狀態價值估計 V(s)
-  - 演算法        : 離線 Advantage Actor-Critic (A2C)，序列化版本
-                    從 MongoDB 讀取「時間連續的經驗序列」進行批次更新
-
-  為什麼從純 MLP 改成 GRU：原本的 state 是無記憶的單步快照，即使加了
-  dl_buffer_info（見下方），也只看得到「當下」，看不出趨勢（例如某個 UE 的
-  buffer 是在成長還是萎縮）。GRU 讓 policy 自己學會維護記憶，不需要手動設計
-  delta 特徵或疊幀。推論時 Actor 的隱藏狀態跨 ZMQ 呼叫持久化（見
-  DRLAgent._actor_hidden／reset_hidden()）；訓練時每個序列一律從零初始化的
-  隱藏狀態開始（見 train_on_batch()）。詳見 DRL_DESIGN.md。
+架構（2026-09-18 起：MODEL_ARCH 開關，MLP／GRU 並存）：
+  - `MODEL_ARCH` 環境變數（"mlp" | "gru"，預設 "mlp"）決定 Actor/Critic 用哪一組
+    網路，比照 reward_calculator.py 的 REWARD_MODE 既有模式，切換時不需要改程式碼。
+  - **為什麼加這個開關**：CLAUDE.md 五階段路線圖的「最基礎 DRL」（Stage 2~4）原意
+    是不含 GRU 的陽春模型，但 2026-07-09 曾經把 Actor/Critic 從 MLP 全面改成 GRU，
+    兩個月後才補上的路線圖文字沒有把這件事考慮進去，導致 Stage 2/3 已完成的結果
+    其實是用錯誤架構跑的。2026-09-18 討論後決定：GRU 不整個拔掉（未來改良版或其他
+    研究仍可能用到，重寫成本高），改成跟 REWARD_MODE 一樣的環境變數開關，兩套架構
+    並存，Stage 2~4 預設 `MODEL_ARCH=mlp`。
+  - `MODEL_ARCH=mlp`：ActorNetworkMLP/CriticNetworkMLP，無記憶、單步 state 快照，
+    訓練用 i.i.d. 隨機抽樣的獨立經驗（見 training_pipeline.py 的 fetch_experiences()）。
+  - `MODEL_ARCH=gru`（2026-07-09 導入，原因見下）：ActorNetworkGRU/CriticNetworkGRU +
+    MLP head，序列化版本，從 MongoDB 讀取「時間連續的經驗序列」進行批次更新。
+    原始的 state 是無記憶的單步快照，即使加了 dl_buffer_info（見下方），也只看得到
+    「當下」，看不出趨勢（例如某個 UE 的 buffer 是在成長還是萎縮）。GRU 讓 policy
+    自己學會維護記憶，不需要手動設計 delta 特徵或疊幀。推論時 Actor 的隱藏狀態跨
+    ZMQ 呼叫持久化（見 DRLAgent._actor_hidden／reset_hidden()）；訓練時每個序列
+    一律從零初始化的隱藏狀態開始（見 train_on_batch_gru()）。詳見 DRL_DESIGN.md。
 
 State Space (固定長度向量，不足補零)：
   [norm_bsr_0, norm_cqi_0, norm_buf_0, norm_bsr_1, norm_cqi_1, norm_buf_1, ..., active_ratio, fairness_bias]
@@ -38,9 +44,12 @@ Action Space：
   非活躍 UE slot 的比例透過 mask 強制為 0。
 
 訓練方式：
-  InferenceServer 的背景執行緒每 TRAIN_INTERVAL_S 秒呼叫 train_on_batch()，
-  從 MongoDB 取得「時間連續的經驗序列」（training_pipeline.py 的
-  fetch_sequences()）進行梯度更新，不再是打散的獨立經驗。
+  InferenceServer 的背景執行緒每 TRAIN_INTERVAL_S 秒呼叫 train_on_batch()。
+  MODEL_ARCH=mlp 時從 MongoDB 取得「打散的獨立經驗」（training_pipeline.py 的
+  fetch_experiences()）做 i.i.d. mini-batch 更新；MODEL_ARCH=gru 時取得「時間
+  連續的經驗序列」（fetch_sequences()）做序列化更新。train_on_batch()／
+  evaluate_on_batch() 是依 self.arch 分派的公開介面，呼叫端（training_pipeline.py／
+  inference_server.py／client_app.py）不需要知道底層是哪個分支。
 """
 
 from __future__ import annotations
@@ -58,6 +67,18 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from reward_calculator import JFI_MIN, REWARD_MODE
+
+# =============================================================================
+# 架構開關
+# =============================================================================
+
+# "mlp"（預設，Stage 2~4「最基礎 DRL」用）｜"gru"（保留給未來改良版/其他研究，
+# 見上方模組 docstring 的決策說明）。比照 reward_calculator.py 的 REWARD_MODE
+# 讀取方式，docker-compose-iab-server.yaml 對應加上
+# `MODEL_ARCH: "${MODEL_ARCH:-mlp}"`。
+MODEL_ARCH: str = os.environ.get("MODEL_ARCH", "mlp").strip().lower()
+if MODEL_ARCH not in ("mlp", "gru"):
+    raise ValueError(f"未知的 MODEL_ARCH={MODEL_ARCH!r}，必須是 'mlp' 或 'gru'")
 
 # =============================================================================
 # 超參數
@@ -84,20 +105,24 @@ LR_ACTOR: float = 1e-4
 LR_CRITIC: float = 3e-4
 HIDDEN_DIM: int = 128
 MIN_TRAIN_EXPERIENCES: int = 200         # 觸發第一次訓練所需的最少「原始經驗」數
-                                         # （在序列切窗之前的門檻，training_pipeline.py 用）
+                                         # （MLP：i.i.d. 抽樣的門檻本身；GRU：序列
+                                         # 切窗之前的門檻，training_pipeline.py 用）
 
-# 序列化訓練參數（2026-07-09 取代舊版 TRAIN_BATCH_SIZE，GRU 需要時間連續的
+# MLP（MODEL_ARCH=mlp）訓練參數：打散抽樣獨立經驗，不要求時間連續性。
+TRAIN_BATCH_SIZE: int = 128      # 每次梯度更新的 mini-batch 大小（i.i.d. 抽樣）
+
+# 序列化訓練參數（僅 MODEL_ARCH=gru 使用，2026-07-09 導入，GRU 需要時間連續的
 # 序列而不是打散的獨立經驗，見 training_pipeline.py 的 fetch_sequences()）：
 TRAIN_SEQ_LEN: int = 32          # 每個訓練序列的步數，~3.2 秒涵蓋範圍（100ms cadence）
                                   # 遠小於一個流量相位的典型長度（~600 步，見
                                   # traffic_scenario.py 預設 phase_duration=60s），
                                   # 確保序列不會跨越相位邊界內部
 TRAIN_SEQ_COUNT: int = 16        # 每次梯度更新用幾個序列（16×32=512 筆原始經驗）
-                                  # 刻意比舊版 TRAIN_BATCH_SIZE=128 大：序列內部樣本
-                                  # 時間相關（不像舊版打散抽樣是獨立的），需要更多
+                                  # 刻意比 TRAIN_BATCH_SIZE=128 大：序列內部樣本
+                                  # 時間相關（不像 i.i.d. 打散抽樣是獨立的），需要更多
                                   # 原始經驗才能得到同樣品質的梯度估計，這是
                                   # BPTT-based RL 的標準做法
-MIN_TRAIN_SEQUENCES: int = TRAIN_SEQ_COUNT   # 訓練門檻：候選序列池至少要有一個 batch 的量
+MIN_TRAIN_SEQUENCES: int = TRAIN_SEQ_COUNT   # 訓練門檻（GRU only）：候選序列池至少要有一個 batch 的量
 
 # Entropy 正則化係數：entropy_coeff = max(ENTROPY_COEFF_MIN, ENTROPY_COEFF_INIT × ENTROPY_DECAY_RATE ^ step)
 # 修正記錄：舊版下限誤寫成跟初始值相同的 0.01，導致 max(0.01, 0.01×0.997^t) 對任何 t>0
@@ -126,10 +151,65 @@ LAMBDA_MAX:  float = 10.0    # 安全上限，避免 JFI 持續低於門檻時 �
 
 
 # =============================================================================
-# 神經網路定義（GRU-based，2026-07-09）
+# 神經網路定義 — MLP（MODEL_ARCH=mlp，2026-09-18 起 Stage 2~4 預設架構）
 # =============================================================================
 
-class ActorNetwork(nn.Module):
+class ActorNetworkMLP(nn.Module):
+    """
+    Policy Network：單步 state → PRB 分配 logits → Masked Softmax。
+
+    無記憶、無隱藏狀態，每次呼叫只看當下這一筆 state。
+    非活躍 UE slot 在 softmax 前被設為 -∞，確保輸出比例為 0。
+    """
+
+    def __init__(
+        self,
+        state_dim: int = STATE_DIM,
+        max_ues: int = MAX_UE_COUNT,
+    ) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, max_ues),
+        )
+
+    def forward(
+        self,
+        state: torch.Tensor,   # (batch, state_dim)
+        mask: torch.Tensor,    # (batch, max_ues)  True = 活躍 UE
+    ) -> torch.Tensor:
+        """回傳各 UE 的 PRB 分配比例，形狀 (batch, max_ues)。"""
+        logits = self.net(state)                   # (batch, max_ues)
+        logits = logits.masked_fill(~mask, -1e9)    # 遮蔽非活躍 slot
+        return F.softmax(logits, dim=-1)            # (batch, max_ues)
+
+
+class CriticNetworkMLP(nn.Module):
+    """Value Network：單步 state → scalar V(s)。無記憶、無隱藏狀態。"""
+
+    def __init__(self, state_dim: int = STATE_DIM) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """回傳狀態價值估計，形狀 (batch,)。"""
+        return self.net(state).squeeze(-1)
+
+
+# =============================================================================
+# 神經網路定義 — GRU（MODEL_ARCH=gru，2026-07-09 導入，保留供未來切換）
+# =============================================================================
+
+class ActorNetworkGRU(nn.Module):
     """
     Policy Network：state 序列 → GRU 隱藏狀態 → PRB 分配 logits → Masked Softmax。
 
@@ -163,13 +243,13 @@ class ActorNetwork(nn.Module):
         return probs, new_hidden
 
 
-class CriticNetwork(nn.Module):
+class CriticNetworkGRU(nn.Module):
     """
     Value Network：state 序列 → GRU 隱藏狀態 → V(s)。
 
-    只在訓練時使用（train_on_batch()/evaluate_on_batch()），每個序列一律從
-    零初始化的隱藏狀態開始。跟 ActorNetwork 不同，Critic 不需要跨 infer()
-    呼叫持久化隱藏狀態——infer() 從不呼叫 Critic。
+    只在訓練時使用（train_on_batch_gru()/evaluate_on_batch_gru()），每個序列
+    一律從零初始化的隱藏狀態開始。跟 ActorNetworkGRU 不同，Critic 不需要跨
+    infer() 呼叫持久化隱藏狀態——infer() 從不呼叫 Critic。
     """
 
     def __init__(self, state_dim: int = STATE_DIM) -> None:
@@ -198,19 +278,24 @@ class CriticNetwork(nn.Module):
 
 class DRLAgent:
     """
-    PRB 分配的 Actor-Critic DRL Agent（GRU-based，序列化 Offline A2C）。
+    PRB 分配的 Actor-Critic DRL Agent。架構由 MODEL_ARCH 決定（見上方模組
+    docstring）：self.arch == "mlp" 或 "gru"，兩者的 infer()/train_on_batch()/
+    evaluate_on_batch() 對外簽章一致，呼叫端（training_pipeline.py／
+    inference_server.py／client_app.py）不需要 if-branch。
 
     典型使用流程：
         agent = DRLAgent(node_id=1)
-        agent.load()                     # 嘗試載入預存權重
+        agent.load()                     # 嘗試載入預存權重（arch 不符會拒絕載入）
 
-        # 每 ~100ms 推論一次（由 InferenceServer 呼叫），Actor 隱藏狀態
-        # 跨呼叫持久化
+        # 每 ~100ms 推論一次（由 InferenceServer 呼叫）。arch=="gru" 時 Actor
+        # 隱藏狀態跨呼叫持久化；arch=="mlp" 時無隱藏狀態，每次獨立。
         allocations = agent.infer(ues, fairness_bias)
 
-        # 每 TRAIN_INTERVAL_S 秒訓練一次（由背景執行緒呼叫），用時間連續的
-        # 經驗序列，訓練時隱藏狀態一律歸零重新開始
-        metrics = agent.train_on_batch(sequences)
+        # 每 TRAIN_INTERVAL_S 秒訓練一次（由背景執行緒呼叫）。arch=="mlp" 時
+        # 傳入打散的獨立經驗 list[dict]；arch=="gru" 時傳入時間連續的經驗
+        # 序列 list[list[dict]]（training_pipeline.py 依 agent.arch 決定要
+        # fetch 哪一種）。
+        metrics = agent.train_on_batch(experiences_or_sequences)
         agent.save()
     """
 
@@ -228,9 +313,14 @@ class DRLAgent:
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         )
+        self.arch = MODEL_ARCH
 
-        self.actor = ActorNetwork().to(self.device)
-        self.critic = CriticNetwork().to(self.device)
+        if self.arch == "gru":
+            self.actor = ActorNetworkGRU().to(self.device)
+            self.critic = CriticNetworkGRU().to(self.device)
+        else:
+            self.actor = ActorNetworkMLP().to(self.device)
+            self.critic = CriticNetworkMLP().to(self.device)
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
 
@@ -254,9 +344,10 @@ class DRLAgent:
 
     def reset_hidden(self) -> None:
         """
-        重置推論時 Actor 的隱藏狀態。
+        重置推論時 Actor 的隱藏狀態。arch=="mlp" 時本來就沒有隱藏狀態，呼叫
+        此函式是 no-op（呼叫端不需要依 arch 分支，直接呼叫即可）。
 
-        呼叫時機（見 DRL_DESIGN.md 完整說明）：
+        arch=="gru" 時的呼叫時機（見 DRL_DESIGN.md 完整說明）：
           - 真正的 UE 斷線（ues 變空），不是流量閒置——流量閒置的緩降/持平/
             恢復軌跡正是要 GRU 捕捉的訊號，不應該被重置抹掉
           - load() 內部（換權重後，舊隱藏狀態是用舊網路產生的，對新網路是
@@ -329,13 +420,17 @@ class DRLAgent:
         state_vec: np.ndarray,
         mask_vec: np.ndarray,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """將 numpy 向量轉換為 (batch=1, seq_len=1, *) 的 tensor，供 infer() 單步推論用。"""
-        state_t = torch.tensor(
-            state_vec, dtype=torch.float32, device=self.device
-        ).unsqueeze(0).unsqueeze(0)    # (1, 1, state_dim)
-        mask_t = torch.tensor(
-            mask_vec, dtype=torch.bool, device=self.device
-        ).unsqueeze(0).unsqueeze(0)    # (1, 1, max_ues)
+        """
+        將 numpy 向量轉換為 tensor，供 infer() 單步推論用。
+
+        arch=="gru" 時多包一層 seq_len 維度 (1, 1, *)；arch=="mlp" 時是單純
+        的 (1, *) flat batch。
+        """
+        state_t = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        mask_t = torch.tensor(mask_vec, dtype=torch.bool, device=self.device).unsqueeze(0)
+        if self.arch == "gru":
+            state_t = state_t.unsqueeze(1)   # (1, 1, state_dim)
+            mask_t = mask_t.unsqueeze(1)     # (1, 1, max_ues)
         return state_t, mask_t
 
     # -------------------------------------------------------------------------
@@ -367,9 +462,12 @@ class DRLAgent:
 
         self.actor.eval()
         with torch.no_grad():
-            probs_seq, new_hidden = self.actor(state_t, mask_t, self._actor_hidden)
-            self._actor_hidden = new_hidden.detach()   # 跨呼叫持久化，見 reset_hidden()
-            probs = probs_seq[0, 0]                    # 攤平回 (MAX_UE_COUNT,)，下方邏輯不變
+            if self.arch == "gru":
+                probs_seq, new_hidden = self.actor(state_t, mask_t, self._actor_hidden)
+                self._actor_hidden = new_hidden.detach()   # 跨呼叫持久化，見 reset_hidden()
+                probs = probs_seq[0, 0]                    # 攤平回 (MAX_UE_COUNT,)
+            else:
+                probs = self.actor(state_t, mask_t)[0]      # (MAX_UE_COUNT,)，無隱藏狀態
 
             # Dirichlet 隨機策略：從 Dirichlet(α = probs[:n] × K) 採樣
             # 確保 action_ratios ≠ actor probs，訓練時 log π(a|s) 梯度有效
@@ -415,7 +513,229 @@ class DRLAgent:
         return allocations, action_ratios
 
     # -------------------------------------------------------------------------
-    # 離線訓練（序列化版本）
+    # 離線訓練 — 公開介面（依 self.arch 分派給 MLP 或 GRU 分支）
+    # -------------------------------------------------------------------------
+
+    def train_on_batch(self, data) -> dict:
+        """
+        依 self.arch 分派：
+          - arch=="mlp"：data 是打散的獨立經驗 list[dict]（見 train_on_batch_mlp()）
+          - arch=="gru"：data 是時間連續的經驗序列 list[list[dict]]（見 train_on_batch_gru()）
+        呼叫端（training_pipeline.py）依 agent.arch 準備對應形狀的資料，這裡只負責分派。
+        """
+        if self.arch == "gru":
+            return self.train_on_batch_gru(data)
+        return self.train_on_batch_mlp(data)
+
+    def evaluate_on_batch(self, data) -> dict:
+        """依 self.arch 分派，資料形狀規則同 train_on_batch()。"""
+        if self.arch == "gru":
+            return self.evaluate_on_batch_gru(data)
+        return self.evaluate_on_batch_mlp(data)
+
+    # -------------------------------------------------------------------------
+    # 離線訓練 — MLP 分支（打散抽樣獨立經驗，i.i.d.）
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _filter_valid_experiences(experiences: list[dict]) -> list[dict]:
+        """
+        防禦性過濾：排除 state_vec/next_state_vec 維度不對的殘留舊資料（例如
+        STATE_DIM 曾經變更過，或切換 MODEL_ARCH 前沒清乾淨 MongoDB，混進
+        np.array() 建構會直接拋 inhomogeneous shape 例外炸掉整個訓練執行緒）。
+        """
+        return [
+            e for e in experiences
+            if len(e.get("state_vec", [])) == STATE_DIM
+            and len(e.get("next_state_vec", [])) == STATE_DIM
+        ]
+
+    def _build_experience_tensors(
+        self, batch: list[dict]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """把打散的獨立經驗批次組成 flat tensor，(batch, *) 無 seq_len 維度。"""
+        states = torch.tensor(
+            np.array([e["state_vec"] for e in batch], dtype=np.float32), device=self.device)
+        masks = torch.tensor(
+            np.array([e["mask_vec"] for e in batch], dtype=bool), device=self.device)
+        actions = torch.tensor(
+            np.array([e["action_ratios"] for e in batch], dtype=np.float32), device=self.device)
+        rewards = torch.tensor(
+            np.array([e["reward"] for e in batch], dtype=np.float32), device=self.device)
+        next_states = torch.tensor(
+            np.array([e["next_state_vec"] for e in batch], dtype=np.float32), device=self.device)
+        next_masks = torch.tensor(
+            np.array([e["next_mask_vec"] for e in batch], dtype=bool), device=self.device)
+        return states, masks, actions, rewards, next_states, next_masks
+
+    def _dirichlet_log_probs_and_entropy_flat(
+        self,
+        probs: torch.Tensor,     # (batch, MAX_UE_COUNT)
+        masks: torch.Tensor,     # (batch, MAX_UE_COUNT)
+        actions: torch.Tensor,   # (batch, MAX_UE_COUNT)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """對每個樣本分別計算 Dirichlet log π(a|s) 與 entropy（無序列維度）。"""
+        log_probs_list: list[torch.Tensor] = []
+        entropy_list: list[torch.Tensor] = []
+        for i in range(probs.shape[0]):
+            n_i = int(masks[i].sum().item())
+            if n_i == 0:
+                log_probs_list.append(torch.tensor(0.0, device=self.device))
+                entropy_list.append(torch.tensor(0.0, device=self.device))
+                continue
+
+            alpha_i = torch.clamp(probs[i, :n_i] * self._current_concentration(), min=1e-3)
+            dist_i = torch.distributions.Dirichlet(alpha_i)
+
+            a_i = actions[i, :n_i]
+            a_sum = a_i.sum()
+            if a_sum < 1e-8:
+                log_probs_list.append(torch.tensor(0.0, device=self.device))
+                entropy_list.append(dist_i.entropy())
+                continue
+            a_i = torch.clamp(a_i / a_sum, min=1e-6)
+            a_i = a_i / a_i.sum()
+
+            log_probs_list.append(dist_i.log_prob(a_i))
+            entropy_list.append(dist_i.entropy())
+
+        return torch.stack(log_probs_list), torch.stack(entropy_list)
+
+    def train_on_batch_mlp(self, experiences: list[dict]) -> dict:
+        """
+        從 MongoDB 取得的打散獨立經驗批次進行 Actor-Critic 離線更新（i.i.d.，
+        無時間連續性要求）。
+
+        Experience document schema：同 train_on_batch_gru()，唯獨這裡的
+        experiences 是攤平的 list[dict]，不是 list[list[dict]]。
+
+        Returns:
+            metrics : dict with training statistics
+        """
+        experiences = self._filter_valid_experiences(experiences)
+        if len(experiences) < TRAIN_BATCH_SIZE:
+            self._log.info(
+                "經驗數量不足 (有 %d 筆，需 %d 筆)，跳過訓練",
+                len(experiences), TRAIN_BATCH_SIZE,
+            )
+            return {}
+
+        idxs = np.random.choice(len(experiences), TRAIN_BATCH_SIZE, replace=False)
+        batch = [experiences[i] for i in idxs]
+
+        # ── Lagrangian 乘子 λ 更新（同 GRU 分支邏輯，見 train_on_batch_gru()）──
+        jfi_vals = [
+            e["jfi_raw"] for e in batch
+            if e.get("jfi_raw") is not None and e.get("r_throughput", 0.0) > 1e-9
+        ]
+        batch_jfi_mean: Optional[float] = None
+        if jfi_vals:
+            batch_jfi_mean = float(np.mean(jfi_vals))
+            if REWARD_MODE != "throughput_only":
+                self._lambda = max(0.0, min(
+                    LAMBDA_MAX,
+                    self._lambda + LAMBDA_LR * (JFI_MIN - batch_jfi_mean),
+                ))
+
+        states, masks, actions, rewards, next_states, next_masks = self._build_experience_tensors(batch)
+
+        # ── Critic 更新 (最小化 TD 誤差) ──────────────────────────────────
+        self.critic.train()
+        current_values = self.critic(states)
+        with torch.no_grad():
+            next_values = self.critic(next_states)
+            targets = rewards + GAMMA * next_values
+            advantages = (targets - current_values).detach()
+            if advantages.std() > 1e-8:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        critic_loss = F.mse_loss(current_values, targets)
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.critic_opt.step()
+
+        # ── Actor 更新 (Dirichlet Policy Gradient) ────────────────────────
+        self.actor.train()
+        probs = self.actor(states, masks)
+        log_probs_t, entropy_t = self._dirichlet_log_probs_and_entropy_flat(probs, masks, actions)
+
+        actor_loss = -(advantages * log_probs_t).mean()
+        entropy_coeff = max(
+            ENTROPY_COEFF_MIN, ENTROPY_COEFF_INIT * (ENTROPY_DECAY_RATE ** self._train_steps)
+        )
+        current_entropy = float(entropy_t.mean())
+        if current_entropy < -5.0:
+            entropy_coeff = max(entropy_coeff, 0.1 * abs(current_entropy) / 5.0)
+
+        actor_loss = actor_loss - entropy_coeff * entropy_t.mean()
+
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        self.actor_opt.step()
+
+        self._train_steps += 1
+        self._is_trained = True
+
+        metrics = {
+            "train_step":  self._train_steps,
+            "actor_loss":  float(actor_loss.item()),
+            "critic_loss": float(critic_loss.item()),
+            "entropy":     float(entropy_t.mean().item()),
+            "mean_reward": float(rewards.mean().item()),
+            "mean_adv":    float(advantages.mean().item()),
+            "lambda":      self._lambda,
+            "batch_jfi_mean": batch_jfi_mean,
+            "n_experiences": len(batch),
+        }
+        self._log.info(
+            "[訓練][MLP] step=%d actor_loss=%.4f critic_loss=%.4f "
+            "entropy=%.4f mean_reward=%.4f lambda=%.4f batch_jfi=%s n=%d",
+            self._train_steps,
+            metrics["actor_loss"], metrics["critic_loss"], metrics["entropy"],
+            metrics["mean_reward"], self._lambda,
+            f"{batch_jfi_mean:.4f}" if batch_jfi_mean is not None else "N/A",
+            len(batch),
+        )
+        return metrics
+
+    def evaluate_on_batch_mlp(self, experiences: list[dict]) -> dict:
+        """在測試集（打散經驗）上計算 loss，不更新梯度。回傳同 evaluate_on_batch_gru()。"""
+        experiences = self._filter_valid_experiences(experiences)
+        if len(experiences) < TRAIN_BATCH_SIZE:
+            return {}
+
+        idxs = np.random.choice(len(experiences), TRAIN_BATCH_SIZE, replace=False)
+        batch = [experiences[i] for i in idxs]
+        states, masks, actions, rewards, next_states, _ = self._build_experience_tensors(batch)
+
+        self.actor.eval()
+        self.critic.eval()
+        with torch.no_grad():
+            current_values = self.critic(states)
+            next_values = self.critic(next_states)
+            targets = rewards + GAMMA * next_values
+            advantages = targets - current_values
+            if advantages.std() > 1e-8:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            test_critic_loss = F.mse_loss(current_values, targets)
+
+            probs = self.actor(states, masks)
+            log_probs_t, entropy_t = self._dirichlet_log_probs_and_entropy_flat(probs, masks, actions)
+            test_actor_loss = -(advantages * log_probs_t).mean()
+
+        return {
+            "test_actor_loss":  float(test_actor_loss.item()),
+            "test_critic_loss": float(test_critic_loss.item()),
+            "test_entropy":     float(entropy_t.mean().item()),
+            "test_mean_reward": float(rewards.mean().item()),
+        }
+
+    # -------------------------------------------------------------------------
+    # 離線訓練 — GRU 分支（序列化，2026-07-09 導入，保留供未來切換）
     # -------------------------------------------------------------------------
 
     @staticmethod
@@ -521,7 +841,7 @@ class DRLAgent:
 
         return torch.stack(log_probs_list), torch.stack(entropy_list)
 
-    def train_on_batch(self, sequences: list[list[dict]]) -> dict:
+    def train_on_batch_gru(self, sequences: list[list[dict]]) -> dict:
         """
         從 MongoDB 取得的「時間連續經驗序列」進行 Actor-Critic 離線更新。
 
@@ -650,7 +970,7 @@ class DRLAgent:
             "seq_len": seq_len,
         }
         self._log.info(
-            "[訓練] step=%d actor_loss=%.4f critic_loss=%.4f "
+            "[訓練][GRU] step=%d actor_loss=%.4f critic_loss=%.4f "
             "entropy=%.4f mean_reward=%.4f lambda=%.4f batch_jfi=%s "
             "n_seq=%d seq_len=%d",
             self._train_steps,
@@ -664,7 +984,7 @@ class DRLAgent:
         )
         return metrics
 
-    def evaluate_on_batch(self, sequences: list[list[dict]]) -> dict:
+    def evaluate_on_batch_gru(self, sequences: list[list[dict]]) -> dict:
         """
         在測試集（序列）上計算 loss，不更新梯度（用於偵測 overfitting）。
 
@@ -737,6 +1057,7 @@ class DRLAgent:
         tmp_path = path.with_suffix(f".pt.tmp.{os.getpid()}")
         torch.save(
             {
+                "arch":        self.arch,
                 "actor":       self.actor.state_dict(),
                 "critic":      self.critic.state_dict(),
                 "actor_opt":   self.actor_opt.state_dict(),
@@ -747,7 +1068,7 @@ class DRLAgent:
             tmp_path,
         )
         os.replace(tmp_path, path)
-        self._log.info("模型已儲存至 %s (訓練步數: %d)", path, self._train_steps)
+        self._log.info("模型已儲存至 %s (arch=%s, 訓練步數: %d)", path, self.arch, self._train_steps)
 
     def load(self) -> bool:
         """
@@ -757,8 +1078,14 @@ class DRLAgent:
         對新載入的權重是未曾訓練過要處理的輸入，不重置會讓推論吃到一個
         語意不明的隱藏狀態。
 
+        arch 不符時明確拒絕載入（而不是讓 load_state_dict() 在 key 不匹配時
+        丟泛用例外）：MLP／GRU 的 state_dict key 不相容，切換 MODEL_ARCH 後
+        應該清空 checkpoint 重新開始，若沒清乾淨，這裡會攔下來、印警告、
+        維持隨機初始化，不會讓程式帶著錯誤架構的殘留權重跑。
+
         Returns:
-            True 表示成功載入，False 表示找不到檔案或載入失敗（從隨機初始化開始）。
+            True 表示成功載入，False 表示找不到檔案、架構不符、或載入失敗
+            （從隨機初始化開始）。
         """
         path = self.model_dir / f"model_node{self.node_id}.pt"
         if not path.exists():
@@ -766,6 +1093,14 @@ class DRLAgent:
             return False
         try:
             ckpt = torch.load(path, map_location=self.device)
+            ckpt_arch = ckpt.get("arch", "gru")   # 舊版（MODEL_ARCH 開關上線前）一律是 GRU
+            if ckpt_arch != self.arch:
+                self._log.warning(
+                    "checkpoint 架構 (%s) 與目前 MODEL_ARCH (%s) 不符，拒絕載入、"
+                    "從隨機初始化開始——切換 MODEL_ARCH 前應先清空 checkpoint",
+                    ckpt_arch, self.arch,
+                )
+                return False
             self.actor.load_state_dict(ckpt["actor"])
             self.critic.load_state_dict(ckpt["critic"])
             self.actor_opt.load_state_dict(ckpt["actor_opt"])
@@ -776,8 +1111,8 @@ class DRLAgent:
             self._lambda = ckpt.get("lambda", LAMBDA_INIT)
             self.reset_hidden()
             self._log.info(
-                "模型已從 %s 載入 (訓練步數: %d, lambda=%.4f)",
-                path, self._train_steps, self._lambda,
+                "模型已從 %s 載入 (arch=%s, 訓練步數: %d, lambda=%.4f)",
+                path, self.arch, self._train_steps, self._lambda,
             )
             return True
         except Exception as exc:

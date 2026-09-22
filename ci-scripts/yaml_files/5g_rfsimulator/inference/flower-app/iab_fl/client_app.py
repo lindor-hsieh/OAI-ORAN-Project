@@ -38,7 +38,7 @@ from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict  # 
 from flwr.clientapp import ClientApp  # noqa: E402
 
 from drl_agent import DRLAgent  # noqa: E402
-from training_pipeline import fetch_sequences, run_training_round  # noqa: E402
+from training_pipeline import fetch_experiences, fetch_sequences, run_training_round  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,10 +51,11 @@ NODE_ID: int = int(os.environ["NODE_ID"])
 MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB: str = os.getenv("MONGO_DB", "iab_xapp")
 MODEL_DIR: str = os.getenv("MODEL_DIR", "/app/models")
-# 序列化評估（GRU）比舊版打散抽樣需要多得多的原始經驗才能湊到
+# MODEL_ARCH=gru 的序列化評估比打散抽樣需要多得多的原始經驗才能湊到
 # evaluate_on_batch() 要求的 TRAIN_SEQ_COUNT 個序列（見 drl_agent.py），
 # 200 筆對序列窗口（stride=TRAIN_SEQ_LEN）來說太小，改對齊
-# training_pipeline.TRAIN_FETCH_LIMIT 的量級。
+# training_pipeline.TRAIN_FETCH_LIMIT 的量級——MODEL_ARCH=mlp 沿用同一個
+# 上限沒有壞處（只是多抓一點資料，i.i.d. 抽樣本來就不嫌資料多）。
 EVAL_FETCH_LIMIT: int = 2000
 
 app = ClientApp()
@@ -117,7 +118,9 @@ def train(msg: Message, context: Context) -> Message:
             agent.save()
         except Exception as exc:
             log.warning("儲存本地微調後權重失敗: %s", exc)
-        num_examples = metrics.get("n_train_seq", 0)
+        # 欄位名稱依 agent.arch 而異（mlp: n_train_exp；gru: n_train_seq），見
+        # drl_agent.py／training_pipeline.py 的說明。
+        num_examples = metrics.get("n_train_exp", metrics.get("n_train_seq", 0))
     else:
         num_examples = 0
 
@@ -150,14 +153,17 @@ def evaluate(msg: Message, context: Context) -> Message:
     eval_metrics: dict = {}
     if mongo_col is not None:
         try:
-            # 改用共用的 fetch_sequences()，不自己維護一份查詢/切窗邏輯——
-            # GRU 需要時間連續的序列，不是打散抽樣的獨立經驗，跟
-            # training_pipeline.run_training_round() 用的是同一套規則。
-            sequences, _ = fetch_sequences(mongo_col, fetch_limit=EVAL_FETCH_LIMIT, log=log)
-            if sequences:
-                eval_metrics = agent.evaluate_on_batch(sequences)
+            # 改用共用的 fetch_experiences()/fetch_sequences()，不自己維護一份
+            # 查詢/切窗邏輯——跟 training_pipeline.run_training_round() 用的是
+            # 同一套規則，依 agent.arch 決定要打散抽樣還是抓時間連續序列。
+            if agent.arch == "gru":
+                data, _ = fetch_sequences(mongo_col, fetch_limit=EVAL_FETCH_LIMIT, log=log)
+            else:
+                data = fetch_experiences(mongo_col, fetch_limit=EVAL_FETCH_LIMIT, log=log)
+            if data:
+                eval_metrics = agent.evaluate_on_batch(data)
                 if eval_metrics:
-                    num_examples = len(sequences)
+                    num_examples = len(data)
         except Exception as exc:
             log.warning("評估失敗: %s", exc)
 

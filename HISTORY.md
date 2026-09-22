@@ -493,3 +493,198 @@ Stage 2 要求切換 `REWARD_MODE` 前必須清空模型 checkpoint。第一次�
 ### Stage 2（avgFL.md）舊數據作廢，重測結果
 
 修完 root cause 1（`REWARD_MODE` 缺口）後，判定舊版 `avgFL.md` 的數據混入 lagrangian 污染，不能視為乾淨的 `throughput_only` 基準，決定重測。修完全部三個 root cause、確認三主機 15 分鐘全程零崩潰、量測前 17/17 UE 現場 ping 0% 封包遺失後，Stage 2、Stage 3 依序重新量測，結果與方法論限制見 `experiment_results/avgFL.md`、`experiment_results/clusterFL.md` 最新版本；`CLAUDE.md` 第 3 節路線圖表格已同步更新為重測後的數字。
+
+---
+
+## 2026-09-18 — Local DRL 改回 MLP（新增 MODEL_ARCH 開關）＋ Stage 2 收斂訓練前置作業踩坑
+
+### 架構問題：「最基礎 DRL」其實一直是 GRU
+
+查證 git 歷史發現：Local DRL 的 Actor/Critic 在 2026-07-09 從 MLP 改成 GRU（`DRL_METHODOLOGY_PLAN.md` §2.3 記錄的三個「已完成改動」之一），但 CLAUDE.md 五階段路線圖裡「最基礎 DRL」這個詞是在 GRU 已經完成兩個月後（2026-09-12）才被創造出來，從頭到尾只沿著 `REWARD_MODE` 這條軸定義，從未把架構（MLP vs GRU）納入考慮。也就是說 Stage 2/3 目前為止「已完成」的所有結果，用的都不是路線圖原本設想的陽春架構。
+
+**決定**（跟舊版 MLP→GRU 遷移的做法不同）：不整倒退掉 GRU（未來改良版或其他研究可能還會用到），改成比照 `REWARD_MODE` 的既有模式，在 `inference/drl_agent.py` 加一個 `MODEL_ARCH`（`mlp`｜`gru`，預設 `mlp`）環境變數開關，兩套網路架構（`ActorNetworkMLP`/`CriticNetworkMLP` vs `ActorNetworkGRU`/`CriticNetworkGRU`）並存於同一份程式碼，`training_pipeline.py` 也對應拆成 `fetch_experiences()`（MLP，打散抽樣 i.i.d.，只看 `MIN_TRAIN_EXPERIENCES=200`）與 `fetch_sequences()`（GRU，原有的時間連續序列邏輯不變）。`docker-compose-iab-server.yaml` 全部 12 個 `inference-nodeN`、12 個 `flower-supernode-nodeN`、`flower-superlink` 都加上 `MODEL_ARCH: "${MODEL_ARCH:-mlp}"`。`DRLAgent.save()`/`load()` 的 checkpoint 多存一個 `arch` 欄位，`load()` 讀到 arch 不符會主動拒絕（印警告、退回隨機初始化），不會讓 state_dict key 不匹配的例外處理悄悄吃掉問題。
+
+**意外的好處**：GRU 版本「訓練幾乎永遠觸發不了」的根因（`_is_contiguous()`／`TRAIN_SEQ_LEN`／`TRAIN_SEQ_COUNT` 的嚴格時間連續性門檻）完全是為了餵 GRU 的 BPTT 才加的，MLP 分支不需要這個門檻，訓練觸發難度大幅下降。相關文件（`DRL_DESIGN.md`、`DRL_METHODOLOGY_PLAN.md`、`STAGE3_CLUSTER_FL_DESIGN.md`、`STAGE4_CUSTOM_FL_DESIGN.md`）都已補上對應的 2026-09-18 更新說明。
+
+單節點冒煙測試（MLP 與 GRU 兩個分支都測，含 checkpoint 存讀與 arch 不符時的拒絕載入邏輯）全部通過後才上線部署。
+
+### 為了 Stage 2 收斂訓練，重建 inference image + 完整三主機乾淨重啟，過程中發現三個新的基礎設施問題
+
+改完 `drl_agent.py`/`training_pipeline.py` 後 `docker build -t local-xapp-inference:latest ./inference` 重建映像檔（COPY-based Dockerfile，不是 bind mount），跑 `REWARD_MODE=throughput_only FL_MODE=avg MODEL_ARCH=mlp bash iab/run_stage2_fl.sh` 清空 checkpoint/經驗、重啟 Stage 2 服務。發現 PC1 上「還在跑」的容器其實已經死了 42 小時（CN5G/Donor CU 早就 Exited，只剩 xApp/inference 容器還活著空轉），因此需要完整三主機依序重啟（`start_iab_server.sh` → PC2 → PC3 → `run_local_pc1.sh --skip-server`）。過程中發現：
+
+1. **`start_iab_server.sh` 內部對 `inference-nodeN` 的 plain `docker compose up -d` 呼叫，會在某些情況下觸發 recreate，把 `REWARD_MODE`/`MODEL_ARCH` 悄悄重設回 compose 檔預設值**（`REWARD_MODE` 預設是 `lagrangian`，不是這次要的 `throughput_only`）——因為這個呼叫在 `start_iab_server.sh` 自己的 shell 環境裡沒有帶上這些變數。現場遇到一次，用 `REWARD_MODE=... MODEL_ARCH=... docker compose up -d --force-recreate inference-node{1..12}` 手動修正。**`iab/training_watchdog.sh` 已經把這個修正納入 `full_recovery()`**：呼叫 `start_iab_server.sh` 時主動帶上正確的環境變數，收尾再額外 `--force-recreate` 一次並逐節點驗證 env，不依賴「應該不會被重設」的假設。
+
+2. **三主機各自的 DNAT 重新斷言腳本會互相覆蓋，只有「最後跑」的那台主機的 access 節點資料面正常**：`start_iab_server.sh`（PC1，服務 Node7/8/UE5~8）、`run_local_pc2.sh`（PC2，服務 Node5/6/UE1~4/17）、`run_local_pc3.sh`（PC3，服務 Node9~12/UE9~16）三支腳本收尾都會對共用的 CU 執行 `iptables -t nat -I OUTPUT 1 ...` 插入 DNAT 規則。現場實測：依序跑完三支之後，只有最後一支對應的主機 UE 是通的，前面兩台的 UE 全部 100% packet loss；把其中一台重跑一次，換成那台通、其他兩台斷——精確驗證用 `iptables -t nat -L OUTPUT -n --line-numbers` 檢查發現：同一個目的地 IP（例如 DU7 的 `192.168.76.13`）在 chain 裡累積了好幾筆歷史 `to:` 目標不同的規則（tunnel IP 每次重啟都會變），舊規則沒有被清掉、只是被新規則插在前面蓋過去——但如果某台主機的 DNAT 重新斷言最後沒有真的執行到（例如 MT 容器沒有被重建，`configure_and_start_*_du()` 沒有被呼叫到，見下一點），它的規則就會停留在舊值，被其他主機新插入的規則群「淹沒」在 chain 後段，即使沒被真的覆寫也會因為 UE 自己的 tunnel IP 早就换了而失效。**這不是本文件更早條目修過的「整批 flush」問題**（那個已經改成 insert-only 確認修復），而是「該重新斷言的沒被觸發」+「chain 裡累積大量過期規則」共同造成的新症狀，現場靠手動 `iptables -t nat -I OUTPUT 1 -p udp --dport 2152 -d <DU IP> -j DNAT --to-destination <正確 tunnel IP>` 插入正確規則修復，尚未寫成自動化——**留給下一次遇到時解決，或考慮讓三支腳本的 DNAT 重新斷言改成「先查詢 MT 容器當下真實的 tunnel IP，再無條件插入」而不是依賴 MT/DU 容器有沒有被重建**。
+3. **UE 的 PDU session 有時會在完成攻擊後自發重新建立（tunnel IP 改變），但預設路由沒有跟著重設**：UE5~8 現場診斷發現 `oaitun_ue1` 介面存在、IP 也正常分配，但 `ip route show` 只剩 `12.1.1.0/24 dev oaitun_ue1` 這條 kernel scope 路由，`default via 12.1.1.1 dev oaitun_ue1` 完全不見，導致 `ping: connect: Network is unreachable`（不是封包遺失，是連 route 都沒有）。手動 `ip route replace default via 12.1.1.1 dev oaitun_ue1` 立即修復。懷疑成因：`wait_for_ue`/`wait_for_local_ue` 只在**當時那次**附著成功後設一次預設路由，如果 UE 之後又經歷了一次自發的 PDU session 重建（拿到新 tunnel IP），沒有人會重新設路由——跟 root cause 2 的「tunnel IP 飄移」本質是同一類問題的另一種表現形式，只是這次是在 UE 自己這一側缺路由，不是 CU 側缺 DNAT。
+4. **全部 12 個 `xapp-nodeN` 容器一度整批消失**（`docker ps -a` 完全找不到，不是 Exited 而是不存在）：發生的確切原因未查清（可能跟同一時段多次 `docker compose up -d --force-recreate inference-node{1..12}`、`start_iab_server.sh` 重跑有關，但沒有直接證據指向哪個指令），用 `for node in 1..12; do docker compose up -d node${node}-l-xapp; done` 全部重建後恢復正常（12/12 都能看到 `AI 決策` log）。**這個現象本身值得留意，若未來又發生，先確認是不是又是 root cause 3（cpuset 過度擁擠）的變形，或另一個尚未定位的觸發條件**。
+
+**最終驗證**：三個問題全部手動修復後，17/17 UE 現場 ping 0% 封包遺失（UE17 這次 RTT 700~2100ms、仍然明顯偏高，但沒有像 `PF.md` 那次一樣 100% 全滅——具體是不是因為這次訓練還沒真正開始、Node4 沒有同時承受高負載，待後續 Stage 2 收斂訓練過程觀察），`REWARD_MODE=throughput_only`／`MODEL_ARCH=mlp`／`FL_MODE=avg` 在全部 26 個相關容器上核對一致，12 個 xApp 全部持續產生 `AI 決策` log。
+
+### Stage 2 收斂訓練上線後第一次真實 FlexRIC 崩潰＋自動復原，順便抓到 `training_watchdog.sh` 自己的一個 bug
+
+系統穩定後啟動 `iab/training_scenario_driver.sh`（三主機，共用 epoch）＋ `iab/training_watchdog.sh`（PC1），跑 `iab/calibrate_fl_rate.py` 校準：MLP 版本全網最慢節點實測 0.384 筆/秒，200 筆經驗約 9 分鐘內達標、512 筆約 22 分鐘——遠優於 GRU 時期「57 分鐘一次都沒跨過 200」的紀錄，證實移除序列連續性門檻確實大幅改善了訓練觸發難度。
+
+上線約 3 分鐘後（15:48），`training_watchdog.sh` 第一次真實偵測到崩潰訊號（`flexric` RestartCount 0→1），90 秒二次確認後觸發完整重啟，依序跑完 PC1→PC2→PC3→PC1(xApp) 全部四步、13/13 E2 恢復、12/12 節點環境變數核對正確，全程約 15 分鐘（15:49~16:05），行為完全符合設計。
+
+**但復原後發現 PC3 的場景驅動器沒有真的重新啟動**（`pgrep` 在 PC3 上找不到 `training_scenario_driver.sh`，PC1/PC2 都正常）。根因：`start_scenario_driver()` 用 `ssh host "cmd &"` 的寫法讓遠端 shell 自己把指令丟進背景，但 SSH session 有時會在遠端背景行程真的 fork 完成前就先關閉連線，導致背景行程從未真正啟動、且没有任何錯誤訊息（`ssh` 指令本身仍回傳成功，因為前景部分——也就是把 `cmd &` 丟出去這個動作——確實成功了，只是丟出去的東西沒接住）。這跟本文件更早條目的 root cause 完全不同類，是純粹的 shell/SSH 背景行程语意問題，不是 IAB 系統本身的 bug。
+
+**修復**：改用 `ssh -f host "cmd"`（`-f` 讓 ssh 自己先 fork 到背景、確認 session 建立後才把控制權交還本地端，不依賴遠端 shell 的 `&` 語意，這是業界公認在 SSH 上啟動背景行程的正確做法），並在 `start_scenario_driver()` 收尾加一段主動驗證＋重試（`pgrep` 確認三主機都真的有行程在跑，缺的重打一次）。現場立即验证：改用 `ssh -f` 手動重啟 PC3 的驅動器後一次成功；`training_watchdog.sh` 本體也已修好並重新上線。
+
+**教訓**：`nohup cmd &` 這個組合在本機 shell 裡是可靠的背景手法，但透過 `ssh host "cmd &"` 遠端執行時不能照搬同樣的假設——SSH session 的生命週期跟遠端 shell 幫你背景化的那個子行程是否真的活下來，是兩件不保證同步的事，寫任何跨主機自動化腳本時背景啟動遠端行程都要用 `ssh -f`，且收尾要主動驗證行程真的在跑，不能只看 SSH 指令本身有沒有回傳成功。
+
+### 第二次真實崩潰：Node2 relay DU 的 RA process pool 耗盡，連帶暴露 DNAT 腳本的兩個既有 bug
+
+修好第一次崩潰的復原流程後約 24 分鐘（16:27），`training_watchdog.sh` 第二次真實偵測到崩潰（同樣是 `flexric` RestartCount регресs），但這次 `full_recovery()` 的 PC1 步驟本身失敗了——`start_iab_server.sh` 收尾的 `verify_and_heal_local_ues()` 對 UE5~8 重試 5 次仍連不通，watchdog 依照設計正確地判斷「復原沒有生效」、主動停止（不是無限重試硬撐出一個假的成功）。
+
+**根因（跟本文件之前任何一條都不同類）**：診斷發現 `rfsim5g-iab-du-8` 容器完全不存在（`configure_and_start_local_access_du()` 因為 MT8 的 tunnel IP 在 300 秒逾時內沒出現而被整段跳過，跟舊條目「Node5 tunnel IP 逾時」是同一種症狀，但這次的病根不同）。查 MT8 的 log 發現它卡在 PRACH/RAR 迴圈（`RAR reception failed`）反覆重試但從未附著成功；再查它的 parent relay——`rfsim5g-iab-du-2`（Node2）——的 log，找到真正的根因：`FAILURE: initiating RA procedure for preamble index N: no free RA process`。Node2 的 DU 端 Random Access process pool（OAI 內部一個小容量的固定陣列）被用盡，導致它完全無法再受理任何新的 PRACH，MT8 送出的每一次 Random Access 嘗試都直接被拒絕在最源頭——這不是 DNAT／路由問題，是 RAN protocol stack 本身的資源池耗盡，合理懷疑是這幾個小時內對 MT7/MT8 做了大量次重啟嘗試，每次失敗的 RA 嘗試在 Node2 這端沒有被正確釋放而逐漸洩漏掉可用的 process slot。
+
+**修復**：`docker restart rfsim5g-iab-du-2` 立即清空 RA process pool，MT8 在下一次重啟後 10 秒內就成功附著（對照組：清空前已經卡了快 20 分鐘）。之後重跑一次 `start_iab_server.sh` 才讓 `configure_and_start_local_access_du()` 真正跑到、建出 `rfsim5g-iab-du-8`。
+
+**過程中額外發現、順手修掉的問題**（都是本文件更早條目「root cause 2」修復之後才浮現的殘留問題，不是這次才引入的）：
+1. **手動插入 DNAT 規則時把 Node7/Node8 的內部橋接 IP 搞反了一次**：`192.168.76.12` 其實是 `rfsim5g-iab-mt-7` 自己的位址、`192.168.76.13` 是 `rfsim5g-iab-mt-8` 自己的（不是直覺以為的「.12=Node8、.13=Node7」），第一次手動修復把兩者的 DNAT 目標插反，導致原本只有 Node8 斷線的狀況惡化成 Node7/Node8（UE5~8 全部 4 個）一起斷線；靠重新對照 `docker-compose-iab-server.yaml` 裡 `rfsim5g-iab-mt-7`/`rfsim5g-iab-mt-8` 的 `ipv4_address` 才抓到對調，改用「先查 MT 容器自己當下的 oaitun_ue1 實際 IP，再用變數帶入正確的 DU IP↔MT tunnel IP 配對」，不要用記憶中的數字。**教訓**：這類手動急救指令，永遠先用 `docker exec <container> ip addr show` 查當下真值，不要憑印象或先前 session 的記憶去背數字。
+2. **（訂正）一開始誤判 `start_iab_server.sh` 對 Node7/8 的 DNAT 重新斷言「沒有每次真的重新插入」，事後查程式碼發現這個診斷是錯的**：`configure_and_start_local_access_du()` 每次呼叫都確實用 `docker exec $MT_NAME ip -f inet addr show oaitun_ue1` 現場查詢當下 tunnel IP、插入對應的新規則，沒有快取問題。真正的根因是**時序缺口**：PC1 本機的 UE5~8 健康檢查（`verify_and_heal_local_ues`）只在 `start_iab_server.sh` 自己執行過程中跑一次，時間點在整個三主機依序啟動流程的最前面；重啟 `rfsim5g-iab-du-2`（清 RA process pool）會連帶讓 MT7、MT8 都要重新附著，MT8 有明確重啟、事後有驗證，但 MT7 是在後續 PC2/PC3 花費數分鐘啟動期間**自發性**重新建立 tunnel（CLAUDE.md 已記載 MT tunnel 有時會自發重建的現象）——這段期間 PC1 端完全沒有任何東西在重新檢查/斷言 Node7/8，直到三主機全部跑完後我才做最終 ping 檢查，才發現 Node7 的 DNAT 規則已經跟不上。這是一個真實但不同類的缺口：**不是「重新斷言邏輯寫錯」，而是「PC1 本機節點的健康檢查時機點太早，跟整個復原流程的收尾對不起來，中間有一段沒人看顧的空窗期」**。
+   **修復**：`iab/training_watchdog.sh` 的 `full_recovery()` 在最後一步（xApp 啟動完成之後）新增一次 PC1 本機 UE5~8 的最終重新驗證＋斷言，不再只依賴 `start_iab_server.sh` 內部那次時機過早的檢查。
+
+**另一個復發的舊症狀**：修完 DNAT 後 UE5~8 一度變成 `ping: connect: Network is unreachable`（不是封包遺失），查出來又是本文件稍早記錄過的「UE 的 PDU session 自發重建、預設路由沒跟著重設」，手動 `ip route replace default via 12.1.1.1 dev oaitun_ue1` 補回。這已經是這個症狀第二次獨立出現（第三次出現、確認影響全主機並修進自我修復迴圈，見下方「第五次崩潰」條目）。
+
+全部修復後 17/17 UE 現場 ping 0% 封包遺失，MongoDB 經驗資料在整個約 1 小時的多輪故障排除過程中完全沒有被清空或動過（只有 RAN 層的容器被重啟），`REWARD_MODE=throughput_only`／`MODEL_ARCH=mlp` 在 12 個 `inference-nodeN` 上核對一致，重新啟動三主機場景驅動器（新 epoch）與 `training_watchdog.sh`，訓練繼續進行。
+
+### 待辦：FlexRIC pending event 積累導致的崩潰頻率問題（根因已查明，修復方案待實作）
+
+收斂訓練上線後崩潰頻率明顯偏高（約每 20~30 分鐘一次，watchdog 目前為止已自動處理 4 次，全部成功復原，不需人工介入）。使用者詢問能否讓 FlexRIC 更強健，查證後定案：**這是既有的架構限制，不是這次訓練或 MODEL_ARCH 改動造成的**，先記錄根因與候選修復方案，這次先不動手（使用者決定先靠自動復原把 Stage 2 訓練到收斂，之後再回頭處理）。
+
+**根因**：`openair2/E2AP/flexric/src/ric/near_ric.c::control_service_near_ric()`（約 745~769 行）——xApp 每送出一次 `CONTROL-REQUEST`（也就是 DRL 下發 PRB 分配那個動作），FlexRIC 就會用 `create_timer_ms_asio_ric()` 建立一個新的 **3000ms 逾時計時器**，註冊進 `ric->pending`（一個 `bi_map`，key 是 timer fd）。如果沒有在 3 秒內被相應的 ACK 處理路徑提早取消，計時器到期時會印出 `near_ric.c:485` 的 `[NEAR-RIC]: WARNING: Pending event timeout. Disarming timer.`（這正是 `training_watchdog.sh` 用來偵測崩潰的訊號字串），並清掉該筆 pending 項目。C xApp 端的 rate limiter（`xapp_node*.c`，每 10 個 MAC callback 才觸發一次 ZMQ，約每 100ms 一次）把單一節點的 CONTROL-REQUEST 頻率壓到理論上限約 10 次/秒，12 個節點加總尖峰可達 120 次/秒——這麼高的併發量下，只要有一部分沒能在 3 秒內被確認/取消，就會持續累積，長時間運行後正好對應 CLAUDE.md 已經記載的「長時間運行後 pending event queue 塞滿」症狀。`xapp_node*.c` 的 `apply_fallback()` 函式本身已經對這個問題有防禦（ZMQ 逾時時刻意不送 CONTROL-REQUEST，註解明確寫著「會把 FlexRIC 的 pending event queue 打爆」），代表專案先前就已經注意到 CONTROL-REQUEST 頻率是主要風險來源，但沒有進一步處理過「正常送出、只是恰好塞車」這種情況。
+
+**候選修復方案（未實作，按風險/效果排序）**：
+1. **調鬆 C xApp 的 rate limiter（風險最低、建議優先評估）**：把 12 個 `xapp_node{1..12}.c` 的觸發門檻從「每 10 個 MAC callback」放寬到例如「每 20~30 個」，直接讓 CONTROL-REQUEST 送出頻率打對折到打三分之一，不需要碰 FlexRIC 核心程式碼。代價是 PRB 重新分配的有效週期從 100ms 拉長到 200~300ms，需要重編 12 個 xApp、重新部署（跟一次崩潰復原差不多量級的中斷）。
+2. **深查 FlexRIC 核心的 ACK 取消路徑（風險較高）**：確認收到 `RIC_CONTROL_ACKNOWLEDGE` 時是否真的有呼叫對應的 `stop_pending_event()` 提早取消計時器並釋放 timer fd——如果這條路徑本身有問題（例如沒有正確比對 `ric_id` 導致 ACK 配對不到 pending 項目），那才是真正的洩漏而非單純「量大排隊」，修對了可能徹底解決而不需要犧牲控制週期；但 `near_ric.c` 是全部 12 個 xApp 共用的核心事件迴圈，改動風險與測試成本都高，需要另外撥時間專門驗證。
+3. **維持現狀，只靠 watchdog 自動復原**：目前 watchdog 每次都能在 15~20 分鐘內完全自主復原（含 2026-09-18 新增的 PC1 本機 UE5~8 最終驗證步驟），這個崩潰頻率與自動復原機制本身可以直接寫進論文方法論限制章節，誠實揭露「這是第一次讓系統在持續高負載下連續運行數小時，才觀察到這個既有限制的實際發生頻率」。
+
+**下一步**：先讓 Stage 2 收斂訓練跑完（純靠方案 3 撐著），拿到數據之後再回頭評估要不要實作方案 1 或方案 2——如果 Stage 3 或後續階段也要跑一樣長的收斂訓練，屆時再做這個決定，不要在同一次訓練過程中中途換架構造成資料不連貫。
+
+### 新增 `iab/check_convergence_mongo.py`：Track 1 改用 MongoDB，不再受容器重啟影響
+
+使用者發現一個實際問題並問到重點：`training_watchdog.sh` 每次崩潰復原都會讓 `inference-nodeN` 重新啟動，`check_convergence.py`（舊版）靠 `docker logs` 抓「訓練完成」摘要行來判斷收斂趨勢，容器一重建 log 歷史就砍掉重來——以目前約 20~30 分鐘崩潰一次、`TRAIN_INTERVAL_S=60秒`一輪來算，兩次崩潰之間最多只能累積 20~30 輪，剛好卡在舊版預設 `--window 20` 的門檻邊緣，長期下來幾乎不可能真正累積到足夠輪數判斷收斂。**注意：這只影響「觀察收斂趨勢」的可視性，不影響訓練本身**——`DRLAgent` 的 `train_steps`／權重透過 checkpoint 持久化，MongoDB 經驗資料也完全沒被 `full_recovery()` 動過，模型是持續在訓練進步的，只是舊版工具看不到。
+
+**修復**：新增 `iab/check_convergence_mongo.py`，改讀 MongoDB 裡 `node{N}_experiences` 的原始經驗（`timestamp`／`reward`／`is_idle`），依 `--bucket-minutes`（預設 5）分鐘一組切時間區間算平均 reward，對區間序列做線性回歸算趨勢（跟舊版同一套「視窗內變化量佔平均值比例」演算法），這份資料完全不受容器重啟影響、可以無限期跨越任意次數的崩潰復原持續累積。零風險、純新增查詢腳本，沒有改動任何正在跑的容器或既有程式碼。`iab/training_healthcheck.sh` 的 Section C 已經改成呼叫這支新腳本（`--window-minutes 120 --bucket-minutes 5 --min-buckets 8`），舊版 `check_convergence.py` 保留、仍可手動呼叫，只是不再是健檢腳本的預設。
+
+現場測試：改用 MongoDB 版本後，同一批節點一次就看到 11~13 個有效時間區間（對照舊版同時間點幾乎每個節點都顯示「還沒有任何一輪訓練完成的 log」），證實有效解決容器重啟造成的觀察空窗問題。
+
+### 第五次崩潰：watchdog 正確判斷失敗並停止，人工介入後確認「UE 端遺失預設路由」是三主機共通的復發症狀
+
+第 5 次崩潰（19:13 觸發）的 `full_recovery()` 卡在 PC3 這步——`run_local_pc3.sh` 收尾的 UE9~16 自我修復重試 5 次仍失敗，watchdog 依設計正確停止（不是無限重試硬撐）。人工介入診斷：PC3 的容器（DU9~12/MT9~12/UE9~16）當下其實都已經是新的、正常運行中，多數 UE 過一會兒自己恢復（8 個只剩 UE15 還斷），查 `rfsim5g-iab-du-12` log 發現是另一種全新症狀——`[RLC] E max RETX reached on SRB 1` + `RLF detected, but no callable RLF handler registered`，UE15 的舊 RNTI 卡在一個 DU 端沒有正確清除的 Radio Link Failure 狀態，`docker compose up -d --force-recreate rfsim5g-end-ue-15` 強制其重新附著（拿到新 RNTI）解決。
+
+**但重新附著後 ping 仍然失敗**，查出跟本文件稍早記錄過的「UE PDU session 自發重建、預設路由沒跟著重設」是同一類問題（`ip route show` 只剩 `12.1.1.0/24 dev oaitun_ue1`，`default via 12.1.1.1 dev oaitun_ue1` 不見了），`ip route replace default via 12.1.1.1 dev oaitun_ue1` 補上即解。**這次不只 UE15**——這次手動完成整個復原後，額外發現 PC1 的 UE5~8（`training_watchdog.sh` 因為卡在 PC3 這步、根本沒跑到後面新增的 PC1 最終驗證步驟）跟 PC2 的 UE17 也是同一個症狀（`ip route show` 都缺 `default via 12.1.1.1`），三台主機、四個不同節點群組（PC1 本機 access、PC2 的 relay 直連 UE17、PC3 的 access）在同一次事件裡全部復發同一種缺路由症狀，確認**這是一個影響全部三主機、不分節點角色的通用問題**，不是特定主機或特定節點類型的個案。
+
+**目前狀態**：三個問題都已現場個別修復（DU12 的 RLF 用強制重建 UE15 解決；PC1/PC2/PC3 的缺路由都用手動 `ip route replace default` 補上），17/17 UE 現場 ping 0% 封包遺失後才重新啟動三主機場景驅動器（新 epoch）與 `training_watchdog.sh`（v5）。
+
+**修復（同日稍後補上，非「待辦」）**：`verify_and_heal_ues()`（`start_iab_pc2.sh`／`start_iab_pc3.sh`）與 `verify_and_heal_local_ues()`（`start_iab_server.sh`）三支腳本都新增 `fix_ue_default_routes()` 函式，在既有的 `reassert_mt_routes`／`reapply_dnat_rules`／`reassert_local_access_dnat_and_routes` 之後、每次重試迴圈都額外對負責的 UE 做 `ip route replace default via 12.1.1.1 dev oaitun_ue1`；`start_iab_pc2.sh` 額外對 UE17（不在 `verify_and_heal_ues` 的 ping 重試範圍內，機制跟 access 節點不同）單獨補一次。三支腳本改完都跑過 `bash -n` 語法檢查，PC2／PC3 的版本已 `scp` 同步過去並在對方主機上再次語法檢查確認。這次修改只改腳本檔案本身，沒有觸碰任何正在跑的容器——下一次 `training_watchdog.sh` 觸發 `full_recovery()` 或有人手動重跑這幾支腳本時就會自動套用新邏輯。
+
+### 追查 Track 1「一直沒有節點收斂」的訊號品質問題：找到並清掉少量 Lagrangian 污染資料
+
+訓練跑了 4 小時、6 次崩潰復原之後，使用者問「還要訓練多久」，查 `check_convergence_mongo.py`（3 小時寬視窗）發現 12 個節點**全部**都還是「仍在變動」，變化量普遍落在 25%~151%（門檻是 <15%），完全沒有節點接近收斂。深入查證發現兩個獨立問題：
+
+1. **少量 Lagrangian 模式污染資料混進 throughput_only 的訓練資料**：`REWARD_MODE=throughput_only` 時 reward 理論上恆為 `r_throughput ∈ [0,1]`（`compute_reward_breakdown()` 的公式，權重 `W_FAIRNESS=W_DELAY=0`），不可能是負值；但直接查 MongoDB 發現部分節點有 reward 低到 -1.5 的紀錄。查 `lambda_applied` 欄位（只有 `compute_lagrangian_reward()` 才會寫入）分布，證實這些負值就是污染——時間點對應本文件較早記錄的「`REWARD_MODE` 短暫被重設回預設值」窗口（`training_watchdog.sh` 的防呆修好之前的幾次崩潰復原）。污染比例很小（12 個節點合計 74772 筆裡 142 筆，0.19%），但因為 throughput_only 的 reward 本身量級很小（下一點），離群值對趨勢判斷的影響被放大。
+2. **即使排除污染，正常 reward 數值量級也遠小於 `MAX_BSR` 正規化上限所暗示的 [0,1] 直覺範圍**（多數落在 0.0001 量級）——研判是訓練場景（`training_scenario_driver.sh` 的輪替表）混入太多閒置／低流量情境（Scenario R 的 `bursty`／`light` profile、以及 A/B/C/D 都沒有真正「把頻寬塞滿」的高負載設計），一般個別 UE 實際傳輸量遠達不到 `MAX_BSR=1,000,000 bytes/100ms`（≈80Mbps）這個上限，reward 訊號因此天生偏小、對雜訊敏感。這一點**尚待處理**，見下一條目。
+
+**修復（資料清潔）**：
+1. `check_convergence_mongo.py` 查詢時排除 `lambda_applied` 存在的文件，且區間統計從平均數改成中位數（對離群值更穩健），報告會列出排除筆數。
+2. 新增 `iab/clean_lambda_contamination.py`（預設 dry-run，要 `--execute` 才會真的刪除），已執行 `--execute` 清掉全部 12 個節點合計 142 筆污染文件，清完 `lambda_applied` 存在的文件數確認歸零。這個刪除操作沒有影響背景訓練執行緒（MongoDB 刪除是原子操作），訓練全程沒有中斷。
+
+**效果**：清完＋改用中位數後，多數節點的變化量顯著下降（例如 Node2 150%→17%、Node11 96%→30%），部分節點（Node3、Node4）已經達到「疑似收斂」門檻，證實訊號品質確實有改善，但多數節點仍未收斂——訓練場景設計本身可能也需要調整，見下一條目。
+
+### 新增 Scenario T（低/中/高流量 × 低/中/高路徑損耗 3x3 交叉設計），取代 R 主導的輪替表
+
+使用者指出訓練場景設計本身的問題：Scenario R 的 `light`／`bursty` profile 佔比高、閒置機率不低，且 A/B/C 之間的對比都在溫和範圍內，沒有任何場景真正把頻寬塞到「需求超過供給」的壅塞狀態，這正是 reward 訊號量級普遍偏小、對雜訊敏感的根本原因之一。
+
+**修復**：`scenarios/traffic_scenario.py` 新增 `scenario_t_tiered()` / Scenario T——`TRAFFIC_TIERS={low:5, medium:25, high:120}` × `PLOSS_TIERS={low:3, medium:12, high:22}` Mbps/dB 3x3 交叉，high tier（120Mbps）刻意遠高於單一 UE 實測可達吞吐量（理論峰值 227Mbps、多跳實測約 43.8Mbps，見 CLAUDE.md 第 2 節），確保訓練資料涵蓋真正的壅塞狀態；每個 phase 依 `(UE 索引 + phase_index) % 9` 錯開分配組合，同時間不同 UE 拿到不同組合、隨 phase 推進輪替。`iab/training_scenario_driver.sh` 的輪替表重新設計：T 佔主力（53%），R 降到 20%（保留真實隨機多樣性），A/B/C 各自保留其邊界案例價值，移除 D（已被 T 的系統性覆蓋取代）。`scenarios/traffic_scenario.py`／`iab/training_scenario_driver.sh` 都已 `scp` 同步到 PC2/PC3 並各自語法檢查過，三主機驅動器已用新版重新啟動（沿用同一個 epoch，wall-clock 自我校正機制自動接續到正確位置，現場驗證過一次真實崩潰復原後正確從 T 輪替到 R，證實這個機制在改版後依然正常運作）。
+
+**現場驗證**：Scenario T 上線後第一次觀察到 UE5 真的跑出 120Mbps 高負載流量（`iperf3 start: ... @ 120Mbps/TCP`）；下一次健檢（跨越一次真實崩潰復原）Track 1 首次出現「疑似收斂」節點（Node6/7/8，變化量 3~5%），多個節點變化量顯著下降，初步證實場景改版方向有效，但仍需要更長時間觀察才能下定論。
+
+**新發現的殘留小問題（尚未修）**：這次崩潰復原後健檢又測到 1~2 筆新的 `lambda_applied` 污染文件（`check_convergence_mongo.py` 已自動排除，不影響判斷，但代表 `REWARD_MODE` 防呆並非 100% 滴水不漏——`training_watchdog.sh` 的 `full_recovery()` 收尾雖然會主動 `--force-recreate` 校正 `inference-nodeN`，但 `start_iab_server.sh` 內部自己的 `up -d` 到那之前這段窗口理論上仍有極短暫的機會跑到預設值；由於量極小（個位數）、且下游已有自動過濾機制擋住，這次先不處理，值得記錄下來供以後有餘裕時徹底根治（例如乾脆讓 `full_recovery()` 一開始就先 `--force-recreate`，不要等 `start_iab_server.sh` 自己跑完普通的 `up -d` 才補救）。**2026-09-19 更新：已徹底修復，見下方條目**——不再是「量極小先不處理」的暫時狀態。
+
+**另一個同一類別的新發現**：同一次崩潰復原後，PC2 的 UE17 也出現跟 PC1 UE5~8 一樣的「最終驗證只做給最後執行的主機」缺口（`training_watchdog.sh` 目前只在收尾對 PC1 本機節點做最終驗證，PC2/PC3 各自的驗證只在自己那個步驟做一次，之後主機順序繼續往下跑，沒有人在全部流程跑完後回頭再驗證非最後一棒的主機）——這次手動補上 UE17 的路由即解決，**這個缺口本質上是「PC1 本機最終驗證」修復的同一個問題、只是換了一個主機**，如果之後要徹底解決，應該考慮把「最終驗證」擴大到全部三主機（不只 PC1），而不是只有 PC1 本機的 UE5~8 有這個保護。**仍未修復**（見下方 2026-09-19 條目，這次同類問題在 UE17 身上又出現一次，做法同樣是手動補路由，長期根治方案不變，這次時間有限沒有動手）。
+
+## 2026-09-19 — Random Access process pool 耗盡自動修復上線、三主機乾淨重啟、Stage 2 正式重測（三度）、Stage 2 資料封存＋Stage 3 啟動
+
+延續使用者的要求：不要再對個別 UE/DU 東補西補，三台主機全部乾淨重啟；並且把 relay/access DU 的 Random Access process pool 耗盡（`gNB_scheduler_RA.c:719` `"no free RA process"`，OAI 內部固定 `NR_NB_RA_PROC_MAX=4` 陣列）這個過去只能人工 `docker restart rfsim5g-iab-du-N` 排除的崩潰模式，做進腳本自動修復——這是 `training_watchdog.sh` 自動復原「有時候成功有時候失敗」的一個主因（先前 Node2、這次 session 稍早的 PC3 Node9~12 案例皆屬此類，且都不會觸發 FlexRIC pending timeout／xApp 重連風暴／CU-DU(donor)/FlexRIC RestartCount 這三個既有偵測訊號，watchdog 完全看不到）。
+
+**Phase 1：RA process pool 耗盡自動修復**。新增 `heal_ra_exhaustion()`（`training_watchdog.sh`，每輪詢週期主動檢查全部 12 個 relay/access DU 的最近 90 秒 log，命中就 `docker restart` 該 DU，每個 DU 獨立 300 秒冷卻，跟既有的 `detect_crash_signal()`/`full_recovery()` 完全獨立、不需要二次確認，修復時間 5~10 秒）與 `heal_ra_exhaustion_local()`（`start_iab_server.sh`/`start_iab_pc2.sh`/`start_iab_pc3.sh` 三份，各自檢查自己主機本地的 DU；PC3 版本額外用 SSH 檢查 PC2 上的 parent relay Node3,4，因為 PC3 的 access 節點斷線也可能是跨主機 parent relay 的 RA pool 耗盡造成），接在各自 `verify_and_heal_*_ues()` 迴圈的第 3 次重試之後（給路由/DNAT 重新斷言前兩次機會，不是每次連通性問題都先無條件重啟 DU）。四份腳本改完先 `bash -n` 語法檢查，PC2/PC3 版本 `scp` 同步後在遠端各自再檢查一次。
+
+**Phase 1.5：意外撿到並徹底修復一個已知但先前「先不處理」的舊坑**——上面 2026-09-18 條目末段記錄過「`start_iab_server.sh` 直接執行時，`inference-nodeN` 的 plain `up -d` 沒帶 `REWARD_MODE`/`MODEL_ARCH`，理論上有極短暫窗口套用 compose 預設值」，當時判斷「量極小、下游已過濾，先不處理」。這次直接執行 `start_iab_server.sh`（不透過 watchdog）做乾淨重啟後，現場實測發現這個窗口比想像中長很多：全部 12 個節點的 `inference-nodeN` 容器啟動後**持續 13 分鐘**都在跑 `REWARD_MODE=lagrangian`（不是「極短暫」，是直到我手動檢查才發現），且**Flower FL 服務整層（`flower-superlink`/`flower-supernode-node{1..12}`/`flower-scheduler`）完全沒有被腳本重新帶回來**（`docker compose down` 會把 profile-gated 的 `stage2-fl` 服務一併清掉，但 `start_iab_server.sh` 完全不知道有這個 profile，只有 `global-xapp`/`flower-scheduler` 這兩個不明原因倖存）。這 13 分鐘內產生的經驗資料有 32 筆（佔全部 114140 筆的 0.03%）帶有 `lambda_applied` 欄位，確認是 lagrangian 污染，用 `iab/clean_lambda_contamination.py --execute` 清除。**真正的修復**：把 `training_watchdog.sh` 原本只在 `full_recovery()` 內部才有的「主動覆蓋」邏輯，直接搬進 `start_iab_server.sh` 本身——啟動 `inference-nodeN` 後立即用 `REWARD_MODE`/`MODEL_ARCH` 環境變數（預設 `throughput_only`/`mlp`）`--force-recreate` 一次，並且用 `docker ps -a` 偵測 `flower-superlink` 是否存在過，存在就用 `FL_MODE`/`MODEL_ARCH` 一併 `--force-recreate` 帶回整層 stage2-fl 服務。這樣不管未來是透過 watchdog 呼叫、還是像這次一樣直接執行，都不會再有這個污染窗口，不用再依賴「下游有過濾機制擋住、污染量小所以能接受」這個脆弱假設。
+
+**Phase 2~3：三主機依序乾淨重啟**（`start_iab_server.sh` → `run_local_pc2.sh` → `run_local_pc3.sh`），**不動 MongoDB/checkpoint**（本來就已經累積 6.5 小時的 Stage 2 訓練資料，2026-09-18 07:29~13:56 UTC）。過程中兩個小插曲：(1) 啟動 PC2 時手滑同時用了「舊式 `ssh "cmd &"`」與「`ssh -f`」兩種寫法各跑了一次，造成兩份 `start_iab_pc2.sh` 同時執行、有競爭風險，立刻 `kill -9` 全部相關 PID 後用單一 `ssh -f` 乾淨重跑，之後全部改成只用 `ssh -f` 單次啟動並立刻確認 process 數量。(2) 17 UE 連通性驗證發現 UE16（PC3，`[RLC] E max RETX reached on SRB 1` + `RLF detected` 反覆出現，卡在 radio-link failure，不是路由/DNAT 問題，`docker restart rfsim5g-end-ue-16` 後正常重新附著）與 UE17（PC2，預設路由在乾淨重啟後又是消失成 `default via 192.168.88.1 dev eth0` 而非 `12.1.1.1 dev oaitun_ue1` 的既有模式，手動 `ip route replace` 後 0% 封包遺失）各自需要一次性手動修復，修完後 17/17 UE 全部連通。
+
+**Phase 4：Stage 2 固定場景正式重測**（第三次，取代 2026-09-14 版本）——先確認/修復 `inference-nodeN`（`REWARD_MODE=throughput_only`/`MODEL_ARCH=mlp`）與 Flower FL 層（`FL_MODE=avg`/`MODEL_ARCH=mlp`）皆正確、`iab/clean_lambda_contamination.py --execute` 清除污染、`bash scenarios/setup_iperf_servers.sh` 重新確認 ext-dn 的 17 個 iperf3 server 監聽正常後，DRL 全程保持啟用（不像 PF baseline 停用 xApp），三主機同時跑 `traffic_scenario.py --scenario R --seed 20260914 --phase-duration 60 --num-phases 15` + `measure_stage.py --duration 900 --interval 5`。全程三主機 FlexRIC/CU/DU/全部 12 個 relay+access DU `RestartCount` 維持 0。
+
+**結果**：JFI=0.3960（PF 基準 0.3303，+19.9%）、17 UE 平均吞吐量 8.78 Mbps（PF 基準 6.45 Mbps，+36.1%）、平均 RTT 194.86 ms（PF 基準 224.23 ms，**改善 −13.1%**）——**三項核心指標第一次同時優於 PF baseline**，2026-09-14 版本的 RTT 曾經惡化 +32.1%，這次反而改善。跟上一版本最大的差異是 MODEL_ARCH 從 GRU 換回 MLP（推論路徑更輕量）+ 訓練時長從 15 分鐘拉長到 6.5 小時 wall-clock，兩個變數同時換掉，無法精確歸因給哪一個，如實記錄在 `experiment_results/avgFL.md`。UE17 量測期間再次出現 ICMP 100% 失敗（量測前現場確認過 0% 封包遺失，量測開始、系統進入高負載後才復現），跟 `PF.md` 記錄的 Node4 三重負載自我節流效應一致，判斷不是本次新增的連線問題。
+
+**Phase 6：Stage 2 資料封存＋Stage 3（cluster FL）啟動**。新增 `iab/archive_stage_data.sh <tag>`（`docker cp` 封存全部 12 個節點的 checkpoint 到 `experiment_results/checkpoints_archive/<tag>/`、MongoDB `node{N}_experiences` 用 `renameCollection` 改名成 `node{N}_experiences_<tag>`，不是複製也不是切換資料庫——因為 collection 名稱在現有程式碼裡完全寫死不可配置，改名是改動範圍最小的封存方式），執行 `bash iab/archive_stage_data.sh stage2_avgfl_20260919` 封存全部 12 節點（合計 114108 筆經驗＋12 份 checkpoint）後，跑 `FL_MODE=cluster REWARD_MODE=throughput_only bash iab/run_stage2_fl.sh` 啟動 Stage 3——這支既有腳本的清空邏輯現在操作的是封存後新建的空 collection，不會動到剛搬走的 Stage 2 資料。確認全部 12 個節點 MongoDB 經驗數為 0（乾淨起點）、環境變數正確（`throughput_only`/`mlp`/`cluster`）。
+
+**Phase 7：跨夜自主訓練基礎設施上線**。三主機各自 `nohup bash iab/training_scenario_driver.sh --host {pc1,pc2,pc3} --epoch <同一個值> &`（PC2/PC3 用 `ssh -f`，PC1 用 `nohup ... & disown`），PC1 額外 `nohup bash iab/training_watchdog.sh --reward-mode throughput_only --model-arch mlp --fl-mode cluster --epoch <同值> &`，以及一個 30 分鐘一次的健檢迴圈（`nohup bash -c 'while true; do bash iab/training_healthcheck.sh --since 1800; sleep 1800; done' > /tmp/training_health_log_stage3.txt &`）。逐一用 `ps -o pid,ppid,cmd` 確認 PC1 本機三個常駐行程 PPID 皆為 `1`（已跟呼叫它們的 shell 脫鉤）；PC2/PC3 的驅動器 PPID 是各自 sshd session 底下的 `nohup` 包裝行程（不是 `1`），但 `nohup` 本身就保證該行程不受 SIGHUP 影響、SSH session 結束後會自動被 init 收養繼續執行，效果等同，不是保護力較弱的替代方案。這三個行程完全獨立於發起指令的 Claude Code session（無論是使用者手動 SSH 或這次的 session）是否還存在，是訓練能撐過使用者筆電 SSH 斷線、本人無法介入的真正保證機制。
+
+**Phase 7.5（2026-09-19 事後發現的嚴重遺漏，必須誠實記錄）：Phase 2 乾淨重啟時漏掉 `run_local_pc1.sh --skip-server`，導致全部 12 個 C 語言 Local xApp 容器從未啟動**——`start_iab_server.sh` 只負責基礎設施（CN5G/FlexRIC/MongoDB/Donor CU-DU/12 組 inference-nodeN），依 CLAUDE.md 既有文件，啟動 xApp 是接在後面的 `run_local_pc1.sh --skip-server`（等 13/13 E2 → 逐一 `docker compose up -d node${i}-l-xapp`）這一步的職責，但 Phase 2 的乾淨重啟序列裡這一步被漏掉，直接跳去做 Phase 3（UE 連通性驗證）與 Phase 4（Stage 2 量測）。`docker ps -a` 事後確認 `xapp-node1`~`xapp-node12` 全部「no such object」，從未被建立過。
+
+**影響範圍比想像中大**：
+1. **Phase 4 的 Stage 2 固定場景量測整份作廢**——量測全程沒有任何 E2SM-MAC CONTROL-REQUEST、Local rApp（DRL Actor）從未被呼叫、Global xApp 的 `fairness_bias` 從未被送達任何節點，DU 端 PRB 分配全程是純 OAI 內建排程器行為（疊加跟 PF baseline 相同的 backhaul-aware PRB 預算機制）。量到的「JFI=0.3960／8.78Mbps／194.86ms，三項全優於 PF baseline」這組數字因此**不能歸因給 Stage 2 訓練出來的 policy**，已在 `experiment_results/avgFL.md` 最上方加註大篇幅更正說明並保留原始數字供記錄，不刪除。
+2. **Stage 3 啟動後同樣空轉了將近 40 分鐘**——Phase 6/7 封存 Stage 2 資料、啟動 Stage 3、上線 watchdog／場景驅動器／健檢迴圈的整個過程，xApp 都不存在，`node{N}_experiences` 全部掛 0，`training_healthcheck.sh` 的 30 分鐘健檢第一輪其實有印出異常訊號（Section B「AI 決策」計數應為 0 卻因為既有的 bash 語法錯誤〔`[[: 0\n0: syntax error`，見 CLAUDE.md/先前條目已知但未修的 bug〕整段被吞掉、沒有清楚報出來），沒有在當下被抓到。
+
+**為什麼「17 UE 連通性 100%」「RestartCount 全程 0」這些檢查都沒抓到**：這兩項檢查驗證的是**資料面**（UE 能不能連上 DN）與**容器沒有崩潰重啟**，兩者都不依賴 xApp 是否存在——沒有 xApp 只代表 DU 端完全沒有收到 PRB 覆寫指令，資料面本身（Uu/F1/N3 tunnel、路由、DNAT）不受影響，UE 一樣可以正常上網，只是排程完全是 OAI 預設行為。這是這次的核心教訓：**「UE 連通性正常」「容器沒重啟」只能證明資料面健康，完全不能代表 DRL 控制迴圈真的在生效**，必須額外檢查 `docker ps` 確認 12 個 `xapp-nodeN` 容器存在、`docker logs flexric | grep -c "E2 SETUP-REQUEST"` ≥13、且 `xapp-nodeN` log 有 `CONTROL-REQUEST tx`/`CONTROL ACK rx` 這種主動控制訊號在跑，缺一不可。
+
+**修復**：發現後立即 `bash iab/run_local_pc1.sh --skip-server`，13/13 E2、12/12 xApp、12/12 ZMQ socket 全部就緒，`xapp-node1` log 確認持續有 `CONTROL-REQUEST tx`/`CONTROL ACK rx`，MongoDB 全部 12 個節點的 `node{N}_experiences` 立刻開始有新文件（30 秒內每節點 17~62 筆）。Stage 3 訓練從這個時間點才算真正開始，`avgFL.md` 已同步更正「下一步」段落的時間點敘述。
+
+**決定：不回頭重跑 Stage 2 的封存 checkpoint 重新驗證量測**——checkpoint 本身（6.5 小時的真實訓練過程，xApp 當時確實有在跑）沒有受影響，只是「量測」這個驗證環節失效；重跑會需要暫停剛剛才真正開始運作的 Stage 3、來回切換 Mongo collection／checkpoint／FL_MODE 好幾輪，操作複雜度與再次出錯的風險都不小，且使用者已明確表示優先順序是讓訓練持續推進、不要因為介入而停下來。`avgFL.md` 已如實標注這組數字作廢、原因、以及「有效的 Stage 2 驗證量測待後補」，留待有餘裕、或 Stage 3 需要跟 Stage 2 做比較時再回頭用封存的 checkpoint（`experiment_results/checkpoints_archive/stage2_avgfl_20260919/`）補做一次。
+
+**Phase 7.6（2026-09-19 續，同一晚）：`training_watchdog.sh` 的 `full_recovery()` 遇到單一主機軟性失敗就整個中止，導致 xApp 層被晾著——已修復**。01:06 一次真實 FlexRIC 崩潰觸發自動復原，卡在 `[2/4] PC2` 這步（Node5 的 DU 因為 MT tunnel 建立過慢被腳本自己的 300 秒逾時跳過、從未建立，是先前已知的「DU 建立被跳過」模式再次出現），`full_recovery()` 偵測到「重試 5 次後仍有 UE 連不通」立刻 `return 1`、整個中止——**代表 [3/4] PC3、[4/4] xApp 啟動這兩步完全沒有被執行到**，CU 又因為這次崩潰重建、NAT 表清空，PC3 的 DNAT 規則從未被重新寫入，PC1 的 xApp 容器（[1/4] PC1 步驟裡 `start_iab_server.sh` 自己的 `docker compose down` 已經把它們清掉，且只有到 [4/4] 才會重新建立）也因此持續處於「已停用、沒人重啟」的狀態，直到下一次 30 分鐘健檢週期才被人工發現，訓練空轉了近一小時。
+
+人工修復當下的問題後（手動重建 PC2 的 DU5、重新驗證/修復 PC3 全部 DNAT／路由、`run_local_pc1.sh --skip-server` 重新啟動 xApp、以新 epoch 重啟三主機驅動器＋watchdog），順手把這個設計缺陷本身也修掉，不留給下一次崩潰重演：`full_recovery()` 新增 `DEGRADED`／`DEGRADED_DETAIL` 計數器，把「單一主機的 UE 連通性軟性失敗（重試 5 次仍有 UE 連不通）」與「E2 連線數不足 13」都從「立即 `return 1` 中止」改成「記錄警告、繼續往下走」，只有 SSH/腳本本身非 0 結束（代表更根本的問題，例如主機真的連不上）、或**三主機同時**都回報軟性失敗，才視為需要人工介入而真正中止。這樣即使某一台主機的某個節點還沒修好，[4/4] 的 xApp 啟動步驟仍然一定會被執行，不會再讓整個訓練迴圈因為一個節點的問題被晾著。改完先 `bash -n` 語法檢查，然後**重啟正在跑的 watchdog process 本身**（單純編輯磁碟上的檔案不會讓已經在跑的 bash 行程套用新內容，必須整個換一個新行程）——只重啟 watchdog，不動三個場景驅動器（沿用同一個 epoch，wall-clock 自我校正機制保證位置不受影響）。
+
+**Phase 7.7（2026-09-19 續）：Stage 3 固定場景試量測（8.5 小時訓練後）＋現場發現並修復第二個 `REWARD_MODE` 未傳遞 bug**。第 11 次崩潰的手動復原完成、17/17 UE 健康、xApp 明確驗證已啟動（吸取上次教訓，這次先確認 `docker ps | grep -c xapp-node` = 12、`CONTROL-REQUEST`/`AI 決策` 訊號都有才繼續）後，跑了跟 PF.md 完全相同方法論的固定場景量測（Scenario R / seed=20260914 / 900s）。
+
+**結果不如預期**：JFI=0.3317（跟 PF 的 0.3303 幾乎持平）、平均吞吐量 4.01 Mbps（比 PF 的 6.45 Mbps **差 37.8%**）、平均 RTT 291.53ms（比 PF 的 224.23ms **差 30.0%**）——不是預期的「cluster FL 應該優於 PF」，量測全程三主機零崩潰，數字本身量測過程沒有問題。
+
+**追查發現一個活躍中的 bug**：檢查 `inference-node1` log 發現 `lambda` 欄位持續在漂移（0.85→1.02，明顯是 Lagrangian dual-ascent 更新的行為模式），但 `REWARD_MODE=throughput_only` 理論上應該讓 `drl_agent.py` 完全跳過 λ 更新。逐一排查：`inference-node1` 自己的 `REWARD_MODE` 環境變數（含 `/proc/1/environ` 直接確認 PID 1 的真實環境，排除 `docker exec` 顯示的環境跟實際運行中 process 不一致的可能）確認正確是 `throughput_only`；但檢查全部 12 個 `flower-supernode-nodeN` 容器（`docker exec flower-supernode-nodeN cat /proc/1/environ`）發現**全部都是 `REWARD_MODE=lagrangian`**——這是 2026-09-14 那次 root cause 1（`flower-supernode-nodeN` 從未收到 `REWARD_MODE`）的同一類問題**沒有修乾淨**：當時的修法是幫 compose 檔的 `flower-supernode-nodeN` 服務定義加上 `REWARD_MODE: "${REWARD_MODE:-lagrangian}"`，但這個 `${VAR:-default}` 語法是在「執行 `docker compose up` 那個當下的 shell 環境」裡展開的——`run_stage2_fl.sh` 第 4 步與 `training_watchdog.sh::full_recovery()` 帶起這批 stage2-fl 服務時，都只在指令前面加了 `FL_MODE=... MODEL_ARCH=...`，漏了 `REWARD_MODE=...`，所以每次透過這兩個進入點啟動／重建 `flower-supernode-nodeN`，都會悄悄吃到預設值 `lagrangian`，整個 Stage 3 訓練期間（含這次量測當下）都是如此。
+
+**追查是否真的污染了 policy 權重**：讀 `drl_agent.py` 原始碼確認 `self._lambda`（Lagrangian 乘子）的全部使用點——只在 metrics 記錄與 checkpoint 存讀時被讀寫，MLP 分支的 `actor_loss`/`critic_loss` 計算完全沒有用到它；另外確認 `training_pipeline.py`／`client_app.py`（FL 訓練路徑）都不呼叫任何 reward 計算函式，純粹讀取 MongoDB 裡已經由 `inference-nodeN`（用正確的 `throughput_only` 公式）寫好的 `reward` 欄位訓練——結論是這個 bug **不會**直接污染梯度更新／policy 權重本身，但代表：(1) 違反了「Stage 2~4 全程應為 throughput_only」的設計不變式；(2) checkpoint 裡的 `lambda` 欄位本身是髒的；(3) 不能排除還有其他尚未追查到的間接路徑。
+
+**修復**：`run_stage2_fl.sh`／`training_watchdog.sh::full_recovery()` 兩處帶起 `flower-supernode-nodeN` 的指令都明確補上 `REWARD_MODE="$REWARD_MODE"`（不能只依賴 compose 檔的預設值語法），並把 `training_watchdog.sh` 那處原本沒有的 `--force-recreate` 也加上（沒有它，環境變數改了也不會套用到已存在的容器）。現場立即用正確環境變數 `--force-recreate` 全部 12 個 `flower-supernode-nodeN`，`/proc/1/environ` 逐一確認修復生效。
+
+**判斷**：鑑於 (a) 上述 bug 雖不直接污染梯度但代表環境不乾淨、(b) 8.5 小時訓練期間歷經 11 次崩潰復原，個別 UE 連通性的既有不穩定模式可能延續進量測窗口（量測結果裡 UE15 覆蓋率 0%、多個節點覆蓋率低於 50%，範圍橫跨三主機，不是單一深層節點的既有模式），這次的量測結果記錄進 `clusterFL.md` 但明確標註為「confound 尚未排除的快照，不是 cluster FL 演算法優劣的最終定論」，不因為數字不好看就重跑到「滿意」為止，也不因為 bug 已修就直接宣稱重跑會變好——如實記錄現況與限制。
+
+**Phase 7.8（2026-09-19 續）：Stage 2 有效重測（用封存的 Stage 2 checkpoint）＋兩份量測的最終誠實結論＋還原 Stage 3 繼續訓練**。用 `iab/archive_stage_data.sh`／新增的 `iab/restore_stage_data.sh`（`archive_stage_data.sh` 的反向操作，docker cp 還原 checkpoint、MongoDB `renameCollection` 搬回即時 collection 名稱）把 Stage 3 當時的即時狀態封存、換回 Stage 2 封存的 checkpoint 與經驗，`inference-nodeN`／`flower-supernode-nodeN`／`flower-superlink` 的環境變數逐一 force-recreate 確認正確（`REWARD_MODE=throughput_only`、`FL_MODE=avg`、`MODEL_ARCH=mlp`），`inference-node1` log 確認載入的是訓練步數 2600 的真實 Stage 2 checkpoint（不是隨機初始化）。
+
+**過程中的操作失誤（如實記錄）**：archive/restore 這兩支腳本操作 MongoDB collection 改名時，因為 `inference-nodeN` 全程沒有暫停，期間持續有新經驗寫入，導致好幾次 `renameCollection` 因為目的地 collection 已被新資料重新建立而失敗（`target namespace exists`）；一次用「把新資料併回 Stage 3 封存 collection」的方式排除，但誤把 node7/node8**已經成功還原**的 Stage 2 資料（6188/5694 筆）當成「Stage 3 殘留新資料」一併併入 Stage 3 封存 collection，事後改用時間戳切分想要救回來，但混雜程度已經無法乾淨切乾淨，最終決定 node7/8 直接用空 collection 起始（checkpoint 本身沒有受影響，只有 MongoDB 經驗歷史的極小部分——2 個節點的背景訓練資料——永久混進了 Stage 3 的封存記錄，不影響任何一份 checkpoint 的正確性）。**教訓**：這類 archive/restore 操作應該先停止 `inference-nodeN`（消除寫入競爭）再做 collection 改名，第二次操作（Stage 2→Stage 3 換回）改成先停用再操作，全程順利無誤，之後任何類似操作都應該先停用寫入端。
+
+**量測結果**：JFI=0.3293（跟 PF 的 0.3303 幾乎持平）、平均吞吐量 4.40 Mbps（比 PF 差 31.8%）、平均 RTT 312.44ms（比 PF 差 39.3%）、3/17 UE 零吞吐量。**但量測開始時 UE9/10/15/16/17 共 5 個節點已知連不通**（花了大量時間嘗試路由/DNAT/DU 重啟/conntrack 清空等既有修法皆未能在合理時間內解決），這 5 個節點佔了近三分之一，且 3 個直接零樣本，判斷這份數字主要反映的是「連通性缺口拉低全域平均」，不是 policy 決策品質——有連通性的 12 個節點（UE1~8、UE11~14）看起來的吞吐量/RTT 量級跟 PF/clusterFL 同一批節點相近，沒有明顯異常。詳細記錄於 `avgFL.md`。
+
+**兩份量測（Stage 2 補測、Stage 3 量測）的共同結論**：都不建議直接拿來下「cluster FL 優於／劣於 avg FL」的定論——Stage 3 的量測受已修復的 `REWARD_MODE` bug 與整晚崩潰復原後的連通性殘留影響；Stage 2 補測則是量測當下就有 5 個節點已知連不通。兩者都是同一晚系統反覆出現的連通性不穩定模式造成的 confound，不是模型本身的問題。建議之後找一個系統穩定、17/17 UE 連通性確認良好的時間點，重新做一次乾淨的三方比較量測，才能對「PF < avg FL < cluster FL」這個路線圖假設下真正的定論。
+
+**收尾**：Stage 2 的即時資料（含補測期間新增的少量經驗）重新封存回 `node{N}_experiences_stage2_avgfl_20260919`，checkpoint 同步更新封存檔；還原 Stage 3 的封存資料（`inference-node1` 確認載入訓練步數 4600~4600，與封存前一致，證實還原正確）、`FL_MODE` 設回 `cluster`。還原過程中意外發現 FlexRIC 在量測期間曾經歷一次短暫崩潰又自動重啟（`RestartCount` 0→1），且**這次 xApp 的 E2 訂閱在 FlexRIC 重啟後沒有自動恢復**（`docker logs xapp-node1` 卡在「等待 Node 1 連線...目前已連接節點數:6」，`flexric` log 大量「RIC Indication message arrived...but no xApp associated」）——單獨 `docker restart xapp-node{1..12}` 未能徹底解決（只恢復部分節點），最終依照 CLAUDE.md 既有記載的「FlexRIC 崩潰只重啟 xApp/DU 不夠，必須連 FlexRIC 一起完整重啟三主機」原則，做了最後一次三主機完整乾淨重啟才徹底解決；同一輪還發現並修復 PC1 host 對 Node1/3/4 relay tunnel IP 的路由（`ip route ... via macvlan-br`）過期未更新、PC3 的 access DU（Node9/10/11/12）在先前手動 `docker restart` 後遺失了往 MT internal IP 的自訂路由（`ip route replace ... via <mt_internal_ip>`，`docker restart` 會重置容器的網路命名空間，連帶清空 exec 進去下的 runtime route，這是先前記錄過的 DNAT/route 表在容器重啟後失效模式的同一類、但作用在不同路由表上的變體）。三主機重啟＋兩項路由修復後，17/17 UE 中 16 個確認連通（UE17 維持其一貫的 Node4 三重負載自我節流模式），以新 epoch 重新啟動三個場景驅動器與 watchdog，確認訓練已恢復（MongoDB 經驗數持續增加）。
+
+**Phase 7.9（2026-09-19 續）：三方乾淨重測（Stage 3 → Stage 2 → PF），全部在使用者明確要求「先驗證 17/17 UE 連通、確認 xApp 真的在跑，再量測」下完成**。使用者指出先前 Stage 2 補測明知 5/17 UE 連不通卻仍繼續量測是錯誤做法，要求這次確實做到位。
+
+**Stage 3 乾淨重測**：三主機依序乾淨重啟（過程中修復 PC1 host 對 relay tunnel 的過期路由 `ip route ... via macvlan-br`），量測前逐項驗證 17/17 UE 現場 ping 0% 封包遺失（含 UE17，本次首次真正做到全部連通）、`docker ps` 確認 12/12 xApp、`xapp-node1` log 確認真實 `CONTROL-REQUEST`/`AI 決策` 訊號、`FL_MODE=cluster`／`REWARD_MODE=throughput_only`／`MODEL_ARCH=mlp` 逐一用 `/proc/1/environ` 確認。結果：JFI=0.3113、吞吐量=5.23 Mbps、RTT=301.93ms，三項仍劣於 PF，但這次 **0/17 UE 零吞吐量**（比先前版本的 1/17 更乾淨），confound 已排除，數字可信。寫入 `clusterFL.md`，取代先前受 `REWARD_MODE` bug／連通性殘留污染的版本。
+
+**Stage 2 乾淨重測**：archive Stage 3 即時狀態（新 tag `stage3_clusterfl_20260919_v2`，先 `docker compose stop inference-node{1..12}` 消除寫入競爭，這次 archive/restore 全程順利、沒有再犯上次的 collection 改名競爭錯誤）→ restore Stage 2 封存 checkpoint/經驗 → force-recreate `inference-nodeN`（`REWARD_MODE=throughput_only`）+ FL 層（`FL_MODE=avg`）→ 同樣逐項驗證 17/17 UE＋xApp 真實運作。過程中再次踩到「PC3 個別元件檢查都正常但 end-to-end 仍不通」的謎樣模式，最終追查到是 xApp 在某次 PC3 單獨重建後**E2 訂閱狀態跟 FlexRIC 對不上**（`flexric` log 大量 `RIC Indication message arrived...but no xApp associated`，`xapp-node1` 卡在「等待 Node 1 連線...已連接節點數:0」）——單獨 `docker restart xapp-node{1..12}` 沒用，必須依 CLAUDE.md 既有記載的順序（FlexRIC→DU→xApp）做完整三主機重啟才解決，這是本次 session 第二次遇到同一個模式，值得記錄成明確的排查優先順序：**「個別節點連通性檢查都過但整體還是不通」時，優先懷疑 xApp-FlexRIC 的 E2 訂閱狀態不同步，不要一直在路由/DNAT/NAT 層打轉**。
+
+結果：JFI=0.2453（比 PF 的 0.3303 差 25.7%，是目前所有量測中最低的 JFI）、吞吐量=6.81 Mbps（比 PF 的 6.45 高 5.6%）、RTT=260.14ms（比 PF 差 16.0%）。混合結果——吞吐量小贏但公平性明顯輸，判斷是 `REWARD_MODE=throughput_only` 沒有 JFI 限制式、policy 傾向把資源集中給少數節點換取總量最大化的合理結果，呼應 Stage 5 規劃要重新啟用 `REWARD_MODE=lagrangian` 的設計動機。寫入 `avgFL.md`，取代前兩次因 xApp 未啟動／5 個 UE 已知連不通而不可信的版本。
+
+**PF baseline 同夜重測**：Stage 2 補測完後，直接 `docker stop xapp-node{1..12}`（PF 模式不需要碰 checkpoint/MongoDB，只要停用 xApp 即可，比 Stage 2/3 之間的切換簡單很多）。量測前一樣逐項驗證 17/17 UE 連通（含修復 PC1 本機 Node7/8 的 MT PREROUTING NAT 規則遺失——跟先前 PC2 Node5 遇到的是同一類問題：`docker restart`／PDU session 自發重建會清空 `iptables -t nat -A PREROUTING ...` 這類 runtime 規則，不是路由層級能修好，必須額外補上 NAT 規則本身）。結果：JFI=0.3017、吞吐量=7.33 Mbps、RTT=238.12ms，跟 2026-09-13 原始基準（0.3303／6.45／224.23）同量級但有 ~10% 上下的差異，判斷是場景/系統狀態的正常雜訊，不是 PF 排程器行為改變。寫入 `PF.md` 新增章節（原始基準保留不動），建議後續 Stage 2/3 比較優先用這份同夜基準做 paired comparison。
+
+**使用者明確指示**：更新完 PF 相關數據檔案後先停止，這次**不**把系統換回 Stage 3 繼續訓練——目前系統停留在 PF baseline 狀態（全部 12 個 xApp 容器 stopped，`inference-nodeN`/`flower-*` 仍是 Stage 2 的設定，checkpoint/經驗不受影響），等待下一步指示。Stage 3 的完整訓練狀態（243k+ 筆經驗、訓練步數 6768 的 checkpoint）已安全封存在 `node{N}_experiences_stage3_clusterfl_20260919_v2` collection 與 `experiment_results/checkpoints_archive/stage3_clusterfl_20260919_v2/`，之後要恢復訓練只需要 `bash iab/restore_stage_data.sh stage3_clusterfl_20260919_v2` + `FL_MODE=cluster` 重啟即可接續。
+
+## 2026-09-20~21 — 發現並修復 iperf3 多埠 server 從未啟動的重大 bug（污染整天的 Stage 2 重訓資料）＋PF/avgFL/clusterFL 三方 Scenario T 乾淨比較
+
+**背景**：前一晚（見上方 2026-09-19 條目）發現舊版 Stage 2 訓練橫跨 Scenario T 輪替表改版時間點，對測試用 Scenario R 曝光比例失衡（~51% vs Stage 3 的 ~20%），判斷是 cluster FL 表現不如 avg FL 的可能 confound。使用者決定：重新訓練 Stage 2（沿用新版 T 佔多數的輪替表），且這次量測改用 **Scenario T**（3×3 流量×路徑損耗交叉設計，全決定式、無 seed，比 Scenario R 的「同 seed」更嚴格可重現）取代 Scenario R，等訓練跑到跟 Stage 3 相近的規模／比例後，做一次 PF／avg FL／cluster FL 三方乾淨比較。
+
+**Stage 2 重訓過程**：整晚透過 `training_watchdog.sh` 自動偵測 FlexRIC 崩潰並完整重啟（本輪累計發生 7 次），期間額外發現並修復多個新的基礎設施缺口：(1) `run_local_pc2.sh`／`start_iab_server.sh` 偶爾會**靜默跳過**啟動某個 access DU 容器（本輪至少兩次是 `rfsim5g-iab-du-5`，`docker ps -a` 直接查不到這個容器，母腳本卻正常回報「Ready」），需要手動 `docker compose up -d` 補上，並補齊該 DU 的自訂路由與其 MT 的 PREROUTING/POSTROUTING NAT 規則（因為這些設定原本是跟 DU 啟動綁在同一個函式裡一起下的，DU 沒啟動就全部漏掉）；(2) UE17（直連 Node4 relay）不在標準 `verify_and_heal_ues()` 範圍內，每次完整重啟後預設路由／DU4 F1-U 綁定位址別名都需要重新斷言，已把這個 heal 邏輯補進 `training_watchdog.sh::full_recovery()`；(3) `flower-supernode-nodeN` 的 `REWARD_MODE` 環境變數在 `start_iab_server.sh` 的靜默 recreate 後又飄回預設值 `lagrangian` 過一次，比照既有修法用 `--force-recreate` 明確帶正確環境變數蓋掉。訓練期間持續用「MongoDB 經驗時間戳 + 已知的 epoch/輪替表」直接反推每筆經驗當下實際套用哪個 scenario，追蹤 T/R/A/B/C 五類的真實佔比（而非只看訓練小時數）是否收斂到目標比例（T 53.3%／R 20%／A 8.3%／B 8.3%／C 10%），比小時數更能反映訓練資料的場景涵蓋是否足夠。
+
+**使用者觸發三方測試**：明確指示「等下一次 FlexRIC 真的崩潰時」不要照舊自動修復回訓練模式，改為把那次完整重啟直接當成三方 Scenario T 比較的起點：PF（全部 xApp/rApp 關閉，只靠 OAI 內建排程器）、avg FL（還原這次 Stage 2 重訓的即時 checkpoint，`MODEL_ARCH=mlp REWARD_MODE=throughput_only FL_MODE=avg`）、cluster FL（還原已封存的 `stage3_clusterfl_20260919_v2`，`FL_MODE=cluster`），每個 stage 都先完整清乾淨重建（含路由）、驗證 17/17 UE 連通，才做 15 分鐘量測。觸發後依此流程：停用 watchdog／三個場景驅動器 → 停用 `inference-nodeN` → 用 `archive_stage_data.sh stage2_avgfl_retrain_20260920` 封存這次重訓的即時資料（12 節點合計 157,750+ 筆經驗＋12 份 checkpoint，全數安全封存，不受後續任何操作影響）→ 停用全部 xApp/rApp/FL 層 → 17/17 UE 驗證通過 → 開始 PF baseline 的 Scenario T 量測。
+
+**重大發現：iperf3 多埠 server 從未正確啟動，整個 session（含整晚的 Stage 2 重訓）只有 UE1 真正有流量**。PF 第一次量測（Scenario T，15 分鐘）跑完後分析結果：17 個 UE 裡有 16 個 `achieved_mbps` 覆蓋率是 **0%**（iperf3 完全沒有成功量到任何吞吐量樣本），只有 UE1 正常（覆蓋率 98.7%）；RTT 覆蓋率大致正常，代表純 ICMP 連通性沒問題，問題出在 iperf3 這一層。查 `pf_scenario_pc1.log` 發現大量 `WARNING iperf3 supervisor 退出 rfsim5g-end-ue-N (rc=1)，重啟 loop...`，且是**整個 15 分鐘量測全程持續發生**，不是偶發。手動對 `rfsim5g-end-ue-6` 執行 `iperf3 -c 192.168.72.135 -p 5206` 直接重現 `Connection refused`。查 `rfsim5g-oai-ext-dn` 容器內的 process，發現只有一個 `iperf3 -s`（無 `-p` 參數，只監聽預設埠 5201），但 `traffic_scenario.py` 的 `UE_IPERF_PORTS` 對照表把 UE1~17 分別對應到 port 5201~5217（一個 UE 一個獨立埠）——單一預設埠的 server 只能服務到剛好對到 5201 的 UE1，其餘 16 個 UE 的 client 連線全部找不到監聽的 server。追查發現專案裡其實早就有 `scenarios/setup_iperf_servers.sh` 這支腳本，專門負責啟動 17 個各自獨立的 iperf3 server（port 5201~5217，各自包一層 `while true` 自動重啟 loop），且 `run_stage2_fl.sh` 執行完的提示訊息裡也明確要求「請先執行 `bash scenarios/setup_iperf_servers.sh`」——但這支腳本**從未被 `start_iab_server.sh` 或 `training_watchdog.sh::full_recovery()` 呼叫過**，這兩個本次 session 用來做乾淨重啟的進入點都只執行內建的單一 `iperf3 -s`，是遺漏，不是新產生的迴歸。
+
+**影響範圍評估（用 MongoDB 資料實測，不是猜測）**：對 `stage2_avgfl_retrain_20260920` 封存資料的 12 個節點分別取樣 2000 筆經驗、算 `state.bsr`／`state.dl_buffer_info` 平均值：只有 Node1（relay，承載 Node5 access 的 backhaul 聚合流量）與 Node5（access，直接服務 UE1/UE2）顯示真實活動（avgBsr 約 223,661~229,669、avgBuf 約 1,775~1,877），其餘 10 個節點（Node2,3,4,6,7,8,9,10,11,12）全部趨近於零（avgBsr 個位數到個位數十、avgBuf=0）——精確對應「只有承載 UE1 流量的路徑有真實負載，其餘節點的 UE 全部因為 iperf3 連不上而近乎閒置」這個假設。結論：**整晚累積的 157,750+ 筆 Stage 2 重訓經驗裡，10/12 節點的資料反映的是近乎閒置、不是真實壅塞情境**，直接違背這次重訓「補足 Scenario T 真實壅塞曝光」的初衷。
+
+**修復**：立即執行 `bash scenarios/setup_iperf_servers.sh`，確認 17 個埠全部監聽中，手動重測單一 UE（`rfsim5g-end-ue-6` → port 5206）成功量到 17.5 Mbits/sec，確認修復生效。已在 `CLAUDE.md` 第 6 節補上明確警語與強制步驟：**任何乾淨重啟後、啟動 `traffic_scenario.py`（不管是量測的一次性呼叫，還是 `training_scenario_driver.sh` 的訓練用長駐呼叫）之前，必須先執行這支腳本**，並記錄這是靜默失敗模式（不會讓腳本報錯、也不會讓 UE 的 ping 連通性檢查失敗，只有 iperf3 吞吐量樣本會全數缺失），特別容易被忽略。`training_watchdog.sh::full_recovery()` 目前仍未自動呼叫這支腳本，是已知缺口，留待之後補上自動化（例如接在 `[4/4] 啟動 xApp` 之後）。
+
+**使用者決策（如實記錄，不事後補救）**：修復後用 v2（乾淨）重跑 PF 的 Scenario T 量測；`stage2_avgfl_retrain_20260920` 這份已經確認受污染的 checkpoint，使用者明確指示**照舊用來做 avg FL 這一階段的量測，並在對應的 `avgFL.md` 報告裡誠實註明這個限制**，不因為發現問題就整個作廢重訓（重訓一次是數小時等級的成本，使用者判斷這次先如實記錄限制、後續有需要再回頭補一次乾淨訓練即可）。PF 本身的量測不受影響（PF 不依賴任何 DRL 訓練資料），沿用同一批乾淨的 v2 結果。

@@ -7,6 +7,16 @@
 > 相關文件：`DRL_DESIGN.md`（Local 端現行架構的完整技術細節，本文件第一部分是濃縮摘要 +
 > 開發流程，細節以 `DRL_DESIGN.md` 為準）、`PHASE5_GLOBAL_DEV_LOG.md`（2026-07-01~07-06
 > Global 基礎架構開發紀錄，本文件第二部分是在那份基礎上的方法論擴充）。
+>
+> **2026-09-18 補記（MODEL_ARCH 開關，不是走回頭路）**：下方 §2.3「Actor/Critic
+> 從 MLP 改成 GRU」的決策記錄本身仍然成立、不撤回——GRU 確實解決了文中描述的
+> POMDP 問題。但 CLAUDE.md 五階段路線圖的「最基礎 DRL」（Stage 2~4）定義是在
+> GRU 已完成兩個月後才補上的，從未把「要不要含 GRU」納入考慮，兩邊對不起來，
+> 導致 Stage 2/3 已完成的結果其實是用非預期架構跑的。討論後決定不整個撤銷
+> GRU（未來改良版或其他研究仍可能用到），改成 `drl_agent.py` 的 `MODEL_ARCH`
+> 環境變數開關（"mlp"｜"gru"，比照 `REWARD_MODE` 模式），Stage 2~4 預設
+> `MODEL_ARCH=mlp`。詳見 `DRL_DESIGN.md` 檔頭補記與 `drl_agent.py` 模組
+> docstring。
 
 ---
 

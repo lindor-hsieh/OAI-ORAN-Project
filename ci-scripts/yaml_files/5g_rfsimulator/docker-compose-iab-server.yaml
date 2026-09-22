@@ -102,6 +102,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node1:/app/models
@@ -143,6 +144,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node2:/app/models
@@ -184,6 +186,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node3:/app/models
@@ -225,6 +228,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node4:/app/models
@@ -266,6 +270,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node5:/app/models
@@ -307,6 +312,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node6:/app/models
@@ -348,6 +354,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node7:/app/models
@@ -389,6 +396,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node8:/app/models
@@ -430,6 +438,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node9:/app/models
@@ -471,6 +480,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node10:/app/models
@@ -512,6 +522,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node11:/app/models
@@ -553,6 +564,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - /tmp:/tmp
             - inference_models_node12:/app/models
@@ -625,6 +637,7 @@ services:
             PYTHONUNBUFFERED: "1"
             FL_NUM_NODES: "12"
             FL_MODE: "${FL_MODE:-avg}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR_NODE1: "/app/models_node1"
@@ -682,6 +695,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node1:/app/models
         command:
@@ -707,6 +721,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node2:/app/models
         command:
@@ -732,6 +747,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node3:/app/models
         command:
@@ -757,6 +773,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node4:/app/models
         command:
@@ -782,6 +799,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node5:/app/models
         command:
@@ -807,6 +825,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node6:/app/models
         command:
@@ -832,6 +851,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node7:/app/models
         command:
@@ -857,6 +877,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node8:/app/models
         command:
@@ -882,6 +903,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node9:/app/models
         command:
@@ -907,6 +929,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node10:/app/models
         command:
@@ -932,6 +955,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node11:/app/models
         command:
@@ -957,6 +981,7 @@ services:
             MONGO_DB: "iab_xapp"
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            MODEL_ARCH: "${MODEL_ARCH:-mlp}"
         volumes:
             - inference_models_node12:/app/models
         command:

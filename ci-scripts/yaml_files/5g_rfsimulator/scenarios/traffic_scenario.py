@@ -459,6 +459,39 @@ def scenario_d_random(ues: list[UEConfig]) -> list[tuple[int, float]]:
     return configs
 
 
+# ── Scenario T（分層交叉：低/中/高流量 × 低/中/高路徑損耗，2026-09-18 新增）──
+# high tier 刻意遠高於單一 UE 實測可達吞吐量（理論峰值 227Mbps，多跳實測約
+# 43.8Mbps，見 CLAUDE.md 第 2 節），確保訓練資料涵蓋「需求真的超過供給」的
+# 壅塞狀態，不是只有溫和對比。
+TRAFFIC_TIERS: dict[str, float] = {"low": 5.0, "medium": 25.0, "high": 120.0}
+PLOSS_TIERS: dict[str, float] = {"low": 3.0, "medium": 12.0, "high": 22.0}
+TIER_COMBOS: list[tuple[str, str]] = [(t, p) for t in TRAFFIC_TIERS for p in PLOSS_TIERS]
+
+
+def scenario_t_tiered(ues: list[UEConfig], phase_index: int) -> list[tuple[float, float]]:
+    """
+    場景 T：流量（低/中/高）× 路徑損耗（低/中/高）3x3 交叉設計。
+
+    動機：Scenario R 的 profile 設計（heavy/light/bursty）與既有 A/B/C/D 都沒有
+    真正「把頻寬塞滿」的高負載條件，且 R 的 light/bursty profile 佔比高、
+    閒置機率不低，長時間收斂訓練下發現 reward 訊號量級普遍偏小、對雜訊敏感
+    （見 HISTORY.md 2026-09-18 條目）。這裡改用明確的 3x3 交叉設計覆蓋低/中/
+    高負載 × 低/中/高通道品質的組合空間，不含閒置機率——閒置狀態的訓練資料
+    交給 Scenario R 分擔，T 專注在「有真實流量時」這個子空間。
+
+    每個 phase 把 9 種組合依 (UE 索引 + phase_index) 錯開分配給所有 UE：
+    同一個 phase 內不同 UE 拿到不同組合（同時間的狀態多樣性），且隨 phase
+    推進輪替（每個 UE 長期下來會經歷全部 9 種組合，不會卡在同一種）。
+    """
+    configs: list[tuple[float, float]] = []
+    n_combos = len(TIER_COMBOS)
+    for i, _ in enumerate(ues):
+        combo_idx = (i + phase_index) % n_combos
+        traffic_name, ploss_name = TIER_COMBOS[combo_idx]
+        configs.append((PLOSS_TIERS[ploss_name], TRAFFIC_TIERS[traffic_name]))
+    return configs
+
+
 def _rng_for(seed: int, global_id: int, phase_index: int) -> random.Random:
     """
     決定式導出 (seed, global_id, phase_index) 專屬的 RNG 實例。
@@ -805,9 +838,11 @@ def parse_args() -> argparse.Namespace:
              "未指定時嘗試從 hostname 猜測，猜不出來則控制全部 17 個 UE（單機測試用）。",
     )
     parser.add_argument(
-        "--scenario", choices=["A", "B", "C", "D", "R"], default="R",
+        "--scenario", choices=["A", "B", "C", "D", "R", "T"], default="R",
         help="場景選擇：A=CQI差異, B=流量不均, C=最差公平性, D=均勻隨機（已被R取代）, "
-             "R=真實隨機（預設，area-uniform path_loss + 持久化 profile + 協定混合）",
+             "R=真實隨機（預設，area-uniform path_loss + 持久化 profile + 協定混合）, "
+             "T=分層交叉（低/中/高流量 × 低/中/高路徑損耗 3x3，2026-09-18 新增，"
+             "見 scenario_t_tiered() 說明）",
     )
     parser.add_argument(
         "--duration", type=int, default=1800,
@@ -865,6 +900,17 @@ def main() -> None:
 
     if args.scenario == "D":
         run_dynamic_scenario(ues, ctrls, phase_duration=args.phase_duration)
+    elif args.scenario == "T":
+        FIXED_EPOCH = 1700000000.0  # 同 Scenario R 用的錨點，純粹是絕對時間基準，兩者不衝突
+        run_dynamic_scenario(
+            ues, ctrls,
+            phase_duration=args.phase_duration,
+            phase_fn=scenario_t_tiered,
+            raw_path_loss=True,
+            scenario_label="T",
+            max_phases=args.num_phases,
+            epoch=FIXED_EPOCH,
+        )
     elif args.scenario == "R":
         import secrets
         seed = args.seed if args.seed is not None else secrets.randbits(32)

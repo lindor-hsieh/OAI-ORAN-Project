@@ -60,6 +60,18 @@ TRAIN_EPOCHS_PER_ROUND: int = 10    # 每輪訓練的梯度更新次數
 EXPLORE_PROB: float = 0.30          # 啟發式階段 Dirichlet 隨機探索的比例
 RELOAD_POLL_INTERVAL_S: float = 30.0  # 檢查磁碟 checkpoint 是否被 FL ClientApp 更新的輪詢間隔
 
+# 2026-09-18 新增：_prev_ues 新鮮度門檻（秒）。正常穩態下連續兩次 ZMQ 請求間隔
+# 是有效控制週期 100ms（見 CLAUDE.md 第 7 節），這裡抓 2.0s（20 倍餘裕）純粹是
+# 為了跟「FlexRIC/DU 崩潰後完整重啟」這種數量級（分鐘）的中斷做區隔，不會誤觸
+# 發到任何正常的排程抖動或 GC pause。訓練管線（training_pipeline.py 的
+# docstring）原本就把「資料新鮮度判斷（staleness guard）」列為要留給呼叫端
+# （也就是這裡）處理的責任，但先前一直沒有真的實作——DU 崩潰重啟後 RNTI 會
+# 重新分配，若沒有這道防線，_build_rl_experience() 會用崩潰前的 (state, action)
+# 搭配崩潰後完全不相關的一組新 UE 計算 reward，reward_calculator.py 的
+# alloc_map.get(rnti, 1) 找不到匹配的舊 RNTI 時會悄悄假設 PRB=1，產生一筆嫁接
+# 兩個不相關時間點的假經驗，混進訓練資料。
+STALE_PREV_UES_THRESHOLD_S: float = 2.0
+
 
 # =============================================================================
 # InferenceServer
@@ -135,6 +147,7 @@ class InferenceServer:
         self._prev_state_vec: Optional[np.ndarray] = None
         self._prev_mask_vec: Optional[np.ndarray] = None
         self._prev_action_ratios: Optional[np.ndarray] = None
+        self._prev_ts: Optional[float] = None   # 見 STALE_PREV_UES_THRESHOLD_S 說明
 
         # 統計計數器
         self._total_inferences: int = 0
@@ -340,6 +353,12 @@ class InferenceServer:
         if "test_actor_loss" in metrics and (t_aloss - tr_aloss) > 0.3:
             overfit_flag = " ⚠ OVERFIT"
 
+        # train_n/test_n 欄位名稱依 MODEL_ARCH 而異（mlp: n_train_exp/n_test_exp；
+        # gru: n_train_seq/n_test_seq），iab/check_convergence.py 的 LOG_LINE_RE
+        # 只認 "train_n=.../test_n=..." 這個輸出格式，跟哪個 arch 無關，所以這裡
+        # 統一取其中有值的那組，不依 arch 分支。
+        train_n = metrics.get("n_train_exp", metrics.get("n_train_seq", 0))
+        test_n = metrics.get("n_test_exp", metrics.get("n_test_seq", 0))
         self._log.info(
             "訓練完成 %d epochs | step=%d "
             "train[actor=%.4f critic=%.4f entropy=%.4f reward=%.4f] "
@@ -355,8 +374,8 @@ class InferenceServer:
             metrics.get("test_critic_loss", 0),
             metrics.get("test_entropy", 0),
             metrics.get("test_mean_reward", 0),
-            metrics.get("n_train_seq", 0),
-            metrics.get("n_test_seq", 0),
+            train_n,
+            test_n,
             overfit_flag,
             self._drl_inferences,
             self._heuristic_inferences,
@@ -652,8 +671,27 @@ class InferenceServer:
                     # DRL_DESIGN.md／snuggly-weaving-twilight 計畫）；
                     # 只在 UE 完全消失（xApp 重連後的空白 state）時才跳過，
                     # 這種情況下 prev/curr 不是同一組 UE，reward 沒有意義。
+                    #
+                    # 新鮮度檢查（STALE_PREV_UES_THRESHOLD_S，見上方常數說明）：
+                    # 即使 ues 非空，若跟上一筆請求的時間差超過門檻，代表中間
+                    # 發生過中斷（典型情境：FlexRIC/DU 崩潰後完整重啟，RNTI
+                    # 重新分配），prev_ues 描述的是一組已經不存在的 UE，不能
+                    # 拿來跟 curr_ues 配對計算 reward——即使兩邊剛好有 UE
+                    # 數量相同也一樣，RNTI 對不上就是對不上。
+                    is_stale = (
+                        self._prev_ts is not None
+                        and (t_recv - self._prev_ts) > STALE_PREV_UES_THRESHOLD_S
+                    )
+                    if is_stale:
+                        self._log.warning(
+                            "偵測到 %.1fs 的請求中斷（> %.1fs 門檻），視為連線中斷後重新開始，"
+                            "捨棄上一筆暫存狀態，不計算這一步的 reward",
+                            t_recv - self._prev_ts, STALE_PREV_UES_THRESHOLD_S,
+                        )
+
                     if (
-                        self._prev_ues is not None
+                        not is_stale
+                        and self._prev_ues is not None
                         and self._prev_allocations is not None
                         and len(ues) > 0
                     ):
@@ -681,6 +719,7 @@ class InferenceServer:
                             )
                         )
                         self._prev_action_ratios = action_ratios
+                        self._prev_ts = t_recv
                     else:
                         # 無活躍 UE 時清除暫存，避免跨不同 UE 組合計算獎勵。
                         # 這是真正的 UE 斷線（而非流量閒置——閒置時 ues 仍
@@ -688,6 +727,7 @@ class InferenceServer:
                         # 避免舊 UE 組合的記憶污染下一組完全不同的 UE。
                         self._prev_ues = None
                         self._prev_allocations = None
+                        self._prev_ts = None
                         self._agent.reset_hidden()
 
                     # ── 回傳結果（必須在 5ms 內完成）────────────────────

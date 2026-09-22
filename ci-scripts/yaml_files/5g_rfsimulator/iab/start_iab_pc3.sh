@@ -210,6 +210,45 @@ reassert_mt_routes() {
     done
 }
 
+# [2026-09-18 新增] 見 start_iab_pc2.sh 同名函式的說明：UE 自己的預設路由
+# 偶爾會在 PDU session 自發重建後消失，reassert_mt_routes/reapply_dnat_rules
+# 都不會動到 UE 容器本身，補進自我修復迴圈。
+fix_ue_default_routes() {
+    for i in "$@"; do
+        docker exec -u 0 "rfsim5g-end-ue-${i}" ip route replace default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+    done
+}
+
+# [2026-09-18 新增] Random Access process pool 耗盡（OAI 內部固定 4 格陣列，
+# gNB_scheduler_RA.c:719 "no free RA process"）是一種路由/DNAT 重新斷言完全
+# 救不回來的獨立崩潰模式，本次 session 手動排查 PC3 Node9~12 卡住時就是這個
+# 根因（連續 errno(111) connection refused，`docker restart rfsim5g-iab-du-3`/
+# `rfsim5g-iab-du-4` 才真正解決）。PC3 的 4 個 access DU（rfsim5g-iab-du-9~12）
+# 在本機，可以直接檢查；但它們的 parent relay（Node3,4）在 PC2，PC3 這裡連不通
+# 時也可能是 PC2 端那兩個 relay DU 的 RA pool 耗盡，一併透過 SSH 檢查修復。
+heal_ra_exhaustion_local() {
+    for du in rfsim5g-iab-du-9 rfsim5g-iab-du-10 rfsim5g-iab-du-11 rfsim5g-iab-du-12; do
+        local hits
+        hits=$(docker logs --since 90s "$du" 2>&1 | grep -c "no free RA process" || true)
+        if [ "${hits:-0}" -gt 0 ]; then
+            echo -e "   ${YELLOW}[RA-HEAL] $du 偵測到 RA process pool 耗盡（${hits} 次），重啟...${NC}"
+            docker restart "$du" >/dev/null 2>&1
+            sleep 10
+        fi
+    done
+    # parent relay Node3,4 在 PC2，跨主機檢查（跟本檔案其餘跨主機操作用同一組 SSH_OPTS）
+    for du in rfsim5g-iab-du-3 rfsim5g-iab-du-4; do
+        local check="docker logs --since 90s $du 2>&1 | grep -c 'no free RA process' || true"
+        local hits
+        hits=$(ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} "$check" 2>/dev/null)
+        if [ "${hits:-0}" -gt 0 ]; then
+            echo -e "   ${YELLOW}[RA-HEAL] $du（PC2）偵測到 RA process pool 耗盡（${hits} 次），重啟...${NC}"
+            ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} "docker restart $du" 2>/dev/null
+            sleep 10
+        fi
+    done
+}
+
 verify_and_heal_ues() {
     # 自我修復迴圈，同 start_iab_pc2.sh 的版本，這裡管 UE9~16。
     local ues=(9 10 11 12 13 14 15 16)
@@ -228,6 +267,10 @@ verify_and_heal_ues() {
         echo -e "   ${YELLOW}[HEAL] 第 ${attempt} 次檢查發現連通性異常，重新斷言路由/DNAT 規則後等待重試...${NC}"
         reassert_mt_routes
         reapply_dnat_rules
+        fix_ue_default_routes "${ues[@]}"
+        if [ "$attempt" -ge 3 ]; then
+            heal_ra_exhaustion_local
+        fi
         sleep 15
     done
     echo -e "   ${RED}[HEAL] 重試 5 次後仍有 UE 連不通，需要人工檢查${NC}"

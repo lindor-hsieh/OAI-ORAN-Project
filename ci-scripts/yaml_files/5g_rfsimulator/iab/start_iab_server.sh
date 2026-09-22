@@ -248,6 +248,32 @@ reassert_local_access_dnat_and_routes() {
     done
 }
 
+# [2026-09-18 新增] 見 start_iab_pc2.sh 同名函式的說明：UE 自己的預設路由
+# 偶爾會在 PDU session 自發重建後消失，reassert_local_access_dnat_and_routes
+# 都不會動到 UE 容器本身，補進自我修復迴圈。
+fix_ue_default_routes() {
+    for i in "$@"; do
+        docker exec -u 0 "rfsim5g-end-ue-${i}" ip route replace default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+    done
+}
+
+# [2026-09-18 新增] Random Access process pool 耗盡（OAI 內部固定 4 格陣列，
+# gNB_scheduler_RA.c:719 "no free RA process"）是一種路由/DNAT 重新斷言完全
+# 救不回來的獨立崩潰模式——子節點會卡在 PRACH/RAR 重試迴圈，直到該 DU 被
+# 重啟為止（見 HISTORY.md 2026-09-18 Node2 案例）。這裡本機直接檢查 Node2
+# (relay) + Node7,8(access) 三個 DU 的 log，有就重啟，5~10 秒即可恢復。
+heal_ra_exhaustion_local() {
+    for du in rfsim5g-iab-du-2 rfsim5g-iab-du-7 rfsim5g-iab-du-8; do
+        local hits
+        hits=$(docker logs --since 90s "$du" 2>&1 | grep -c "no free RA process" || true)
+        if [ "${hits:-0}" -gt 0 ]; then
+            echo -e "   ${YELLOW}[RA-HEAL] $du 偵測到 RA process pool 耗盡（${hits} 次），重啟...${NC}"
+            docker restart "$du" >/dev/null 2>&1
+            sleep 10
+        fi
+    done
+}
+
 verify_and_heal_local_ues() {
     # 自我修復迴圈，同 start_iab_pc2.sh/start_iab_pc3.sh 的版本，這裡管 UE5~8。
     local ues=(5 6 7 8)
@@ -265,6 +291,10 @@ verify_and_heal_local_ues() {
         fi
         echo -e "   ${YELLOW}[HEAL] 第 ${attempt} 次檢查發現連通性異常，重新斷言路由/DNAT 規則後等待重試...${NC}"
         reassert_local_access_dnat_and_routes
+        fix_ue_default_routes "${ues[@]}"
+        if [ "$attempt" -ge 3 ]; then
+            heal_ra_exhaustion_local
+        fi
         sleep 15
     done
     echo -e "   ${RED}[HEAL] 重試 5 次後仍有 UE 連不通，需要人工檢查${NC}"
@@ -304,6 +334,34 @@ INF_SERVICES=""
 for i in $NODES; do INF_SERVICES="$INF_SERVICES inference-node${i}"; done
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d $INF_SERVICES
 sleep 3
+
+# [2026-09-18 新增] 陷阱記錄：這支腳本開頭的 `docker compose down`（無 --profile）
+# 會連 stage2-fl profile 的服務（flower-superlink/supernode-nodeN/scheduler/
+# global-xapp）一起清掉，但上面這行 plain `up -d $INF_SERVICES` 呼叫的 shell
+# 環境如果沒有帶 REWARD_MODE/MODEL_ARCH，docker compose 會悄悄套用 compose 檔
+# 裡的預設值（REWARD_MODE 預設是 lagrangian，不是訓練中實際要用的模式！），且
+# stage2-fl 服務完全不會被帶回來——這支腳本本身不知道現在是哪個 stage。
+# training_watchdog.sh 的 full_recovery() 原本就有一段「主動覆蓋一次」的保護，
+# 但那只在透過 watchdog 呼叫時才生效；直接執行這支腳本（例如乾淨重啟）完全
+# 沒有這層保護，2026-09-18 現場就因為直接執行踩到這個坑（REWARD_MODE 悄悄變
+# lagrangian、污染了新寫入的經驗，且 FL 服務整層消失）。這裡比照
+# training_watchdog.sh 的做法，主動用環境變數（或安全預設值）覆蓋一次，並在
+# stage2-fl 服務先前有在跑（用 docker ps -a 判斷該服務容器是否存在過）時，
+# 用正確的環境變數重新帶回來。
+REWARD_MODE="${REWARD_MODE:-throughput_only}"
+MODEL_ARCH="${MODEL_ARCH:-mlp}"
+FL_MODE="${FL_MODE:-avg}"
+echo -e "${CYAN}[4/7] 主動用 REWARD_MODE=${REWARD_MODE} MODEL_ARCH=${MODEL_ARCH} 覆蓋一次 inference-nodeN（防止悄悄套用 compose 預設值）...${NC}"
+REWARD_MODE="$REWARD_MODE" MODEL_ARCH="$MODEL_ARCH" \
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d --force-recreate $INF_SERVICES
+sleep 3
+
+if docker ps -a --format '{{.Names}}' | grep -q '^flower-superlink$'; then
+    echo -e "${CYAN}[4/7] 偵測到 stage2-fl 服務先前有跑過，用 FL_MODE=${FL_MODE} MODEL_ARCH=${MODEL_ARCH} 一併帶回來...${NC}"
+    FL_MODE="$FL_MODE" MODEL_ARCH="$MODEL_ARCH" \
+        $DOCKER_COMPOSE -f $COMPOSE_FILE --profile stage2-fl up -d --force-recreate \
+        global-xapp flower-superlink flower-supernode-node{1..12} flower-scheduler
+fi
 
 for i in $NODES; do
     STATUS=$(docker logs inference-node${i} 2>&1 | grep "已綁定" | tail -1)

@@ -1,5 +1,21 @@
 # Local xApp DRL 設計文件
 
+> **2026-09-18 更新（MODEL_ARCH 開關）**：本文件 §6.1／§6.1.1／§6.1.2 描述的
+> MLP→GRU 改版決策記錄維持不變（GRU 確實在 2026-07-09 引入、原因如文件所述），
+> 但架構本身**不再是單向、不可逆的變更**——`drl_agent.py` 現在用
+> `MODEL_ARCH` 環境變數（"mlp"｜"gru"，預設 "mlp"，比照 `REWARD_MODE` 的既有
+> 模式）在兩套網路架構之間切換，兩者並存於同一份程式碼（`ActorNetworkMLP`／
+> `CriticNetworkMLP` vs `ActorNetworkGRU`／`CriticNetworkGRU`）。
+>
+> **原因**：CLAUDE.md 五階段路線圖的「最基礎 DRL」（Stage 2~4）原意是不含
+> GRU 的陽春模型，但這份定義是在 GRU 已經完成兩個月後才補上的，兩者互相沒
+> 對齊，導致 Stage 2/3 已完成的結果其實是用錯誤架構跑的。2026-09-18 討論後
+> 決定：不整個拔掉 GRU（未來改良版或其他研究仍可能用到），改成環境變數開關。
+> Stage 2~4 預設 `MODEL_ARCH=mlp`；下方 §6.1 起的序列化訓練機制
+> （`fetch_sequences()`／`TRAIN_SEQ_LEN`／`TRAIN_SEQ_COUNT`）**僅在
+> `MODEL_ARCH=gru` 時適用**，`mlp` 模式下訓練退回打散抽樣的 i.i.d. 獨立經驗
+> （`training_pipeline.fetch_experiences()`），不受序列連續性門檻限制。
+
 ## 1. 系統定位
 
 每個 IAB Node（共 5 個）部署一個獨立的 **Local xApp**，負責該節點的下行 PRB 資源分配。

@@ -11,8 +11,15 @@ training_pipeline.py — 共用的 DRL 訓練流程（MongoDB 讀取 → Actor-C
 不負責：MongoDB 寫入緩衝區 flush、資料新鮮度判斷（staleness guard）、模型存檔——
 這些跟呼叫端各自的執行環境（常駐迴圈 vs 一次性 subprocess）綁定，留給呼叫端處理。
 
-2026-07-09：從「打散抽樣獨立經驗」改成「抓時間連續的經驗序列」，配合 drl_agent.py
-的 GRU 架構——GRU 需要序列內部真的有時間上的先後關係，才有記憶可學。
+2026-09-18：依 drl_agent.py 的 MODEL_ARCH 開關分派兩種資料抓取方式：
+  - MODEL_ARCH=mlp（Stage 2~4 預設）：fetch_experiences()，打散抽樣獨立經驗，
+    不要求時間連續性，門檻只看 MIN_TRAIN_EXPERIENCES 原始經驗數。
+  - MODEL_ARCH=gru：fetch_sequences()（2026-07-09 為配合 GRU 架構導入，GRU
+    需要序列內部真的有時間上的先後關係，才有記憶可學），額外要求切出足夠的
+    時間連續序列。
+run_training_round() 依 agent.arch 決定呼叫哪一個、餵給 agent.train_on_batch()
+的資料形狀也跟著不同（agent.train_on_batch() 內部依 agent.arch 再分派一次，
+見 drl_agent.py）。
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ from typing import Optional
 import numpy as np
 import pymongo
 
-from drl_agent import DRLAgent, MIN_TRAIN_EXPERIENCES, TRAIN_SEQ_LEN, TRAIN_SEQ_COUNT
+from drl_agent import DRLAgent, MIN_TRAIN_EXPERIENCES, TRAIN_BATCH_SIZE, TRAIN_SEQ_LEN, TRAIN_SEQ_COUNT
 
 TRAIN_FETCH_LIMIT: int = 2000
 TRAIN_EPOCHS_PER_ROUND: int = 10
@@ -53,6 +60,42 @@ def _is_contiguous(doc_a: dict, doc_b: dict) -> bool:
     return doc_a.get("next_state_vec") == doc_b.get("state_vec")
 
 
+def fetch_experiences(
+    mongo_col: pymongo.collection.Collection,
+    fetch_limit: int = TRAIN_FETCH_LIMIT,
+    log: Optional[logging.Logger] = None,
+) -> list[dict]:
+    """
+    從 MongoDB 讀取最近 fetch_limit 筆經驗（打散抽樣用，MODEL_ARCH=mlp 專用）。
+
+    跟 fetch_sequences() 不同，這裡不要求時間連續性、不切窗——MLP 是無記憶的
+    單步模型，訓練時每筆經驗獨立看待即可，門檻只看原始經驗數
+    （MIN_TRAIN_EXPERIENCES，run_training_round() 判斷）。
+
+    Returns:
+        experiences : 原始經驗 list[dict]（按時間升序）
+    """
+    try:
+        cursor = (
+            mongo_col
+            .find(
+                {"reward": {"$exists": True}, "next_state_vec": {"$exists": True}},
+                projection=_PROJECTION,
+            )
+            .sort("timestamp", pymongo.ASCENDING)
+            .limit(fetch_limit)
+        )
+        experiences = list(cursor)
+    except pymongo.errors.PyMongoError as exc:
+        if log:
+            log.warning("讀取訓練資料失敗: %s", exc)
+        return []
+
+    if log:
+        log.info("讀取到 %d 筆原始經驗（打散抽樣，MLP）", len(experiences))
+    return experiences
+
+
 def fetch_sequences(
     mongo_col: pymongo.collection.Collection,
     fetch_limit: int = TRAIN_FETCH_LIMIT,
@@ -60,8 +103,9 @@ def fetch_sequences(
     log: Optional[logging.Logger] = None,
 ) -> tuple[list[list[dict]], int]:
     """
-    從 MongoDB 讀取最近 fetch_limit 筆經驗（按時間升序），切成一段一段時間上
-    連續的「運行」（run），每段運行再切成長度 seq_len、彼此不重疊的定長序列。
+    MODEL_ARCH=gru 專用。從 MongoDB 讀取最近 fetch_limit 筆經驗（按時間升序），
+    切成一段一段時間上連續的「運行」（run），每段運行再切成長度 seq_len、
+    彼此不重疊的定長序列。
 
     不重疊視窗（stride=seq_len）是刻意的：訓練時要以「整個序列」為單位做
     train/test 切分避免洩漏——重疊視窗會共享大部分時間步，會讓切分後的
@@ -124,27 +168,92 @@ def run_training_round(
     lock: Optional[threading.Lock] = None,
 ) -> dict:
     """
+    依 agent.arch 分派：MODEL_ARCH=mlp 呼叫 _run_training_round_mlp()（打散
+    抽樣、無時間連續性要求）；MODEL_ARCH=gru 呼叫 _run_training_round_gru()
+    （時間連續序列）。兩者對外回傳 metrics dict 的核心欄位一致
+    （train_step/actor_loss/critic_loss/entropy/mean_reward/mean_adv/lambda/
+    batch_jfi_mean/test_* 等），只有訓練樣本計數欄位不同（mlp: n_train_exp/
+    n_test_exp；gru: n_train_seq/n_test_seq/seq_len）。若資料不足或讀取失敗
+    則回傳 {}。**不呼叫 agent.save()**——由呼叫端決定何時、用什麼路徑存檔。
+
+    `lock`（選填）：只包住實際觸碰 agent 權重的梯度更新／評估段落，MongoDB
+    讀取與 train/test split 都在鎖外執行，見兩個實作各自的說明。
+    """
+    if agent.arch == "gru":
+        return _run_training_round_gru(agent, mongo_col, epochs, fetch_limit, min_experiences, log, lock)
+    return _run_training_round_mlp(agent, mongo_col, epochs, fetch_limit, min_experiences, log, lock)
+
+
+def _run_training_round_mlp(
+    agent: DRLAgent,
+    mongo_col: pymongo.collection.Collection,
+    epochs: int,
+    fetch_limit: int,
+    min_experiences: int,
+    log: Optional[logging.Logger],
+    lock: Optional[threading.Lock],
+) -> dict:
+    """
+    讀取打散的獨立經驗（fetch_experiences()）、8:2 切 train/test（以單筆經驗
+    為單位，i.i.d.，無時間步洩漏疑慮）、訓練 epochs 輪、於測試集評估。
+
+    門檻只看 MIN_TRAIN_EXPERIENCES 原始經驗數，不像 GRU 分支還要額外滿足
+    時間連續序列數——這是 MODEL_ARCH=mlp 訓練比 GRU 容易觸發的主因。
+    """
+    experiences = fetch_experiences(mongo_col, fetch_limit=fetch_limit, log=log)
+    n_raw = len(experiences)
+
+    if n_raw < min_experiences:
+        if log:
+            log.info("經驗數量不足 (需 %d 筆)，等待更多資料累積...", min_experiences)
+        return {}
+
+    n = len(experiences)
+    test_size = min(max(1, int(n * 0.2)), max(0, n - TRAIN_BATCH_SIZE))
+    test_idxs = set(np.random.choice(n, test_size, replace=False).tolist()) if test_size > 0 else set()
+    train_exp = [e for i, e in enumerate(experiences) if i not in test_idxs]
+    test_exp = [e for i, e in enumerate(experiences) if i in test_idxs]
+
+    last_metrics: dict = {}
+    for _ in range(epochs):
+        ctx = lock if lock is not None else contextlib.nullcontext()
+        with ctx:
+            m = agent.train_on_batch(train_exp)
+        if m:
+            last_metrics = m
+
+    if not last_metrics:
+        return {}
+
+    ctx = lock if lock is not None else contextlib.nullcontext()
+    with ctx:
+        test_metrics = agent.evaluate_on_batch(test_exp)
+
+    result: dict = dict(last_metrics)
+    result.update(test_metrics)
+    result["n_train_exp"] = len(train_exp)
+    result["n_test_exp"] = len(test_exp)
+    return result
+
+
+def _run_training_round_gru(
+    agent: DRLAgent,
+    mongo_col: pymongo.collection.Collection,
+    epochs: int,
+    fetch_limit: int,
+    min_experiences: int,
+    log: Optional[logging.Logger],
+    lock: Optional[threading.Lock],
+) -> dict:
+    """
     讀取近期時間連續的經驗序列（fetch_sequences()）、8:2 切 train/test（以
     序列為單位，避免時間步層級的洩漏）、訓練 epochs 輪、於測試集評估。
 
-    回傳合併後的 metrics dict（train_step/actor_loss/critic_loss/entropy/
-    mean_reward/mean_adv/lambda/batch_jfi_mean/n_sequences/seq_len 等訓練指標
-    + test_actor_loss/test_critic_loss/test_entropy/test_mean_reward 等測試
-    指標 + n_train_seq/n_test_seq 序列數）。若資料不足或讀取失敗則回傳 {}。
-    **不呼叫 agent.save()**——由呼叫端決定何時、用什麼路徑存檔（in-process
-    常駐迴圈 vs FL ClientApp 存檔時機不同）。
-
-    `lock`（選填）：只包住實際觸碰 agent 權重的梯度更新／評估段落，
-    MongoDB 讀取與 train/test split 都在鎖外執行。**鎖以每個 epoch 為單位
-    個別取得/釋放**（2026-07-09 GRU 改版後的修正，不是整個 epochs 迴圈包
-    一個鎖）：GRU 的 BPTT 反向傳播比舊版 MLP 重得多，若整段訓練迴圈共用
-    一個鎖，會讓等待中的近即時 infer() 卡到數秒（實測 3~4 秒），遠超 C
-    xApp 的 5ms REQ 逾時。拆成逐 epoch 鎖，讓 infer() 有機會在 epoch 邊界
-    插隊，總訓練時間不變，但不再是一整段連續的 DRL 空窗。呼叫端若在單一
-    process 內與其他執行緒共用同一個 agent（例如 InferenceServer 的近
-    即時 ZMQ 迴圈），應傳入該 process 的模型鎖；若 agent 在本次呼叫的
-    process 中是唯一擁有者（例如 FL ClientApp 的獨立 subprocess），可
-    省略此參數。
+    `lock`：**鎖以每個 epoch 為單位個別取得/釋放**（2026-07-09 GRU 改版後的
+    修正，不是整個 epochs 迴圈包一個鎖）：GRU 的 BPTT 反向傳播比 MLP 重得多，
+    若整段訓練迴圈共用一個鎖，會讓等待中的近即時 infer() 卡到數秒（實測
+    3~4 秒），遠超 C xApp 的 5ms REQ 逾時。拆成逐 epoch 鎖，讓 infer() 有
+    機會在 epoch 邊界插隊，總訓練時間不變，但不再是一整段連續的 DRL 空窗。
     """
     sequences, n_raw = fetch_sequences(mongo_col, fetch_limit=fetch_limit, log=log)
 
@@ -172,13 +281,6 @@ def run_training_round(
     train_seq = [s for i, s in enumerate(sequences) if i not in test_idxs]
     test_seq = [s for i, s in enumerate(sequences) if i in test_idxs]
 
-    # 鎖以「每個 epoch」為單位個別取得/釋放，不是整個 for 迴圈包一個鎖——
-    # GRU 的 BPTT 反向傳播比舊版 MLP 重得多，10 epoch 整段鎖住實測會讓
-    # ZMQ 主迴圈的 infer() 卡到 3~4 秒（2026-07-09 現場觀測），遠超 C xApp
-    # 的 5ms REQ 逾時，導致該整段訓練期間 DRL 完全失效、全部 fallback 回
-    # PF。改成每個 epoch 邊界釋放鎖，讓等待中的 infer() 有機會在 epoch
-    # 之間插隊，把「一次連續 3.5 秒斷線」攤成「每個 epoch 邊界各自的
-    # 較短延遲」，雖然總訓練時間不變，但不再是一整段連續空窗。
     last_metrics: dict = {}
     for _ in range(epochs):
         ctx = lock if lock is not None else contextlib.nullcontext()

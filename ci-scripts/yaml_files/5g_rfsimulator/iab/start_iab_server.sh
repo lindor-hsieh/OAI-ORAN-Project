@@ -1,12 +1,14 @@
 #!/bin/bash
 # PC 1: IAB Server Script (1 donor + 4 relay + 8 access + 17 UE 三主機版)
 #
-# 跟舊版(雙主機)最大的差異：Node1~4(relay) 全部搬到 PC2/PC3，PC1 不再啟動任何
-# relay MT/DU 容器，只負責 CN5G + FlexRIC + MongoDB + Donor CU/DU + 12 組
-# xApp/inference 容器(集中在 PC1，理由見 CLAUDE.md)。Donor DU 需要跨主機接受
-# 4 個 relay 節點的 rfsim client 連線，且 Donor CU 需要能路由到這 4 個 relay
-# 節點動態取得的 12.1.1.x tunnel IP —— 這跟舊版「CU DNAT 陷阱」是同一類問題，
-# 只是換成 relay 層、且 tunnel IP 現在要透過 SSH 去 PC2/PC3 查詢。
+# 2026-09-22 節點重分配：Node1~4(relay) 全部集中到 PC1（跟 Donor 同機），
+# 用來消除「跟 Donor 同主機的分支吞吐量系統性偏高」這個量測 confound（見
+# CLAUDE.md 第 1 節、HISTORY.md 對應條目）。PC1 現在不再啟動任何 access
+# 節點或 UE 容器（Node7,8+UE5~8 搬去 PC2），只負責 CN5G + FlexRIC +
+# MongoDB + Donor CU/DU + 全部 4 個 relay(Node1~4) + 12 組 xApp/inference
+# 容器。四個 relay 現在全部跟 CU 同機，設定 tunnel IP 路由完全是本機操作，
+# 不需要任何 SSH（舊版只有 Node2 是這樣，Node1/3/4 原本要靠 PC2/PC3 SSH
+# 通知 PC1，現在整層 SSH 通知機制都不需要了）。
 
 COMPOSE_FILE="docker-compose-iab-server.yaml"
 IFACE_NAME="enxc84d44350030"
@@ -16,13 +18,9 @@ PC2_IP="192.168.88.2"
 PC3_IP="192.168.88.3"
 UPF_IP="192.168.88.134"
 UE_TUNNEL_SUBNET="12.1.1.0/24"
-PC2_INTERNAL_SUBNET="192.168.74.0/24"   # Node5,6 (access, PC2)
+PC2_INTERNAL_SUBNET="192.168.74.0/24"   # Node5,6,7,8 (access, PC2)
 PC3_INTERNAL_SUBNET="192.168.75.0/24"   # Node9~12 (access, PC3)
 DN_CONTAINER="rfsim5g-oai-ext-dn"
-
-PC2_USER="mcalab"
-PC3_USER="lindor"
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes"
 
 if command -v docker-compose &> /dev/null; then DOCKER_COMPOSE="docker-compose"; else DOCKER_COMPOSE="docker compose"; fi
 
@@ -31,7 +29,7 @@ GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC
 # ==========================================
 # 1. 核心清理與 Docker 網路環境修復
 # ==========================================
-echo -e "${CYAN}[1/7] Clean Up...${NC}"
+echo -e "${CYAN}[1/6] Clean Up...${NC}"
 
 $DOCKER_COMPOSE -f $COMPOSE_FILE down 2>/dev/null
 
@@ -56,7 +54,7 @@ sudo ip link set $IFACE_NAME mtu 1350
 # ==========================================
 # 2. 設定 Macvlan 與魔法路由 (PC2/PC3 各自的 internal 子網分開路由)
 # ==========================================
-echo -e "${CYAN}[2/7] Configuring Macvlan Bridge & Magic Routes...${NC}"
+echo -e "${CYAN}[2/6] Configuring Macvlan Bridge & Magic Routes...${NC}"
 sudo ip link set $IFACE_NAME up
 sudo ip addr flush dev $IFACE_NAME 2>/dev/null || true
 
@@ -74,7 +72,7 @@ sudo ip route replace 192.168.88.128/25 dev macvlan-br
 # ==========================================
 # 3. 啟動 O-RAN 核心網與 Donor-CU/DU
 # ==========================================
-echo -e "${CYAN}[3/7] Starting OAI Core, FlexRIC & MongoDB...${NC}"
+echo -e "${CYAN}[3/6] Starting OAI Core, FlexRIC & MongoDB...${NC}"
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d mysql oai-amf oai-smf oai-upf oai-ext-dn oai-flexric mongodb
 
 echo -e "${YELLOW}Waiting for MongoDB to be ready...${NC}"
@@ -90,18 +88,19 @@ sleep 15
 $DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-donor-du
 
 # ==========================================
-# 3.5 本機 RAN 節點：Node2(relay) + Node7,8(access) + UE5~8
-#   2026-09-12 因 PC2 CPU 資源競爭導致 relay MT 反覆斷線重連（見
-#   HISTORY.md），把這組子樹從 PC2 搬來 PC1 分擔負載。跟 PC2/PC3 的
-#   configure_and_start_relay()/configure_and_start_access_du() 邏輯完全
-#   相同，差別只在於 CU 就在本機，所有原本要 SSH 過去下的指令改成直接
-#   本機執行，不需要 SSH。
+# 3.5 本機 RAN 節點：Node1,2,3,4（全部 relay，2026-09-22 集中到 PC1）
+#   CU 就在本機，四個 relay 的 tunnel IP 路由設定全部是本機操作，不需要
+#   SSH。一個一個依序啟動並等待穩定，避免「relay 還沒真的穩定，下一個就
+#   搶著啟動」造成 CU stale F1 association 骨牌效應（同 PC2/PC3 舊版的
+#   教訓，見 CLAUDE.md 第 7 節排查指南）。
 # ==========================================
-echo -e "${CYAN}[3.5/7] Launching Local RAN Nodes: Node2(relay) + Node7,8(access) + UE5~8...${NC}"
+echo -e "${CYAN}[3.5/6] Launching Local Relay Nodes: Node1,2,3,4...${NC}"
+
+declare -A RELAY_MACVLAN=( [1]="192.168.88.150" [2]="192.168.88.151" [3]="192.168.88.152" [4]="192.168.88.153" )
 
 configure_and_start_local_relay() {
     local N=$1
-    local MACVLAN_IP=$2
+    local MACVLAN_IP="${RELAY_MACVLAN[$N]}"
     local MT_NAME="rfsim5g-iab-mt-${N}"
     local DU_NAME="rfsim5g-iab-du-${N}"
 
@@ -127,56 +126,6 @@ configure_and_start_local_relay() {
         && echo -e "   ${GREEN}本機路由已更新：${MT_TUNNEL_IP} via ${MACVLAN_IP}${NC}"
 }
 
-configure_and_start_local_access_du() {
-    local MT_NAME=$1
-    local DU_NAME=$2
-    local DU_DOCKER_IP=$3
-
-    echo -e "\n${GREEN}[Action] Setting up network for $DU_NAME ($DU_DOCKER_IP)${NC}"
-
-    local MT_TUNNEL_IP=$(docker exec $MT_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-
-    # CU 就在本機，直接下 DNAT 指令，不需要 SSH 通知
-    docker exec -u 0 rfsim5g-donor-cu iptables -t nat -I OUTPUT 1 -d $DU_DOCKER_IP -p udp --dport 2152 -j DNAT --to-destination $MT_TUNNEL_IP \
-        && echo -e "   ${GREEN}CU DNAT rule applied: $DU_DOCKER_IP → $MT_TUNNEL_IP${NC}"
-
-    docker exec -u 0 $MT_NAME sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    docker exec -u 0 $MT_NAME iptables -t nat -F PREROUTING
-    docker exec -u 0 $MT_NAME iptables -t nat -F POSTROUTING
-    docker exec -u 0 $MT_NAME conntrack -F 2>/dev/null || true
-    docker exec -u 0 $MT_NAME iptables -t nat -A POSTROUTING -s $DU_DOCKER_IP -o oaitun_ue1 -j MASQUERADE
-    docker exec -u 0 $MT_NAME iptables -t nat -A PREROUTING -i oaitun_ue1 -p sctp -j DNAT --to-destination $DU_DOCKER_IP
-    docker exec -u 0 $MT_NAME iptables -t nat -A PREROUTING -i oaitun_ue1 -p udp --dport 2152 -j DNAT --to-destination $DU_DOCKER_IP
-
-    docker exec -u 0 $MT_NAME ip route replace 192.168.71.0/24 via 12.1.1.1 dev oaitun_ue1
-    docker exec -u 0 $MT_NAME ip route replace 192.168.72.0/24 via 12.1.1.1 dev oaitun_ue1
-
-    docker exec -u 0 $MT_NAME ethtool -K oaitun_ue1 tx off 2>/dev/null || true
-    docker exec -u 0 $MT_NAME ip link set oaitun_ue1 mtu 1300 2>/dev/null
-
-    docker exec -u 0 $MT_NAME ip route del default 2>/dev/null || true
-    docker exec -u 0 $MT_NAME ip route add default via 12.1.1.1 dev oaitun_ue1
-
-    echo "   -> [Docker] Starting DU: $DU_NAME"
-    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d --force-recreate $DU_NAME
-
-    local _wait=0
-    until docker exec -u 0 "$DU_NAME" true 2>/dev/null; do
-        sleep 1; _wait=$((_wait+1))
-        [ $_wait -ge 20 ] && { echo -e "   ${RED}警告：$DU_NAME 等待逾時${NC}"; break; }
-    done
-
-    local MT_INTERNAL_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' $MT_NAME | grep '192.168.76' | head -n 1 | xargs)
-
-    docker exec -u 0 $DU_NAME ip route replace 192.168.88.1 via 192.168.76.1 2>/dev/null
-    docker exec -u 0 $DU_NAME ip route replace 192.168.71.0/24 via $MT_INTERNAL_IP 2>/dev/null
-    docker exec -u 0 $DU_NAME ip route replace 192.168.72.0/24 via $MT_INTERNAL_IP 2>/dev/null
-    docker exec -u 0 $DU_NAME ip route replace 12.1.1.0/24 via $MT_INTERNAL_IP 2>/dev/null
-
-    echo -e "${YELLOW} Waiting 10s for CU F1AP stability...${NC}"
-    sleep 10
-}
-
 wait_for_local_relay_du_healthy() {
     local DU_NAME=$1
     local COUNT=0
@@ -200,70 +149,17 @@ wait_for_local_relay_du_healthy() {
         sleep 3
         COUNT=$((COUNT+1))
     done
-    echo -e "   ${RED}$DU_NAME 逾時仍未穩定，access node 可能連不上，請檢查${NC}"
+    echo -e "   ${RED}$DU_NAME 逾時仍未穩定，下游節點可能連不上，請檢查${NC}"
     return 1
 }
 
-wait_for_local_ue() {
-    local UE_NAME=$1
-    echo -n "   -> Checking $UE_NAME... "
-    local IP=""; local COUNT=0
-    while [ -z "$IP" ]; do
-        sleep 2
-        IP=$(docker exec $UE_NAME ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-        echo -n "."
-        COUNT=$((COUNT+1))
-        [ $COUNT -ge 30 ] && break
-    done
-    if [ ! -z "$IP" ]; then
-        echo -e "${GREEN} Attached! ($IP)${NC}"
-        docker exec -u 0 $UE_NAME ip link set oaitun_ue1 mtu 1200 2>/dev/null
-        docker exec -u 0 $UE_NAME ip route replace default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
-    else
-        echo -e "${RED} Not Found${NC}"
-    fi
-}
-
-$DOCKER_COMPOSE -f $COMPOSE_FILE up -d rfsim5g-iab-mt-2
-configure_and_start_local_relay 2 192.168.88.151
-wait_for_local_relay_du_healthy rfsim5g-iab-du-2
-
-declare -A LOCAL_ACCESS_DU_IP=( [7]="192.168.76.12" [8]="192.168.76.13" )
-declare -A LOCAL_ACCESS_MT_NAME=( [7]="rfsim5g-iab-mt-7" [8]="rfsim5g-iab-mt-8" )
-declare -A LOCAL_ACCESS_DU_NAME=( [7]="rfsim5g-iab-du-7" [8]="rfsim5g-iab-du-8" )
-
-reassert_local_access_dnat_and_routes() {
-    # [2026-09-14 新增] 同 start_iab_pc2.sh/start_iab_pc3.sh 的說明：MT 的
-    # oaitun_ue1 tunnel 偶爾會在初次設定完成後自發性重新建立 PDU session，
-    # 把先前設好的 DNAT/71/72/default 路由重置掉，需要重新斷言。PC1 本機就是
-    # CU 所在主機，不需要 SSH，直接下指令。
-    for n in 7 8; do
-        local mt_ip=$(docker exec ${LOCAL_ACCESS_MT_NAME[$n]} ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-        [ -z "$mt_ip" ] && continue
-        docker exec -u 0 rfsim5g-donor-cu iptables -t nat -I OUTPUT 1 -d ${LOCAL_ACCESS_DU_IP[$n]} -p udp --dport 2152 -j DNAT --to-destination $mt_ip
-        docker exec -u 0 ${LOCAL_ACCESS_MT_NAME[$n]} ip route replace 192.168.71.0/24 via 12.1.1.1 dev oaitun_ue1 2>/dev/null
-        docker exec -u 0 ${LOCAL_ACCESS_MT_NAME[$n]} ip route replace 192.168.72.0/24 via 12.1.1.1 dev oaitun_ue1 2>/dev/null
-        docker exec -u 0 ${LOCAL_ACCESS_MT_NAME[$n]} ip route del default 2>/dev/null
-        docker exec -u 0 ${LOCAL_ACCESS_MT_NAME[$n]} ip route add default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
-    done
-}
-
-# [2026-09-18 新增] 見 start_iab_pc2.sh 同名函式的說明：UE 自己的預設路由
-# 偶爾會在 PDU session 自發重建後消失，reassert_local_access_dnat_and_routes
-# 都不會動到 UE 容器本身，補進自我修復迴圈。
-fix_ue_default_routes() {
-    for i in "$@"; do
-        docker exec -u 0 "rfsim5g-end-ue-${i}" ip route replace default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
-    done
-}
-
-# [2026-09-18 新增] Random Access process pool 耗盡（OAI 內部固定 4 格陣列，
-# gNB_scheduler_RA.c:719 "no free RA process"）是一種路由/DNAT 重新斷言完全
-# 救不回來的獨立崩潰模式——子節點會卡在 PRACH/RAR 重試迴圈，直到該 DU 被
-# 重啟為止（見 HISTORY.md 2026-09-18 Node2 案例）。這裡本機直接檢查 Node2
-# (relay) + Node7,8(access) 三個 DU 的 log，有就重啟，5~10 秒即可恢復。
+# [2026-09-18 新增，2026-09-22 沿用] Random Access process pool 耗盡（OAI 內部
+# 固定 4 格陣列，gNB_scheduler_RA.c:719 "no free RA process"）是一種路由重新
+# 斷言完全救不回來的獨立崩潰模式，子節點會卡在 PRACH/RAR 重試迴圈直到該 DU
+# 被重啟為止（見 HISTORY.md 2026-09-18 Node2 案例）。這裡檢查全部 4 個本機
+# relay DU 的 log，有就重啟。
 heal_ra_exhaustion_local() {
-    for du in rfsim5g-iab-du-2 rfsim5g-iab-du-7 rfsim5g-iab-du-8; do
+    for du in rfsim5g-iab-du-1 rfsim5g-iab-du-2 rfsim5g-iab-du-3 rfsim5g-iab-du-4; do
         local hits
         hits=$(docker logs --since 90s "$du" 2>&1 | grep -c "no free RA process" || true)
         if [ "${hits:-0}" -gt 0 ]; then
@@ -274,61 +170,18 @@ heal_ra_exhaustion_local() {
     done
 }
 
-verify_and_heal_local_ues() {
-    # 自我修復迴圈，同 start_iab_pc2.sh/start_iab_pc3.sh 的版本，這裡管 UE5~8。
-    local ues=(5 6 7 8)
-    local ext_dn_ip="192.168.72.135"
-    for attempt in 1 2 3 4 5; do
-        local all_ok=true
-        for i in "${ues[@]}"; do
-            if ! docker exec rfsim5g-end-ue-$i ping -c 1 -W 2 $ext_dn_ip >/dev/null 2>&1; then
-                all_ok=false
-            fi
-        done
-        if [ "$all_ok" = true ]; then
-            echo -e "   ${GREEN}[HEAL] 全部 UE5~8 連通性正常（第 ${attempt} 次檢查）${NC}"
-            return 0
-        fi
-        echo -e "   ${YELLOW}[HEAL] 第 ${attempt} 次檢查發現連通性異常，重新斷言路由/DNAT 規則後等待重試...${NC}"
-        reassert_local_access_dnat_and_routes
-        fix_ue_default_routes "${ues[@]}"
-        if [ "$attempt" -ge 3 ]; then
-            heal_ra_exhaustion_local
-        fi
-        sleep 15
-    done
-    echo -e "   ${RED}[HEAL] 重試 5 次後仍有 UE 連不通，需要人工檢查${NC}"
-    return 1
-}
-
-for n in 7 8; do
-    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "${LOCAL_ACCESS_MT_NAME[$n]}"
-    COUNT=0
-    while ! docker exec "${LOCAL_ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; do
-        sleep 5; COUNT=$((COUNT+1))
-        # [2026-09-12 修復] 120s 對 relay 偶爾要 100+ 秒才穩定（CU stale F1 association
-        # 重試骨牌效應）來說太短，一旦逾時整個 configure_and_start_local_access_du()
-        # 就永遠不會被呼叫（包含正確的 DNAT/NAT/route 設定），導致這個 access node 永久
-        # 卡住、需要事後手動補。拉長到 300s 給 relay 更多穩定時間，避免整組設定被跳過。
-        [ $COUNT -ge 60 ] && { echo -e "   ${RED}Node${n} tunnel IP 逾時(300s)，跳過${NC}"; break; }
-    done
-    if docker exec "${LOCAL_ACCESS_MT_NAME[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -q "inet "; then
-        configure_and_start_local_access_du "${LOCAL_ACCESS_MT_NAME[$n]}" "${LOCAL_ACCESS_DU_NAME[$n]}" "${LOCAL_ACCESS_DU_IP[$n]}"
-    fi
+for n in 1 2 3 4; do
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "rfsim5g-iab-mt-${n}"
+    configure_and_start_local_relay $n
+    wait_for_local_relay_du_healthy "rfsim5g-iab-du-${n}"
 done
 
-for i in 5 6 7 8; do
-    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "rfsim5g-end-ue-$i"
-    wait_for_local_ue "rfsim5g-end-ue-$i"
-done
-
-echo -e "${CYAN}驗證 + 自我修復 UE5~8 連通性...${NC}"
-verify_and_heal_local_ues
+heal_ra_exhaustion_local
 
 # ==========================================
 # 4. 啟動 Python 推論伺服器 (Node 1~12，全部集中在 PC1)
 # ==========================================
-echo -e "${CYAN}[4/7] Starting Inference Servers (Node 1~12)...${NC}"
+echo -e "${CYAN}[4/6] Starting Inference Servers (Node 1~12)...${NC}"
 NODES=$(seq 1 12)
 INF_SERVICES=""
 for i in $NODES; do INF_SERVICES="$INF_SERVICES inference-node${i}"; done
@@ -351,13 +204,13 @@ sleep 3
 REWARD_MODE="${REWARD_MODE:-throughput_only}"
 MODEL_ARCH="${MODEL_ARCH:-mlp}"
 FL_MODE="${FL_MODE:-avg}"
-echo -e "${CYAN}[4/7] 主動用 REWARD_MODE=${REWARD_MODE} MODEL_ARCH=${MODEL_ARCH} 覆蓋一次 inference-nodeN（防止悄悄套用 compose 預設值）...${NC}"
+echo -e "${CYAN}[4/6] 主動用 REWARD_MODE=${REWARD_MODE} MODEL_ARCH=${MODEL_ARCH} 覆蓋一次 inference-nodeN（防止悄悄套用 compose 預設值）...${NC}"
 REWARD_MODE="$REWARD_MODE" MODEL_ARCH="$MODEL_ARCH" \
     $DOCKER_COMPOSE -f $COMPOSE_FILE up -d --force-recreate $INF_SERVICES
 sleep 3
 
 if docker ps -a --format '{{.Names}}' | grep -q '^flower-superlink$'; then
-    echo -e "${CYAN}[4/7] 偵測到 stage2-fl 服務先前有跑過，用 FL_MODE=${FL_MODE} MODEL_ARCH=${MODEL_ARCH} 一併帶回來...${NC}"
+    echo -e "${CYAN}[4/6] 偵測到 stage2-fl 服務先前有跑過，用 FL_MODE=${FL_MODE} MODEL_ARCH=${MODEL_ARCH} 一併帶回來...${NC}"
     FL_MODE="$FL_MODE" MODEL_ARCH="$MODEL_ARCH" \
         $DOCKER_COMPOSE -f $COMPOSE_FILE --profile stage2-fl up -d --force-recreate \
         global-xapp flower-superlink flower-supernode-node{1..12} flower-scheduler
@@ -373,32 +226,18 @@ for i in $NODES; do
 done
 
 # ==========================================
-# 5. 跨主機 relay tunnel IP 路由（新版 CU 陷阱：relay 層版本）
-#   Node1~4 的 MT 容器在 PC2/PC3 上，取得的 12.1.1.x tunnel IP 是動態的，
-#   Donor CU（在 PC1、host network）要能把 F1/GTP 封包送到這個 tunnel IP，
-#   需要在 PC1 本機路由表加一條「tunnel IP 經由該 relay 的 macvlan IP」。
-#
-#   這條路由改成由 PC2/PC3 的 configure_and_start_relay()「主動推送」
-#   （拿到 tunnel IP 的當下透過 SSH 通知 PC1，見該腳本），不再由 PC1 這裡
-#   反過來被動輪詢猜 PC2/PC3 什麼時候準備好——舊做法會在 PC2/PC3 還沒啟動
-#   時卡住最多 4 個節點 × 180s = 12 分鐘的無意義等待。PC1 這裡不需要再做
-#   任何事，繼續往下執行即可。
+# 5. 最後路由與 UPF/FlexRIC 修正
 # ==========================================
-
-# ==========================================
-# 6. 最後路由與 UPF/FlexRIC 修正
-# ==========================================
-echo -e "${CYAN}[6/7] Finalizing Network & UPF/FlexRIC Routing...${NC}"
+echo -e "${CYAN}[5/6] Finalizing Network & UPF/FlexRIC Routing...${NC}"
 
 docker exec -u 0 rfsim5g-oai-upf bash -c "sysctl -w net.ipv4.ip_forward=1 && iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
 sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
 sudo ip route replace $UE_TUNNEL_SUBNET via $UPF_IP dev macvlan-br 2>/dev/null
 
-# FlexRIC 回程路由：三條 internal 子網都要能回得去（PC2/PC3 各自的，
-# 加上 PC1 本機新增的 Node7,8 internal 子網 192.168.76.0/24）
+# FlexRIC 回程路由：PC2/PC3 各自的 internal 子網都要能回得去。PC1 本身
+# 2026-09-22 後不再有任何 access 節點/internal bridge，不需要再加本機子網路由。
 docker exec -u 0 flexric ip route add $PC2_INTERNAL_SUBNET via 192.168.88.1 2>/dev/null || true
 docker exec -u 0 flexric ip route add $PC3_INTERNAL_SUBNET via 192.168.88.1 2>/dev/null || true
-docker exec -u 0 flexric ip route add 192.168.76.0/24 via 192.168.88.1 2>/dev/null || true
 
 echo -e "${YELLOW}Setting up iperf3 server in $DN_CONTAINER...${NC}"
 docker start $DN_CONTAINER 2>/dev/null

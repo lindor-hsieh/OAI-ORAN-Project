@@ -1,12 +1,16 @@
 #!/bin/bash
-# PC 3: IAB Client Script — Node9,10,11,12 (access) + UE9~16
+# PC 3: IAB Client Script — Node9,10,11,12 (access) + UE9~17
 #
-# 三主機版沿革（見 HISTORY.md 2026-09-12 條目）：
-#   Node3,4(relay，含直連 UE17) 已搬到 PC2（PC3 CPU 資源競爭導致 relay MT
-#   反覆斷線重連）。PC3 現在只剩 4 個 access 節點 + 它們的 UE，全部 access
-#   MT 都跨主機連到 PC2 的 relay DU（透過 macvlan，機制跟 relay 跨主機連
-#   Donor 完全相同——access MT 的 rfsimulator serveraddr 本來就是網段共用的
-#   macvlan IP，不因為 parent relay 實際跑在哪台主機而改變，不需要額外設定）。
+# 2026-09-22 節點重分配（見 CLAUDE.md 第 1 節、HISTORY.md 對應條目）：
+#   Node1~4(relay，全部含 UE17 掛的 Node4) 現在全部集中到 PC1（跟 Donor 同
+#   機，消除同主機分支的吞吐量優勢）。PC3 仍然只有 4 個 access 節點 + 它們
+#   的 UE，全部 access MT 都跨主機連到 PC1 的 relay DU（透過 macvlan，機制
+#   跟 relay 跨主機連 Donor 完全相同——access MT 的 rfsimulator serveraddr
+#   本來就是網段共用的 macvlan IP，不因為 parent relay 實際跑在哪台主機而
+#   改變，不需要額外設定）。UE17 這次也搬過來 PC3（邏輯上仍掛在 Node4 底下、
+#   透過 rfsimulator 直連 Node4 的 DU，但 Node4 現在在 PC1，UE17 容器本身
+#   留在 PC3 分攤 access 層負載——這個「邏輯歸屬 ≠ 容器實際主機」的特例在
+#   scenarios/traffic_scenario.py 用 UE_HOST_OVERRIDE 字典處理）。
 
 COMPOSE_FILE="docker-compose-iab-pc3.yaml"
 IFACE_NAME="enxc84d4427aa8f"
@@ -24,14 +28,12 @@ declare -A ACCESS_DU_IP=( [9]="192.168.75.20" [10]="192.168.75.21" [11]="192.168
 declare -A ACCESS_MT_NAME=( [9]="rfsim5g-iab-mt-9" [10]="rfsim5g-iab-mt-10" [11]="rfsim5g-iab-mt-11" [12]="rfsim5g-iab-mt-12" )
 declare -A ACCESS_DU_NAME=( [9]="rfsim5g-iab-du-9" [10]="rfsim5g-iab-du-10" [11]="rfsim5g-iab-du-11" [12]="rfsim5g-iab-du-12" )
 
-# 這 4 個 access 節點的 parent relay（Node3, Node4）現在跑在 PC2，
-# 啟動前要先確認它們在 PC2 上已經穩定運作，不能只靠本機檢查。
+# 這 4 個 access 節點的 parent relay（Node3, Node4）現在跑在 PC1，
+# 啟動前要先確認它們在 PC1 上已經穩定運作，不能只靠本機檢查。
 declare -A PARENT_RELAY_OF=( [9]="rfsim5g-iab-du-3" [10]="rfsim5g-iab-du-3" [11]="rfsim5g-iab-du-4" [12]="rfsim5g-iab-du-4" )
 
 PC1_USER="lindor"
 PC1_IP="192.168.88.1"
-PC2_USER="mcalab"
-PC2_IP="192.168.88.2"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes"
 
 if docker compose version &> /dev/null; then DOCKER_COMPOSE="docker compose"; else DOCKER_COMPOSE="docker-compose"; fi
@@ -103,18 +105,18 @@ if ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "exit" 2>/dev/null; then
     echo -e "${GREEN}[SSH] PC1 CU 已就緒${NC}"
 fi
 
-echo -e "${CYAN}[SSH] 等待 PC2 的 relay Node3,4 就緒（parent relay 現在跑在 PC2）...${NC}"
+echo -e "${CYAN}[SSH] 等待 PC1 的 relay Node3,4 就緒（parent relay 現在跑在 PC1）...${NC}"
 _wait=0
-until ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} \
+until ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} \
     "docker inspect -f '{{.State.Status}}' rfsim5g-iab-du-3 rfsim5g-iab-du-4 2>/dev/null | grep -qv running && exit 1 || exit 0" 2>/dev/null; do
     sleep 5; _wait=$((_wait+5))
-    echo -ne "\r  等待 PC2 relay Node3,4... ${_wait}s"
+    echo -ne "\r  等待 PC1 relay Node3,4... ${_wait}s"
     if [ $_wait -ge 180 ]; then
-        echo -e "\n${YELLOW}[SSH] 等待逾時，PC2 的 relay 可能還沒就緒，access 節點啟動後可能要多花時間才能附著${NC}"
+        echo -e "\n${YELLOW}[SSH] 等待逾時，PC1 的 relay 可能還沒就緒，access 節點啟動後可能要多花時間才能附著${NC}"
         break
     fi
 done
-echo -e "${GREEN}  PC2 relay Node3,4 檢查完成${NC}"
+echo -e "${GREEN}  PC1 relay Node3,4 檢查完成${NC}"
 
 configure_and_start_access_du() {
     local MT_NAME=$1
@@ -224,8 +226,9 @@ fix_ue_default_routes() {
 # 救不回來的獨立崩潰模式，本次 session 手動排查 PC3 Node9~12 卡住時就是這個
 # 根因（連續 errno(111) connection refused，`docker restart rfsim5g-iab-du-3`/
 # `rfsim5g-iab-du-4` 才真正解決）。PC3 的 4 個 access DU（rfsim5g-iab-du-9~12）
-# 在本機，可以直接檢查；但它們的 parent relay（Node3,4）在 PC2，PC3 這裡連不通
-# 時也可能是 PC2 端那兩個 relay DU 的 RA pool 耗盡，一併透過 SSH 檢查修復。
+# 在本機，可以直接檢查；但它們的 parent relay（Node3,4）現在在 PC1，PC3
+# 這裡連不通時也可能是 PC1 端那兩個 relay DU 的 RA pool 耗盡，一併透過 SSH
+# 檢查修復。
 heal_ra_exhaustion_local() {
     for du in rfsim5g-iab-du-9 rfsim5g-iab-du-10 rfsim5g-iab-du-11 rfsim5g-iab-du-12; do
         local hits
@@ -236,14 +239,14 @@ heal_ra_exhaustion_local() {
             sleep 10
         fi
     done
-    # parent relay Node3,4 在 PC2，跨主機檢查（跟本檔案其餘跨主機操作用同一組 SSH_OPTS）
+    # parent relay Node3,4 在 PC1，跨主機檢查（跟本檔案其餘跨主機操作用同一組 SSH_OPTS）
     for du in rfsim5g-iab-du-3 rfsim5g-iab-du-4; do
         local check="docker logs --since 90s $du 2>&1 | grep -c 'no free RA process' || true"
         local hits
-        hits=$(ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} "$check" 2>/dev/null)
+        hits=$(ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "$check" 2>/dev/null)
         if [ "${hits:-0}" -gt 0 ]; then
-            echo -e "   ${YELLOW}[RA-HEAL] $du（PC2）偵測到 RA process pool 耗盡（${hits} 次），重啟...${NC}"
-            ssh $SSH_OPTS ${PC2_USER}@${PC2_IP} "docker restart $du" 2>/dev/null
+            echo -e "   ${YELLOW}[RA-HEAL] $du（PC1）偵測到 RA process pool 耗盡（${hits} 次），重啟...${NC}"
+            ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} "docker restart $du" 2>/dev/null
             sleep 10
         fi
     done
@@ -322,13 +325,20 @@ echo -e "${CYAN}Finalizing Control Plane, waiting 15s...${NC}"
 sleep 15
 reapply_dnat_rules
 
-echo -e "\n${CYAN}[3/6] Launching End-UEs 9~16（一個一個依序啟動）...${NC}"
-for i in 9 10 11 12 13 14 15 16; do
+echo -e "\n${CYAN}[3/6] Launching End-UEs 9~17（UE17 直連 Node4(relay，現在在 PC1) 的 DU，
+不需要 access DU 設定，一個一個依序啟動）...${NC}"
+for i in 9 10 11 12 13 14 15 16 17; do
     $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "rfsim5g-end-ue-$i"
     wait_for_ue "rfsim5g-end-ue-$i"
 done
 
 reapply_dnat_rules
+
+# UE17 不在 verify_and_heal_ues() 的 ping 重試範圍內（機制跟 access 節點不同，
+# 直連 relay DU、沒有自己的 MT/DNAT 需要重新斷言），但一樣會遇到「預設路由
+# 消失」這個 UE 端通用問題（見 HISTORY.md 2026-09-18 條目），這裡單獨補一次，
+# 不影響 verify_and_heal_ues() 既有的範疇設計。
+fix_ue_default_routes 17
 
 echo -e "\n${CYAN}[6/6] 驗證 + 自我修復 UE9~16 連通性...${NC}"
 verify_and_heal_ues
@@ -341,4 +351,4 @@ else
     echo -e "${CYAN}$(echo -e "$CU_MAGIC_COMMANDS")${NC}"
 fi
 echo -e "${YELLOW}====================================================${NC}"
-echo -e "\n${GREEN}IAB PC3 - Node9,10,11,12(access) + UE9~16 Ready!${NC}"
+echo -e "\n${GREEN}IAB PC3 - Node9,10,11,12(access) + UE9~17 Ready!${NC}"

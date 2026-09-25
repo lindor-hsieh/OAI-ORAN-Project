@@ -103,15 +103,34 @@ NODE_TO_DU_CONTAINER: dict[int, str] = {n: f"rfsim5g-iab-du-{n}" for n in range(
 
 # Node → 所屬主機（決定 --host 篩選哪些節點；telnet chanmod port 只在該節點
 # DU 容器實際運作的那台主機的 127.0.0.1 監聽，所以這裡要填「DU 實際跑在哪」，
-# 不是「它的 access 子節點在哪」——Node3,4 的 DU 搬到 pc2 後，即使 Node9~12
-# 這些 access 子節點還留在 pc3，Node3,4 這兩列也要跟著改成 pc2）。
-# 2026-09-12 兩輪搬遷（見 CLAUDE.md）：
-#   1) Node2 + 其 access 子節點 Node7,8 從 pc2 搬到 pc1。
-#   2) Node3,4（relay）從 pc3 搬到 pc2；Node9~12（access）留在 pc3 不動。
+# 不是「它的 access 子節點在哪」）。
+# 2026-09-22 節點重分配（見 CLAUDE.md 第 1 節）：全部 4 個 relay（Node1~4）
+# 集中到 pc1（跟 Donor 同機，消除同主機分支吞吐量偏高的量測 confound），
+# access 節點（Node5~12）平均分散到 pc2（Node5,6,7,8）/pc3（Node9~12）。
 HOST_OF_NODE: dict[int, str] = {
-    2: "pc1", 7: "pc1", 8: "pc1",
-    1: "pc2", 3: "pc2", 4: "pc2", 5: "pc2", 6: "pc2",
+    1: "pc1", 2: "pc1", 3: "pc1", 4: "pc1",
+    5: "pc2", 6: "pc2", 7: "pc2", 8: "pc2",
     9: "pc3", 10: "pc3", 11: "pc3", 12: "pc3",
+}
+
+# UE → 所屬主機的覆寫字典，只用來處理「邏輯歸屬 Node ≠ 容器實際主機」的特例。
+# UE17 邏輯上仍掛在 NODE_CONFIG[4]，但容器實際跑在 pc3（2026-09-22 起，見
+# CLAUDE.md），跟 HOST_OF_NODE[4]="pc1" 不一致，需要單獨覆寫（影響
+# build_ue_list()：UE17 的 iperf/ping 等 docker exec 類操作要在 pc3 執行，
+# 因為容器只存在於 pc3 的 docker daemon）；其餘 16 個 UE 沒有這個特例。
+UE_HOST_OVERRIDE: dict[str, str] = {
+    "rfsim5g-end-ue-17": "pc3",
+}
+
+# Node → 跨主機 chanmod telnet 位址覆寫。UE17 的 traffic control 現在在 pc3
+# 執行（見上），但它的 pathloss channelmod 仍必須透過 Node4 的 DU telnetsrv
+# 下達，而 Node4 的 DU 實際跑在 pc1（HOST_OF_NODE[4]="pc1"）——telnet port
+# 原本只綁 127.0.0.1，2026-09-22 已把 Node4 這個 port 額外開放到 macvlan-br
+# 位址（見 docker-compose-iab-server.yaml 對應註解），讓 pc3 能跨主機連過去。
+# 只有 Node4 需要這個覆寫；其餘節點的 telnet 永遠跟自己的 DU 同機，用
+# 127.0.0.1 即可，不需要出現在這個字典裡。
+NODE_TELNET_HOST_OVERRIDE: dict[int, str] = {
+    4: "192.168.88.1",
 }
 
 # 校正掃描的 path_loss 值（單位 dB）；上限 25dB，超過會斷線
@@ -468,7 +487,9 @@ PLOSS_TIERS: dict[str, float] = {"low": 3.0, "medium": 12.0, "high": 22.0}
 TIER_COMBOS: list[tuple[str, str]] = [(t, p) for t in TRAFFIC_TIERS for p in PLOSS_TIERS]
 
 
-def scenario_t_tiered(ues: list[UEConfig], phase_index: int) -> list[tuple[float, float]]:
+def scenario_t_tiered(
+    ues: list[UEConfig], phase_index: int, protocol: str = "tcp"
+) -> list[tuple[float, float, str]]:
     """
     場景 T：流量（低/中/高）× 路徑損耗（低/中/高）3x3 交叉設計。
 
@@ -482,13 +503,21 @@ def scenario_t_tiered(ues: list[UEConfig], phase_index: int) -> list[tuple[float
     每個 phase 把 9 種組合依 (UE 索引 + phase_index) 錯開分配給所有 UE：
     同一個 phase 內不同 UE 拿到不同組合（同時間的狀態多樣性），且隨 phase
     推進輪替（每個 UE 長期下來會經歷全部 9 種組合，不會卡在同一種）。
+
+    protocol：全部 UE 統一用這個協定跑（"tcp" 或 "udp"，見 CLI `--protocol`）。
+    2026-09-22 現場驗證發現 TCP 版本的達成吞吐量被 TCP 自身的擁塞視窗/RTT
+    乘積卡死（同一個 UE、同通道、同目標，TCP 卡在 ~1Mbps，UDP 可以乾淨跑滿
+    20Mbps、0% 封包遺失），代表 TCP 版本量到的其實是「這個平台 TCP 緩衝區
+    設定的極限」而非排程器真正分配出來的容量，會壓縮甚至掩蓋 PF/avg FL/
+    cluster FL 之間真正的排程差異。UDP 沒有壅塞窗口，量到的吞吐量更直接
+    反映排程器的實際分配結果，適合當作判斷排程演算法優劣的主要指標。
     """
-    configs: list[tuple[float, float]] = []
+    configs: list[tuple[float, float, str]] = []
     n_combos = len(TIER_COMBOS)
     for i, _ in enumerate(ues):
         combo_idx = (i + phase_index) % n_combos
         traffic_name, ploss_name = TIER_COMBOS[combo_idx]
-        configs.append((PLOSS_TIERS[ploss_name], TRAFFIC_TIERS[traffic_name]))
+        configs.append((PLOSS_TIERS[ploss_name], TRAFFIC_TIERS[traffic_name], protocol))
     return configs
 
 
@@ -577,24 +606,52 @@ def _my_hostname_role() -> Optional[str]:
 
 
 def build_ue_list(host: Optional[str] = None) -> list[UEConfig]:
-    """建立 UE 清單。host 指定時只回傳該主機負責的 UE 子集（見 HOST_OF_NODE）。"""
+    """建立 UE 清單。host 指定時只回傳該主機負責的 UE 子集。
+
+    逐 UE 判斷所屬主機：優先查 UE_HOST_OVERRIDE（處理 UE17 這種「邏輯掛在
+    某 Node 底下，但容器實際跑在另一台主機」的特例），查不到才 fallback 到
+    該 UE 所屬 Node 的 HOST_OF_NODE。其餘 16 個 UE 沒有覆寫、行為不變。
+    """
     ues = []
     for node_id, (_, ue_list) in NODE_CONFIG.items():
-        if host is not None and HOST_OF_NODE.get(node_id) != host:
-            continue
         for container, ue_id in ue_list:
+            ue_host = UE_HOST_OVERRIDE.get(container, HOST_OF_NODE.get(node_id))
+            if host is not None and ue_host != host:
+                continue
             global_id = int(container.rsplit("-", 1)[-1])  # "rfsim5g-end-ue-17" → 17
             ues.append(UEConfig(container=container, ue_id=ue_id, node_id=node_id, global_id=global_id))
     return ues
 
 
 def build_controllers(host: Optional[str] = None) -> dict[int, ChannelModController]:
-    """建立 channelmod controller。host 指定時只回傳該主機負責的節點子集。"""
-    return {
+    """建立 channelmod controller。
+
+    host 指定時，回傳的集合 = 「DU 跟這個主機同機的節點」（一般情況，走
+    127.0.0.1）∪「這個主機負責 traffic control 的 UE，其所屬 Node 掛在別的
+    主機」（UE_HOST_OVERRIDE 特例，跨主機走 NODE_TELNET_HOST_OVERRIDE 指定
+    的位址）——沒有這一步，apply_scenario_phase() 對 UE17 呼叫
+    ctrls[ue.node_id] 會在 pc3 端 KeyError，因為 Node4 平常只會出現在
+    host="pc1" 的結果裡。
+    """
+    ctrls = {
         node_id: ChannelModController("127.0.0.1", telnet_port)
         for node_id, (telnet_port, _) in NODE_CONFIG.items()
         if host is None or HOST_OF_NODE.get(node_id) == host
     }
+    if host is not None:
+        for container, ue_host in UE_HOST_OVERRIDE.items():
+            if ue_host != host:
+                continue
+            owner_node_id = next(
+                nid for nid, (_, ue_list) in NODE_CONFIG.items()
+                if any(c == container for c, _ in ue_list)
+            )
+            if owner_node_id in ctrls:
+                continue
+            telnet_port = NODE_CONFIG[owner_node_id][0]
+            remote_host = NODE_TELNET_HOST_OVERRIDE.get(owner_node_id, "127.0.0.1")
+            ctrls[owner_node_id] = ChannelModController(remote_host, telnet_port)
+    return ctrls
 
 
 def wait_for_ue_interfaces(ues: list[UEConfig], max_wait: int = 120) -> bool:
@@ -874,6 +931,12 @@ def parse_args() -> argparse.Namespace:
         "--no-wait", action="store_true",
         help="跳過等待 UE 介面就緒的步驟",
     )
+    parser.add_argument(
+        "--protocol", choices=["tcp", "udp"], default="tcp",
+        help="場景 T 專用：全部 UE 統一用這個協定（預設 tcp）。UDP 沒有壅塞視窗，"
+             "量到的吞吐量更直接反映排程器實際分配的容量，適合當作判斷排程演算法"
+             "優劣的指標；TCP 的達成吞吐量會被視窗/RTT 乘積卡住，見 scenario_t_tiered() 說明",
+    )
     return parser.parse_args()
 
 
@@ -902,10 +965,11 @@ def main() -> None:
         run_dynamic_scenario(ues, ctrls, phase_duration=args.phase_duration)
     elif args.scenario == "T":
         FIXED_EPOCH = 1700000000.0  # 同 Scenario R 用的錨點，純粹是絕對時間基準，兩者不衝突
+        log.info("Scenario T protocol=%s", args.protocol)
         run_dynamic_scenario(
             ues, ctrls,
             phase_duration=args.phase_duration,
-            phase_fn=scenario_t_tiered,
+            phase_fn=lambda u, phase_index: scenario_t_tiered(u, phase_index, protocol=args.protocol),
             raw_path_loss=True,
             scenario_label="T",
             max_phases=args.num_phases,

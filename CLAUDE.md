@@ -10,34 +10,36 @@
 
 ```
 Donor (PC1)
-├── Node1 (relay, PC2) ── Node5 (access, PC2) ── UE1, UE2
+├── Node1 (relay, PC1) ── Node5 (access, PC2) ── UE1, UE2
 │                     └── Node6 (access, PC2) ── UE3, UE4
-├── Node2 (relay, PC1) ── Node7 (access, PC1) ── UE5, UE6
-│                     └── Node8 (access, PC1) ── UE7, UE8
-├── Node3 (relay, PC2) ── Node9  (access, PC3) ── UE9,  UE10
+├── Node2 (relay, PC1) ── Node7 (access, PC2) ── UE5, UE6
+│                     └── Node8 (access, PC2) ── UE7, UE8
+├── Node3 (relay, PC1) ── Node9  (access, PC3) ── UE9,  UE10
 │                     └── Node10 (access, PC3) ── UE11, UE12
-└── Node4 (relay, PC2) ── Node11 (access, PC3) ── UE13, UE14
+└── Node4 (relay, PC1) ── Node11 (access, PC3) ── UE13, UE14
                       ├── Node12 (access, PC3) ── UE15, UE16
-                      └── UE17（直接掛在 Node4 的 DU，不經過 access 層；Node4 在 PC2）
+                      └── UE17（直接掛在 Node4 的 DU，不經過 access 層；Node4 在 PC1、UE17 容器在 PC3）
 ```
 
-Donor→Relay→Access→UE 為 3-hop；UE17→Node4 為 2-hop。**Node9~12（access）的 parent relay Node3,4 現在跑在 PC2，是跨主機連線**（跟 relay 跨主機連 Donor 的機制完全相同，都是透過三台共用的 macvlan L2 網段，不需要額外設定）。
+Donor→Relay→Access→UE 為 3-hop；UE17→Node4 為 2-hop。**全部 4 個 relay（Node1~4）現在都跟 Donor 同機（PC1）**，Donor→Relay 這一段變成本機內部通訊；Relay→Access 這一段（全部 8 個 access 節點）則全部是跨主機連線（PC1→PC2/PC3），透過三台共用的 macvlan L2 網段，不需要額外設定。
 
-> **2026-09-12 節點重分配（分兩輪）**：
-> 1. Node2 + 其兩個 access 子節點 Node7,8（含 UE5~8）從 PC2 搬到 PC1。
-> 2. Node3,4（relay，含直連 UE17）從 PC3 搬到 PC2；Node9~12（access）留在 PC3 不動，變成跨主機連到 PC2 的 relay DU。
+> **2026-09-22 節點重分配**：把全部 4 個 relay（Node1~4）集中搬到 PC1（跟 Donor 同機），access 節點（Node5~12）平均分散到 PC2（Node5,6,7,8）/PC3（Node9,10,11,12）；UE17 容器搬到 PC3（macvlan IP 位置透明、不需改值，見下方 IP 表）。
 >
-> 原因：PC2/PC3 各自同時跑太多組 relay+access 的 MT+DU（每組 2 個即時 RF 模擬 process）在 16 核心主機上過於擁擠，會造成 CPU 排程延遲使 UE 端誤判為 PHY 失步（RRC Reestablishment cause=otherFailure），連鎖觸發 CU 端 `no AMF for CU UE ID`、tunnel IP 不斷變動、DU 反覆重啟（診斷過程見 `HISTORY.md`）。第二輪特意不把 Node3,4 整組（含 Node9~12）都塞給 PC1，是為了保留 PC1 給未來 FL/Global xApp 階段的餘裕；也沒有全部塞給 PC2 避免重現 PC2 原本的問題，所以採用「relay 留在原本較輕的一側、access 留在原地變成跨主機」的折衷分法。目前三主機即時 process 數量約為 **PC1:14、PC2:18、PC3:11**。
+> 原因：2026-09-21 完成的 PF/avgFL/clusterFL 三方量測，逐 UE 比對後發現 UE5~8（當時 Node2+Node7,8，跟 Donor 同在 PC1）在三次量測中全部是吞吐量最高的一群，UE1~4/UE9~16（需要真正跨主機傳輸）全部是最低的一群——這個分組跟場景流量、排程策略都無關，純粹是「跟 Donor 同主機」省去一段實體跨主機開銷造成的量測 confound。改成「全部 relay 集中同機、全部 access 一律跨主機」後，四條分支的路徑結構完全一致（Donor→Relay 全部同機、Relay→Access 全部跨主機），理論上不應該再有任何一條分支系統性領先。
+>
+> 這個分布也比先前考慮過的「relay 分散、access 整條分支搬家」方案更省資源：relay 本身負載比 access 輕，PC1 集中 4 個 relay（8 個即時 process）比先前的 Node2（2 個）還少；PC2/PC3 各自 4 個 access（8 個 process）+ 8~9 個 UE，落在 PC2:16、PC3:17，均低於已驗證安全的 ≤18 上限。目前三主機即時 process 數量約為 **PC1:10、PC2:16、PC3:17**（乾淨重啟後的實測結果見 `experiment_results/PF.md` 對應章節）。
+>
+> UE17 的 pathloss channelmod 控制（Node4 的 DU telnetsrv）跟它的 iperf 流量控制（容器）現在物理上分屬兩台主機（PC1/PC3），已把 Node4 的 chanmod telnet port 從只綁 `127.0.0.1` 改成額外綁 macvlan-br 位址（`192.168.88.1:9092`），讓 PC3 的 `traffic_scenario.py` 能跨主機連過去（見 `scenarios/traffic_scenario.py` 的 `NODE_TELNET_HOST_OVERRIDE`）。
 
 ### 硬體與節點配置表
 
 | 實體主機 | 部署元件 | 網路角色 | 備註說明 |
 | :--- | :--- | :--- | :--- |
-| **PC 1** (192.168.88.1, lindor) | CN5G、FlexRIC Server、MongoDB、Donor CU/DU、**全部 12 組** `xapp-nodeN`+`inference-nodeN` 容器、**Node2 (relay) + Node7,8 (access) + UE5~8** | 核心網與全域控制中心 + 分擔一組 RAN 子樹 | xApp(C)+inference(Python) 刻意集中在 PC1（見下方理由），MongoDB 對外監聽 `27017`。Node2/7/8 的 CU 端指令（DNAT、路由）都是本機直接執行，不需要 SSH（見 `iab/start_iab_server.sh` 的 `configure_and_start_local_relay`/`configure_and_start_local_access_du`）。 |
-| **PC 2** (192.168.88.2, **mcalab**) | Node1,3,4 (relay，Node4 含直連 UE17) + Node5,6 (access) + UE1~4,17 | RAN 資料面 | 純資料面，無 xApp/inference 容器。Ubuntu 20.04。Node3,4 的 DU/MT 是 2026-09-12 從 PC3 搬過來的。 |
-| **PC 3** (192.168.88.3, lindor) | Node9,10,11,12 (access) + UE9~16 | RAN 資料面 | 純資料面，無 xApp/inference 容器。Ubuntu 24.04。這 4 個 access 節點的 parent relay（Node3,4）現在跑在 PC2，跨主機連線。 |
+| **PC 1** (192.168.88.1, lindor) | CN5G、FlexRIC Server、MongoDB、Donor CU/DU、**全部 12 組** `xapp-nodeN`+`inference-nodeN` 容器、**Node1,2,3,4 (relay，Node4 含直連 UE17 的 DU)** | 核心網與全域控制中心 + 全部 relay 層 | xApp(C)+inference(Python) 刻意集中在 PC1（見下方理由），MongoDB 對外監聽 `27017`。4 個 relay 的 CU 端指令（路由）都是本機直接執行，不需要 SSH（見 `iab/start_iab_server.sh` 的 `configure_and_start_local_relay`）。 |
+| **PC 2** (192.168.88.2, **mcalab**) | Node5,6,7,8 (access) + UE1~8 | RAN 資料面 | 純資料面，無 xApp/inference 容器。Ubuntu 20.04。全部 4 個 access 節點的 parent relay（Node1,2,3,4）都在 PC1，跨主機連線。 |
+| **PC 3** (192.168.88.3, lindor) | Node9,10,11,12 (access) + UE9~17 | RAN 資料面 | 純資料面，無 xApp/inference 容器。Ubuntu 24.04。這 4 個 access 節點的 parent relay（Node3,4）在 PC1，跨主機連線；UE17 容器也在這裡（邏輯上仍掛在 Node4 底下，見上方拓樸圖說明）。 |
 
-**xApp/inference 集中在 PC1 的理由**：xApp(C) 與 inference(Python) 之間走 `ipc://` Unix domain socket（見第 2 節），兩者必須同一台主機；若要「真正分散到 PC2/PC3」，ZMQ 要改走 TCP，5ms timeout 預算要多扛一段跨主機網路延遲，風險換來的好處不大——經評估後決定維持集中，`MONGO_URI` 因此不需要因為主機數增加而修改（所有 inference 容器仍是 `mongodb://localhost:27017`，因為它們仍跟 MongoDB 同一台主機）。RAN 節點（MT/DU/UE）則物理分散到 PC1（一部分）/PC2/PC3，且 relay 與其 access 子節點不一定同主機（見上方拓樸圖 Node3,4/Node9~12 的跨主機關係）。
+**xApp/inference 集中在 PC1 的理由**：xApp(C) 與 inference(Python) 之間走 `ipc://` Unix domain socket（見第 2 節），兩者必須同一台主機；若要「真正分散到 PC2/PC3」，ZMQ 要改走 TCP，5ms timeout 預算要多扛一段跨主機網路延遲，風險換來的好處不大——經評估後決定維持集中，`MONGO_URI` 因此不需要因為主機數增加而修改（所有 inference 容器仍是 `mongodb://localhost:27017`，因為它們仍跟 MongoDB 同一台主機）。RAN 節點（MT/DU/UE）則物理分散到 PC1（全部 relay）/PC2/PC3（access+UE），relay 與其 access 子節點必定跨主機（2026-09-22 起，見上方拓樸圖）。
 
 ### IP / ID 配置表
 
@@ -48,12 +50,12 @@ Donor→Relay→Access→UE 為 3-hop；UE17→Node4 為 2-hop。**Node9~12（ac
 | `physCellId` | `0` | `1`~`4` | `5`~`12` | — |
 | E2 `TARGET_NODE_ID`（xApp .c，= gNB_ID 十進位） | — | `3585`~`3588` | `3589`~`3596` | — |
 | `rfsimulator.serverport` | `4043` | `4044`~`4047` | `4048`~`4055` | — |
-| FlexRIC telnet debug port（chanmod 通道控制） | — | `9089`~`9092` | `9093`~`9100` | — |
+| FlexRIC telnet debug port（chanmod 通道控制） | — | `9089`~`9092`（Node4=`9092` 額外開放 macvlan-br 位址 `192.168.88.1`，供 PC3 跨主機控制 UE17，其餘仍 `127.0.0.1`-only） | `9093`~`9100` | — |
 | IMSI (`208990100001xxx`) | — | 尾碼 `100`~`103` | 尾碼 `104`~`111` | 尾碼 `200`~`216`（跟 MT 區段刻意拉開） |
-| macvlan IP | `.144`（DU）| Node1=`.150`（PC2）,Node2=`.151`（PC1）,Node3=`.152`,Node4=`.153`（PC2）—— MT/DU 共用同一 netns、同一 IP，這個位址不因實際跑在哪台主機而改變（三台共用同一個 macvlan L2 網段） | Node5=`.160/.161`,Node6=`.162/.163`,Node7=`.164/.165`,Node8=`.166/.167`（PC1/PC2 混合，依上表); Node9=`.168/.169`,Node10=`.170/.171`,Node11=`.172/.173`,Node12=`.174/.175`（PC3） | 動態，共用 `12.1.1.0/24` SMF pool；UE17 額外占用 macvlan `.176`（直連 relay，需要自己的 macvlan IP） |
-| internal bridge IP | — | 不需要（relay 的 MT/DU 共用 netns，沒有獨立位址） | **PC1 用 `192.168.76.0/24`**：Node7=`.12/.22`,Node8=`.13/.23`；**PC2 用 `192.168.74.0/24`**：Node5=`.10/.20`,Node6=`.11/.21`；**PC3 用 `192.168.75.0/24`**（Node3,4 搬走後不變，因為 internal bridge 是 access 節點自己的，不受 parent relay 位置影響）：Node9=`.10/.20`,Node10=`.11/.21`,Node11=`.12/.22`,Node12=`.13/.23` | — |
+| macvlan IP | `.144`（DU）| Node1=`.150`,Node2=`.151`,Node3=`.152`,Node4=`.153`（全部在 PC1）—— MT/DU 共用同一 netns、同一 IP，這個位址不因實際跑在哪台主機而改變（三台共用同一個 macvlan L2 網段） | Node5=`.160/.161`,Node6=`.162/.163`,Node7=`.164/.165`,Node8=`.166/.167`（PC2）; Node9=`.168/.169`,Node10=`.170/.171`,Node11=`.172/.173`,Node12=`.174/.175`（PC3） | 動態，共用 `12.1.1.0/24` SMF pool；UE17 額外占用 macvlan `.176`（直連 relay，需要自己的 macvlan IP；容器在 PC3，位址不變） |
+| internal bridge IP | — | 不需要（relay 的 MT/DU 共用 netns，沒有獨立位址） | **PC2 用 `192.168.74.0/24`**：Node5=`.10/.20`,Node6=`.11/.21`,Node7=`.12/.22`,Node8=`.13/.23`；**PC3 用 `192.168.75.0/24`**：Node9=`.10/.20`,Node10=`.11/.21`,Node11=`.12/.22`,Node12=`.13/.23` | — |
 
-> **各主機 internal bridge 子網刻意不同**（`.74.0/24`／`.75.0/24`／`.76.0/24`）：PC1 的路由表對同一個子網只能指到一個 next-hop，若多台主機共用同一子網，PC1 就無法同時正確路由到不同主機的 access node internal IP。internal bridge 網路是 access 節點自己的 host-local 網路，只跟「access 節點實際跑在哪」有關，跟它的 parent relay 跑在哪台主機無關（Node9~12 的 internal bridge 一直都在 PC3，即使 parent Node3,4 搬到 PC2 也不用改）。
+> **各主機 internal bridge 子網刻意不同**（`.74.0/24`／`.75.0/24`）：PC1 的路由表對同一個子網只能指到一個 next-hop，若多台主機共用同一子網，PC1 就無法同時正確路由到不同主機的 access node internal IP。internal bridge 網路是 access 節點自己的 host-local 網路，只跟「access 節點實際跑在哪」有關，跟它的 parent relay 跑在哪台主機無關。PC1 2026-09-22 後不再有任何 access 節點，不再需要 internal bridge 網路（原本 Node7,8 用的 `iab_internal_net_pc1`/`192.168.76.0/24` 已整段移除）。
 
 CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
 
@@ -135,7 +137,7 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 
 | Stage | 策略 | Global 層（配額協調/FL 聚合） | Local 層（單節點 DRL） | 狀態 |
 |---|---|---|---|---|
-| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**（2026-09-13 三度重測，見 `experiment_results/PF.md`：併發 JFI=0.3303、17 UE 平均吞吐量約 6.45 Mbps、平均 RTT 224.23 ms，15 分鐘全程三主機零新增崩潰——**這份數據是 backhaul-aware 機制在三台主機全部真正生效後的正式基準**。前兩次量測皆已作廢：第一次忘記停用 xApp；第二次雖已停用 xApp，但事後發現 PC2/PC3 的 `librfsimulator.so` 忘記重新編譯（只重編了 nr-uesoftmodem/nr-softmodem/telnetsrv，見第 7 節新增的 rsync 後置檢查規則），導致只有 PC1 節點的機制真正生效，PC2/PC3 全部節點仍是 no-op；三主機皆確認 `bhload` 模組成功註冊後才產出本次數據。**UE17 現場複測 ICMP 100% 封包遺失、iperf3 完全無法建立傳輸**，是三主機機制全部真正介入後 Node4（UE17 直連 relay，同時中繼 Node11+Node12）三重負載疊加的極端案例，詳見 PF.md「UE17 特別說明」；是 Stage 2~5 的比較對象） |
+| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**（2026-09-13 三度重測，見 `experiment_results/PF.md`：併發 JFI=0.3303、17 UE 平均吞吐量約 6.45 Mbps、平均 RTT 224.23 ms，15 分鐘全程三主機零新增崩潰——**這份數據是 backhaul-aware 機制在三台主機全部真正生效後的正式基準**。前兩次量測皆已作廢：第一次忘記停用 xApp；第二次雖已停用 xApp，但事後發現 PC2/PC3 的 `librfsimulator.so` 忘記重新編譯（只重編了 nr-uesoftmodem/nr-softmodem/telnetsrv，見第 7 節新增的 rsync 後置檢查規則），導致只有 PC1 節點的機制真正生效，PC2/PC3 全部節點仍是 no-op；三主機皆確認 `bhload` 模組成功註冊後才產出本次數據。**UE17 現場複測 ICMP 100% 封包遺失、iperf3 完全無法建立傳輸**，是三主機機制全部真正介入後 Node4（UE17 直連 relay，同時中繼 Node11+Node12）三重負載疊加的極端案例，詳見 PF.md「UE17 特別說明」；是 Stage 2~5 的比較對象。**2026-09-22 節點重分配後已在 Scenario T 下重測**（見 `experiment_results/PF.md` 對應章節）：JFI 從 0.2812（09-21 舊拓樸）躍升到 0.9812，UE5~8 對其餘 13 UE 的吞吐量比值從約 10~20 倍降到 1.08 倍，證實先前「固定幾個 UE 持續最高」的現象主因是同主機優勢而非排程/場景差異；平均吞吐量下降（4.23→1.06 Mbps）是移除該優勢後的預期結果，非系統劣化，詳見該章節「結論：同主機優勢 confound 已消除」） |
 | 2 | avg FL + 最基礎 DRL | Global xApp（全域公平性軟性廣播，Stage 2~5 全程固定）+ Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | **已完成（2026-09-14 重測版，取代 2026-09-13 舊版本）**，見 `experiment_results/avgFL.md`：JFI=0.4779 對比 PF 的 0.3303（**改善 +44.7%**）、17 UE 平均吞吐量 8.40 Mbps 對比 PF 的 6.45 Mbps（**改善 +30.2%**）、平均 RTT 296.07 ms 對比 PF 的 224.23 ms（**惡化 +32.1%，尚未達成 RTT 單調遞增要求，判斷主因同舊版本——DRL Actor 推論延遲疊加進 MAC 排程週期**），15 分鐘全程三主機 FlexRIC/CU/DU/MT 零新增崩潰。**重測原因**：2026-09-13 舊版本的 `flower-supernode-nodeN` 訓練路徑其實一直缺 `REWARD_MODE` 環境變數、悄悄跑 lagrangian，加上另外兩個會導致資料面隨機斷線的基礎設施問題（CU NAT table 被無條件 flush、cpuset 過度擁擠造成 CU 隨機崩潰）修復後決定重測，三個 root cause 完整記錄見 `HISTORY.md` 2026-09-14 條目 |
 | 3 | soft cluster FL + 最基礎 DRL | Global xApp+Global rApp：Soft/Weighted Clustered FL——依節點連續角色比例 `role_ratio_i`（見下方公式）加權聚合出 relay/access 兩個原型模型，每個節點依自己的 `role_ratio_i` 混合接收兩個原型；硬性二分群是 `role_ratio∈{0,1}` 時的特例（2026-09-13 討論定案，取代原本 relay/access 硬分兩群設計，動機見下方 Node4 說明） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2，模型不變，只有 Global 聚合方式不同） | **已完成**（2026-09-14，見 `experiment_results/clusterFL.md`：JFI=0.4163、17 UE 平均吞吐量 6.30 Mbps、平均 RTT 372.57 ms，皆**低於** avg FL（Stage 2）的 0.4779／8.40 Mbps／296.07 ms，**尚未達成單調遞增要求**，15 分鐘全程三主機零新增崩潰。**重要方法論限制**：量測全程 FL 觸發訓練幾乎每輪都因經驗數量不足而跳過聚合，`IABFedAvg`／`IABClusterFedAvg` 在這 15 分鐘視窗內幾乎沒有機會做出有意義的非零權重聚合，Stage 2/3 觀察到的差異主要反映 12 個節點各自獨立訓練軌跡的隨機變異，不能直接歸因為聚合演算法本身有問題（聚合公式已經過離線數學驗證）；為何落後與後續調整方向待下一輪討論，詳見 clusterFL.md） |
 | 4 | 自訂 FL + 最基礎 DRL | Global xApp+Global rApp：自訂聚合演算法（介面待設計） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2/3） | 未開始 |
@@ -240,9 +242,9 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 * `/openairinterface5g/openair2/E2AP/flexric`：FlexRIC 專案目錄
 * `/openairinterface5g/openair2/E2AP/flexric/src/`：C 語言 Local xApp 的主要開發目錄
 * `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator`：docker 部署目錄
-* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-server.yaml`：for PC 1（CN5G、Donor CU/DU、FlexRIC、MongoDB、全部 12 組 xapp-nodeN + inference-nodeN 容器、**Node2 relay + Node7,8 access + UE5~8**，由 `iab/run_local_pc1.sh` → `iab/start_iab_server.sh` 啟動）
-* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-pc2.yaml`：for PC 2（Node1,3,4 relay（Node4 含直連 UE17）+ Node5,6 access + UE1~4,17，由 `iab/run_local_pc2.sh` → `iab/start_iab_pc2.sh` 啟動）
-* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-pc3.yaml`：for PC 3（Node9,10,11,12 access + UE9~16，parent relay 跨主機在 PC2，由 `iab/run_local_pc3.sh` → `iab/start_iab_pc3.sh` 啟動）
+* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-server.yaml`：for PC 1（CN5G、Donor CU/DU、FlexRIC、MongoDB、全部 12 組 xapp-nodeN + inference-nodeN 容器、**全部 4 個 relay：Node1,2,3,4（Node4 含直連 UE17 的 DU）**，由 `iab/run_local_pc1.sh` → `iab/start_iab_server.sh` 啟動）
+* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-pc2.yaml`：for PC 2（Node5,6,7,8 access + UE1~8，parent relay 跨主機在 PC1，由 `iab/run_local_pc2.sh` → `iab/start_iab_pc2.sh` 啟動）
+* `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/docker-compose-iab-pc3.yaml`：for PC 3（Node9,10,11,12 access + UE9~17，parent relay 跨主機在 PC1，UE17 容器也在這裡，由 `iab/run_local_pc3.sh` → `iab/start_iab_pc3.sh` 啟動）
 * `/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/scenarios/traffic_scenario.py`：流量+路徑損耗場景控制器（見第 8 節）
 * `/openairinterface5g/HISTORY.md`：歷史踩坑/量測紀錄（見文件開頭慣例說明）
 
@@ -271,7 +273,7 @@ sudo ./build_oai --gNB --nrUE --build-e2 --ninja -w USRP -C --cmake-opt -DE2AP_V
 **建議做法（2026-09-14 驗證更穩定）：完全依序啟動，不要三台同時跑**——先讓 PC1 的基礎設施（不含 E2 等待、不含 xApp 啟動）單獨跑完，再依序（不要同時）跑 PC2、PC3，最後回 PC1 做 E2 等待＋啟動 xApp：
 
 ```bash
-# 1. PC1 基礎設施（CN5G/FlexRIC/MongoDB/Donor CU-DU/Node2,7,8），跑完才繼續下一步
+# 1. PC1 基礎設施（CN5G/FlexRIC/MongoDB/Donor CU-DU/Node1,2,3,4 relay），跑完才繼續下一步
 bash ~/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/iab/start_iab_server.sh
 
 # 2. PC2 完全跑完，才換 PC3（不要背景同時跑兩台）
@@ -377,8 +379,8 @@ GLOBAL_XAPP_LOOKBACK = 50（global_xapp.py，計算節點平均吞吐量時往�
 
 1. **先檢查是不是 `cpuset` 把太多 process 塞進同一組核心**：`docker-compose-iab-server.yaml` 目前只有全部 12 個 `inference-nodeN` 服務釘在 `cpuset: "12-15"`（4 核心，Stage 2 上線時就有的既有設計，長期驗證穩定）。**任何要新增 cpuset 隔離的容器（例如 Global xApp／Flower FL 服務），都不能無條件套用同一組 `"12-15"`**——2026-09-14 debug session 曾經把 `global-xapp`／`flower-superlink`／12 個 `flower-supernode-nodeN`／`flower-scheduler`（共 15 個服務）也全部加上 `cpuset: "12-15"`，變成同一組 4 核心要塞 27 個 process，即使瞬時 CPU 使用率看起來不誇張（`mpstat` 平均只有 30% 上下），仍然造成偶發性的排程延遲尖峰，讓 RT-priority 的 CU/DU SCTP/RRC 計時器偶爾錯過期限而 crash-restart，進而讓所有依賴 CU 當下 netns 的 DNAT/路由設定失效——這正是「不管怎麼修 NAT/路由、過一陣子又壞、每次壞的節點都不一樣」這種難以定位症狀的真正源頭。**排查方法**：`docker inspect --format '{{.HostConfig.CpusetCpus}}' <container>` 列出目前所有容器的 cpuset 分組，數一數同一組核心裡總共塞了多少 process，跟核心數（`nproc`）比較是否明顯失衡；懷疑是這個原因時，直接把新加的 cpuset 限制拿掉做 A/B 對照（拿掉後乾淨重啟，觀察 CU RestartCount 是否維持 0），比繼續往下挖 NAT/路由邏輯快得多。
 2. **確認 CU 的 NAT OUTPUT table 沒有被意外整批清空**：`iab/start_iab_pc2.sh`／`start_iab_pc3.sh`／`start_iab_server.sh` 的 DNAT 規則寫入邏輯全部使用 `iptables -t nat -I OUTPUT 1 ...`（插入到最前面），**不會**、也**不能**對整條 `OUTPUT` chain 做 `-F` 全部清空——早期版本 PC2 的腳本會在自己的收尾步驟對 CU 的 NAT OUTPUT table 做無條件 `-F`，只要這個 flush 跑在其他主機已經寫好自己節點 DNAT 規則**之後**，就會把其他主機的規則整批砍掉，且沒有人會補回來，造成跟第 1 點類似的「隨機哪個節點斷線」症狀（但成因完全不同：這個是規則被砍，第 1 點是 CU 本身真的 crash）。三個腳本現在都已改成「不 flush、只在最前面插入」，若未來又看到類似症狀，先確認相關腳本有沒有被還原成舊版的 flush 寫法。
-3. **確認三主機啟動順序**：即使上述兩點都排除，仍建議依序（不要三台完全同時）執行：先跑 `bash iab/start_iab_server.sh`（只做 PC1 基礎設施＋Node2/7/8，不等 E2、不啟動 xApp）→ 等它完全跑完 → 依序（不要同時）跑 PC2、PC3 各自的 `run_local_pc{2,3}.sh` 並各自等到完全跑完 → 最後跑 `bash iab/run_local_pc1.sh --skip-server`（只做 E2 等待＋啟動 xApp）。這個順序讓三主機的 CU 操作完全不重疊，實測比三台同時起跑更穩定（2026-09-14 驗證：依序啟動後，15 分鐘正式量測全程 CU/DU/MT RestartCount 維持 0）。
-4. **自我修復機制**：三個 `start_iab_*.sh` 腳本收尾都有 `verify_and_heal_ues()`／`verify_and_heal_local_ues()`，會對自己負責的 UE 做 ping 驗證，失敗時自動重新斷言 MT 路由＋CU DNAT 規則，最多重試 5 次（每次間隔 15 秒）。若腳本印出「重試 5 次後仍有 UE 連不通，需要人工檢查」，通常代表當時 CU 或該節點的 DU/MT 剛好處於第 1、2 點描述的不穩定狀態，等它穩定後手動重跑一次 `docker exec -u 0 <mt> ip route replace ...`＋CU 端 `iptables -t nat -I OUTPUT 1 ...`（或直接重跑該主機的腳本）通常就會通。
+3. **確認三主機啟動順序**：即使上述兩點都排除，仍建議依序（不要三台完全同時）執行：先跑 `bash iab/start_iab_server.sh`（只做 PC1 基礎設施＋Node1,2,3,4 relay，不等 E2、不啟動 xApp）→ 等它完全跑完 → 依序（不要同時）跑 PC2、PC3 各自的 `run_local_pc{2,3}.sh` 並各自等到完全跑完 → 最後跑 `bash iab/run_local_pc1.sh --skip-server`（只做 E2 等待＋啟動 xApp）。這個順序讓三主機的 CU 操作完全不重疊，實測比三台同時起跑更穩定（2026-09-14 驗證：依序啟動後，15 分鐘正式量測全程 CU/DU/MT RestartCount 維持 0）。
+4. **自我修復機制**：三個 `start_iab_*.sh` 腳本收尾都有 `verify_and_heal_ues()`（PC1 2026-09-22 後不再有任何 UE，改成 `heal_ra_exhaustion_local()` 只檢查 4 個 relay DU），會對自己負責的 UE 做 ping 驗證，失敗時自動重新斷言 MT 路由＋CU DNAT 規則，最多重試 5 次（每次間隔 15 秒）。若腳本印出「重試 5 次後仍有 UE 連不通，需要人工檢查」，通常代表當時 CU 或該節點的 DU/MT 剛好處於第 1、2 點描述的不穩定狀態，等它穩定後手動重跑一次 `docker exec -u 0 <mt> ip route replace ...`＋CU 端 `iptables -t nat -I OUTPUT 1 ...`（或直接重跑該主機的腳本）通常就會通。
 
 ---
 
@@ -390,7 +392,7 @@ GLOBAL_XAPP_LOOKBACK = 50（global_xapp.py，計算節點平均吞吐量時往�
 
 路徑損耗安全上限 `PATHLOSS_SAFE_MAX_DB=25.0`（超過會讓 UE 斷線，已現場驗證）。Scenario R 直接送連續 ploss 值，不需要 CQI 校正；Scenario A/B/C/D 需要（`--calibrate --node N`）。
 
-**跨主機執行**：telnet chanmod port 只在該主機本機（`127.0.0.1`）可連，`traffic_scenario.py` 用 `--host {pc2,pc3}` 各自在本地執行、只套用自己負責的 UE/Node 子集；兩台主機用同一個 `--seed`，每個 UE 每個 phase 的隨機值用 `(seed, ue_global_id, phase_index)` 三元組獨立導出（`phase_index` 以絕對時間換算），不需要跨主機即時通訊即可保持同步。
+**跨主機執行**：telnet chanmod port 原則上只在該主機本機（`127.0.0.1`）可連，`traffic_scenario.py` 用 `--host {pc2,pc3}` 各自在本地執行、只套用自己負責的 UE/Node 子集；兩台主機用同一個 `--seed`，每個 UE 每個 phase 的隨機值用 `(seed, ue_global_id, phase_index)` 三元組獨立導出（`phase_index` 以絕對時間換算），不需要跨主機即時通訊即可保持同步。**唯一例外是 UE17**（2026-09-22 起）：它的容器在 pc3、但邏輯上掛的 Node4 telnet 在 pc1，`build_controllers()` 用 `NODE_TELNET_HOST_OVERRIDE` 讓 pc3 這邊跨主機連 `192.168.88.1:9092`（見第 1 節）——PC1 不需要、也不會執行這支腳本（PC1 沒有任何 UE 容器）。
 
 ```bash
 # PC2：控制 UE1~8

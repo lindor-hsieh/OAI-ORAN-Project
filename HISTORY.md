@@ -813,3 +813,119 @@ Stage 2 要求切換 `REWARD_MODE` 前必須清空模型 checkpoint。第一次�
 
 ## 2026-09-25（續五）— CLAUDE.md 關鍵路徑合併
 原第 5 節（目錄結構）與第 7 節開頭（xApp／共用底層檔案清單）合併為第 5 節「專案目錄結構與關鍵檔案路徑」，改為依部署／腳本／場景／推論與 FL／C 語言底層分表，新增 `iab/` 腳本分類與 backhaul 機制原始檔路徑；用途待定的四支腳本（`check_convergence.py`、`check_convergence_weights.py`、`calibrate_fl_rate.py`、`clean_lambda_contamination.py`）在該節逐一記錄用途與保留原因（未刪除）。
+
+## 2026-09-26 — PC3 網卡移到 USB 3.x 後的驗證：改善約 2 倍，PC1 網卡成為新瓶頸
+
+**修復驗證**：PC3 網卡 USB 5000 Mb/s、連線 2.5 Gb/s；容器全停時主機間 iperf3 TCP 三台兩兩、雙向皆 2.34 Gbps（先前含 PC3 者 ~320 Mbps），ping 平均 0.37~0.39 ms（先前 PC1↔PC3 35 ms）。依序乾淨重啟（00:34~00:41，各階段間無重疊）：13/13 E2、CU/DU/FlexRIC RestartCount 0、17/17 UE ping 0% 遺失、RTT 多數 ~57~120 ms（先前 ~300 ms），UE17 ~290 ms。
+
+**UDP 下行容量（`iperf3 -u -R -b 100M -t 10`，ext-dn→UE）**：UE9（PC3）單獨 0.96 Mbps／42% 遺失（第一個跑，疑似暖機，不可靠）；UE1（PC2）單獨 3.5 Mbps；UE9+UE10（PC3，同 Node9）同時各 4.07 Mbps、0% 遺失（合計 8.1 Mbps）。容量僅較修復前（1.7~2 Mbps）好約一倍。
+
+**新瓶頸**：無任何測試流量、只有 rfsim 容器在跑時，PC1 網卡 rx 2423／tx 2415 Mbps（2.5G 網卡的實際上限 ~2.34 Gbps 附近），PC2 rx/tx ~1.07 Gbps、PC3 ~1.34 Gbps（兩者加總 ≈ PC1）。推論（未驗證）：rfsimulator 每條跨主機鏈路連續傳 IQ 取樣（估計即時需 >1.5 Gbps/條），9/22 拓樸把 4 個 relay 全放 PC1，使 8 條 relay↔access 鏈路全部擠過 PC1 單一網卡，模擬時間被拖慢。**這是 9/22 拓樸搬遷的副作用**，PF 新拓樸 JFI 0.98 的「均貧」可能也有此成分。
+
+**待決方向**：(1) 每條分支 relay 與其 access 同機、僅 Donor→relay 跨主機（跨主機鏈路 8→4，需重新處理同主機公平性）；(2) 降低 PRB/頻寬使鏈路流量下降（改 PHY，全 Stage 需重測）；(3) 加網卡（PC1 10G 或雙網卡）。使用者尚未決定，未動拓樸、未做正式量測。
+
+**2026-09-26 決定與更正**：使用者確認 9/22 的拓樸（全部 relay 與 Donor 同機、access 分散 PC2/PC3）是目前最佳放置，**不更動**——四條分支路徑結構一致，是消除「同主機分支領先」confound 的必要條件。上方「這是 9/22 拓樸搬遷的副作用」與待決方向 (1)「分支同機化」作廢：問題不在拓樸，而在 PC1 只用單一 USB 2.5G 網卡承載全部 8 條 relay↔access 的 rfsim 鏈路。硬體盤點（唯讀）：三台各有一張內建 RTL8125 2.5GbE（`enp6s0`，目前僅協商到 1000 Mb/s，未用於實驗網路），PC1/PC2/PC3 的 USB 2.5G 網卡（`enxc84d...`）皆已在 USB 3.x（5000 Mb/s）。剩餘方向：(a) 把內建 `enp6s0` 也接進實驗交換器，與 USB 網卡做 bonding 或分流，PC1 有效頻寬約可加倍；(b) 10GbE；(c) 降低 PRB/頻寬（改 PHY，全 Stage 重測，非首選）。待確認：交換器剩餘 2.5G 埠數、`enp6s0` 現在是否是各主機的對外網路。
+
+**2026-09-26 單分支對照實驗（證實網卡飽和推論）**：把 Node2/3/4 與其 access（Node6~12）及 UE3~17 全部 `docker stop`，只留 Donor + Node1(PC1) → Node5(PC2) → UE1/UE2。結果：(1) **僅一條 relay↔access 跨主機鏈路，PC1 網卡就是 rx 2.26／tx 2.24 Gbps**（與 8 條鏈路時的 2.42 Gbps 幾乎相同）——單條鏈路即用滿網卡，符合 rfsimulator 連續傳 IQ 取樣的即時需求（61.44 Msps × 4 B ≈ 1.97 Gbps/方向 + 標頭）；(2) UE1 UDP 下行 47.9 Mbps（後 5 秒 54.8）、UE2 44.3 Mbps、UE1 TCP 47.4 Mbps，與 2026-09-12 同機單 UE 的 43.8 Mbps 同量級；UE RTT ~43 ms（全系統 ~85 ms）；(3) 全系統 8 條鏈路共用同一張網卡 → 每條約 1/8 即時速度（慢動作 ~8×），預測 48/8≈6 Mbps，實測 ~4 Mbps 吻合。**結論：每 UE ~4 Mbps 是「PC1 網卡頻寬 ÷ 8 條 rfsim 鏈路」造成的模擬時間變慢，不是排程/演算法/協定問題；平台單 UE 真實能力 ~48 Mbps。** 容量估算：8 條鏈路全即時需 ~16+ Gbps/方向（PC1）；雙 2.5G bonding 約只能 ×2（~8 Mbps）；10G 約 ×4；降低 relay↔access 載波頻寬可等比降低鏈路流量（10 MHz≈24 PRB@30kHz→15.36 Msps，每條 ~0.5 Gbps，8 條 ~4 Gbps，配合 bonding 可接近即時，但 backhaul 峰值降為 ~51 Mbps）。此實驗結束時環境僅剩單分支運行，需依 CLAUDE.md §6 乾淨重啟。
+
+**2026-09-26 UL/DL 方向對照（解釋 09-23「UDP 20Mbps／TCP 1Mbps」）**：乾淨重啟後（全系統、其餘 UE 閒置）用 `iperf3 --get-server-output` 取兩端報告。**上行**（UE→ext-dn，無 `-R`）：UE1 UDP 20M 傳送端 20.0 Mbps、接收端全數收到 0 遺失（尾巴至 13.5 s，平均 14.8）、UDP 100M 累積 17.8 Mbps／44% 遺失、TCP 13.9 Mbps；UE9（PC3）UDP 20M 收 17.9 Mbps 0 遺失。**下行**（`-R`）：UE1 UDP offered 20M/10M/5M 收 ~9~10／10.0／5.0 Mbps 0 遺失，TCP 10.3 Mbps；UE9+UE10（PC3 同 Node9）各 offered 10M 各 5.08 Mbps（合計 ~10.2）。**結論**：(1) 09-23 那次「同 UE、同通道、UDP 乾淨跑到 20.0 Mbps 0/32664 遺失、TCP 卡 1.05 Mbps → 瓶頸在 TCP 本身」是拿**上行 UDP 對下行 TCP**比，方向不同，該結論作廢；(2) 平台目前（網卡已修、全系統其餘閒置）容量：**下行 ~10 Mbps／access 節點（同節點 UE 共用）、上行 ~15~18 Mbps／UE**；(3) 先前「每 UE ~4 Mbps」（09-26 早）是 offered 100M 灌爆且剛重啟量到的，低估；(4) **暖機現象**：UE1、UE9 各自的第一次下行測試只有 ~2.6 Mbps（1.1% 遺失），同 UE 再測即 ~10 Mbps，成因未明（假說：MCS/鏈路適應尚未爬升），量測需丟棄每個 UE 起頭樣本或先預熱。
+
+**2026-09-26 UE 數量階梯測試（全系統、下行 `-R`、`-O 3`、每階 10 s、每階僅跑一次）**：選 UE 集合 1=[UE1]、2=[UE1,UE9]、4=[UE1,5,9,13]（每 relay 一個）、8=[UE1,3,5,7,9,11,13,15]（每 access 一個）、17=全部。**UDP（每 UE offered 5M）**：實收總量 5.0／10.0／24.2*／40.4／34.0 Mbps（n=1/2/4/8/17；總 offered 5/10/20/40/85），n=17 飽和（每 UE ~2.0，Node4 底下 UE13~17 最低 ~1.56，其餘 ~2.0~2.4）；*n=4 超過 offered 是 `-O 3` 後佇列尾巴資料被計入的讀值假象。**TCP**：實收總量 2.8／12.6／24.4／29.9／43.2 Mbps，每 UE 平均 2.8／6.3／6.1／3.7／2.5，n=17 時 UE17 僅 0.94。**結論**：(1) 全系統總容量 ~35~45 Mbps，與單分支容量（~48 Mbps）同量級——符合「PC1 網卡整體只夠約一條 rfsim 鏈路即時速度」的解釋，容量幾乎與 UE/分支數無關；17 UE 同時各 ~2~2.5 Mbps，要每 UE ~10 Mbps 需總量 ×4。(2) TCP「冷 UE」現象：先前傳過的 UE 6~10 Mbps，第一次傳的 UE 1.6~2.8 Mbps（n=8 的 UE3/7/11/15 皆 ~1.6，UE1/5/9/13 為 5~6），UDP 5M 不受影響；`-O 3` 未消除，非數秒暖機，成因未明。(3) 流量場景目標頻寬總和應控制在 ~30~35 Mbps 內（平均 ~2 Mbps/UE）；Scenario T 的 5/25/120 Mbps 檔位需改 1/2/4 Mbps 量級。
+
+**2026-09-26 rfsim 封包內容檢查（為何閒置就吃 2.4 Gbps）**：在 PC1 實驗網卡對 Node1↔Node5/6 的 rfsim TCP（port 4044）抓 4000 封包，承載資料 4.4 MB 的**零位元組比例 100%、99% 的封包整個全零**——閒置時 rfsim 傳的全是零取樣。原始碼：`rfsimulator_write_internal()` 每次 trx_write 對每個連線先送 16 B header（size/nbAnt/timestamp）再送完整 `nsamps×4 B` 取樣，不做任何稀疏化；接收端 `simulator.c` 約 802~812 行在新區塊 timestamp 大於 lastReceivedTS 時**自動把空洞補零**。未設 `TCP_NODELAY`。**可行的省流量方案（待實作，需使用者同意）**：傳送端找出每個 slot 內第一個與最後一個非零取樣，只送該段，並固定再送一個 1 取樣的結尾標記區塊把 timestamp 推到 slot 結尾（否則接收端 `rfsimulator_read` 會等到下一區塊、雙方鎖步死結），同時加 `TCP_NODELAY`；預期網卡流量降 1~2 個數量級，8 條鏈路可接近即時；需三台重編 `rfsimulator`，CPU 可能成為新瓶頸。
+
+## 2026-09-26（續）— rfsimulator 稀疏傳輸（sparse TX）patch 與效果
+
+**改動（`radio/rfsimulator/simulator.c`，三台皆已重編並依時間戳確認）**：(1) `rfsimulator_write_internal()` 找出每個 slot 的第一個到最後一個非零取樣，只送該段；若尾端有零，固定再送一個 1 取樣的結尾標記區塊（timestamp 指到 slot 最後一個取樣）把接收端 lastReceivedTS 推進到 slot 結尾，避免鎖步死結；全零 slot 只送標記。(2) 接收端 `process_recv_header()` 的空洞補零由逐取樣迴圈（含取模）改成分段 `memset`（寫入位置與原迴圈相同），避免每個 slot 都補零造成 CPU 浪費。(3) `allocCirBuf()` 對每條 socket 設 `TCP_NODELAY`。(4) 環境變數 `RFSIM_SPARSE=0` 可關閉（回到完整傳送，不需重編）；啟動 log 會印 `rfsimulator sparse TX enabled/disabled`。舊版備份：scratchpad 的 `librfsimulator.so.orig`（PC1）與各機 `/tmp/librfsimulator.so.orig`。**接收端重建的取樣內容與原本相同，只降低傳輸量**（未做位元等價性驗證，待做 A/B）。
+
+**效果（全系統，乾淨重啟後）**：閒置網卡 PC1 rx/tx 2.42/2.42 Gbps → 0.063/0.25 Gbps；UE RTT ~85 → ~50 ms；階梯測試（下行，`-O 3`）TCP 總量 n=1/2/4/8/17：2.8/12.6/24.4/29.9/43.2 → 36.8/62.3/54.6/47.5/64.0 Mbps；UDP（每 UE offered 5M）總量 5/10/24.2/40.4/34.0 → 5/10/21.4/35.2/55.4 Mbps。**17 UE 全開 TCP 時**：PC1 網卡 tx 2.05 Gbps（又吃滿）、PC2/PC3 rx 0.95/1.13 Gbps、CPU 忙碌 PC1 56%／PC3 79%／PC2 85%（load 15/16）。原因：有使用者流量時幾乎每個 DL slot 都有資料且橫跨整個 slot 的 14 個 OFDM 符號，「第一到最後非零取樣」≈整個 slot，稀疏化省不掉；頻域少用 PRB 也不減少時域取樣。**結論**：閒置/稀疏流量下大幅受益（單 UE TCP ~37 Mbps），滿載時 PC1 網卡與 PC2/PC3 CPU 同時接近極限，17 UE 總容量僅 ~55~64 Mbps（每 UE ~3~4 Mbps）。**研究影響**：所有以牆鐘時間量的指標（RTT、Mbps）與 DRL 迴圈時序（xApp 100 ms、ZMQ 5 ms 超時相對模擬時間的占比）都因模擬更接近即時而改變；Stage 1~3 舊數據不可與此後數據比較；所有 Stage 必須使用同一版 `librfsimulator.so`。待辦：A/B 等價性驗證（`RFSIM_SPARSE=0/1` 比較 MCS 分布、HARQ 重傳率、UE 相對排序）、離線重建位元等價測試。
+
+**2026-09-26 通道惡化機制檢查（尚待掃描實測）**：(1) 只有 DU 啟用 rfsimulator 通道模型（`iab_du_node*.conf` `rfsimulator.options=("chanmod")`，每個 UE 一個 `rfsimu_channel_ue{0,1}`，預設 `ploss_dB=0`、`noise_power_dB=-50`）；所有 UE 啟動指令沒有 `chanmod`，`nrue.uicc.conf` 的 `channelmod` 區塊全被註解。rfsim 通道模型只在接收端套用，因此 `traffic_scenario.py` 經 DU telnet 改的路徑損耗**只影響上行**，**下行完全沒有被惡化**。(2) 雜訊掃描（DU telnet `channelmod modify 0 noise_power_dB <v>`，-50/-30/-20/-12）：UL ulsch 第二輪（HARQ 重傳）累積 11→69→142→191、UL SNR 63.5→47.5 dB；DL 始終 MCS 27~28、零重傳。(3) 推論（未驗證）：UL 功率控制補償路徑損耗（PH 48 dB），故上行也惡化有限，>~25 dB 才因功率上限斷線。**若成立，Stage 1~3 所有「路徑損耗 3/12/22 dB」檔位大概沒有真正改變通道品質**（與 09-23「9 種損耗×頻寬組合吞吐量都 1.0~1.3 Mbps」一致），PF/DRL 差異主要由負載與 backhaul 決定。待辦：乾淨的 ploss/noise 掃描（UL SNR/MCS/重傳）、必要時讓 UE 端也啟用通道模型或改用雜訊功率作為惡化手段（全 Stage 需重測）。注意 `channelmod modify` 的參數名是 `ploss`／`noise_power_dB`（`path_loss_dB` 無效）。
+
+## 2026-09-26（續二）— DL 通道惡化機制、rfsim CPU 優化與速度調節器
+
+**下行從未被惡化過（根因）**：rfsim 通道模型只在「接收端」套用；DU 端（`iab_du_node*.conf` `rfsimulator.options=("chanmod")`）的 `rfsimu_channel_ue*` 只影響 UL，UE 端原本沒有通道模型（`nrue.uicc.conf` 的 `channelmod` 區塊被註解、UE 指令無 `chanmod`）。因此 Stage 1~3 場景用的「路徑損耗 3/12/22 dB」只作用於 UL（且被 UL 功率控制補償，UL SNR 仍 ~24~50 dB），**下行完全沒有惡化**。修改：新增 `conf/nrue.uicc.chanmod.conf`（啟用 chanmod 與 `rfsimu_channel_enB0`，ploss=0／noise=-50 基準）給 17 個終端 UE（MT 仍用 `nrue.uicc.conf`，避免 12 個 MT 白白多吃 CPU、改變 backhaul）；compose 對每個終端 UE 加 `--telnetsrv --telnetsrv.listenport 9301`。`channelmod modify` 的參數名是 `ploss`／`noise_power_dB`（`path_loss_dB` 無效）。
+
+**UE 端下行掃描（TCP `-R`，速度 0.6×）**：噪音旋鈕 -50~-12 dB 無影響、-6 dB MCS 16（TCP 37→18.7 Mbps）、0 dB 幾乎斷（0.2 Mbps）。ploss 旋鈕：0~24 dB 無影響（MCS 28、TCP 31~35 Mbps）；28 dB MCS 13~15 且不穩定（BLER 0.14~0.34）；31 dB MCS 8（~10.5 Mbps）；33 dB MCS 7~8；35 dB MCS 5~6（~7 Mbps）；**≥36~37 dB 斷線（RLF），且 UE 不會自動恢復（`Network is unreachable`，單獨 `docker restart` 該 UE 容器 10 分鐘仍未恢復，需乾淨重啟）**——這就是 `PATHLOSS_SAFE_MAX_DB` 的真正由來。基準 DL SNR ~55~60 dB，所以 ploss 要 >~25 dB 才開始惡化。
+
+**場景修改（`scenarios/traffic_scenario.py`、`channelmod_ctrl.py`）**：新增 `UEChannelController`（經 `docker exec bash /dev/tcp` 連 UE 內 telnet 9301）；`apply_ue_config()` 設 UL ploss 時同步在背景執行緒設 UE 端 DL ploss，場景損耗 0~25 dB 線性映射到 UE 端 22~33 dB（`DL_DEGRADE_KNEE_DB=22`、`DL_DEGRADE_MAX_DB=33`，離斷線懸崖保留 3~4 dB）；結束時重設；`--no-dl-degrade`／`SCENARIO_DL_DEGRADE=0` 可關閉。**Stage 1~3 舊數據的「通道惡化」全部只有 UL，下行從未惡化，需在此設定下重測。**
+
+**rfsim CPU 優化與速度調節器（`radio/rfsimulator/simulator.c`、`apply_channelmod.c`）**：(1) 雜訊振幅 <0.01 LSB（noise_power_dB ≤ -45）略過高斯亂數；(2) rxAddInput 單天線單分接頭快速路徑；(3) `rfsimulator_read_fused()`：所有連線皆單天線 AWGN 時以 1024 取樣小區塊單趟累加輸出，取代 5 趟大緩衝區處理（清 out、清 temp、rxAddInput、逐取樣 `lroundf`）——UE 主執行緒 CPU 100%→~50%，且與沒有通道模型的 MT 相同（UE 端通道模型幾乎無額外成本）；捨入為 away-from-zero，與 `lroundf` 僅在 |x| 恰為 .5 前一個浮點數時可能差 1 LSB。`RFSIM_CHAN_FAST=0` 關閉 (2)(3)。(4) **速度調節器** `rfsim_pace()`：伺服器端（gNB/DU）依檔案 `/usr/local/lib/oai_libs/rfsim_speed.txt`（build 目錄，三台各一份，約每 400 次讀取重新載入、可不重啟調整）的速度比例 S 讓模擬時間不超前牆鐘的 1/S，提前時 `nanosleep`；檔案不存在/≤0=不調節。**背景**：網路不再是瓶頸後 rfsim「跑多快算多快」把 PC2/PC3 CPU 吃光（idle <5%、load 67~98、RTT 秒級、部分 UE 掉包）；S=0.6 時模擬速度精確 0.60（由 DU log 的 `Frame.Slot` 每 128 frame 的牆鐘間隔量得），PC2/PC3 CPU idle 70~79%、load 3。**所有以牆鐘量測的指標（RTT、Mbps）都被 S 縮放，論文需說明並固定同一個 S。**
+
+**環境事件**：長時間（~5 小時）壞狀態的 DU 會出現 `TASK_SCTP queue contains 45898 messages`、access MT 無法完成 RA（`cannot forward CCCH message`），需乾淨重啟；重啟腳本在 CPU 飽和時 PC2/PC3 段可花 18~20 分鐘（自我修復迴圈重試）。
+
+**2026-09-26（續三）— 重大更正：`channelmod modify ... ploss` 的正值是「增益」而不是損耗**：`random_channel.c` 的 `ploss` handler 直接把數值存進 `path_loss_dB`，而 `rxAddInput()`（及融合讀取路徑）以 `pow(10, path_loss_dB/20)` 當**線性增益**（程式碼註解亦寫 `path_loss_dB should contain the total path gain`）。因此：(1) **Stage 1~3 場景對 DU 端送的 0~25 dB「路徑損耗」實際是對上行的 0~25 dB 增益**（UL SNR 不降反升，與觀察到的「SNR 幾乎不變、MCS 不變」一致），下行則完全沒動（UE 端無通道模型）——過去所有 Stage 的「路徑損耗惡化」都不是真的惡化；(2) 本日 UE 端正 ploss 掃描看到的「28 dB MCS 13 → 35 dB MCS 5 → ≥36~37 dB 斷線」是**放大 25~56 倍造成 int16 取樣飽和/削波**，不是 SNR 下降，也不是 RLF；ploss 20 dB 時加雜訊 -3 dB 仍 MCS 28（訊號被放大 20 dB，雜訊被蓋掉）也是同一原因；(3) 二維網格（UE4、UE12，ploss 0/20/28/32 × noise -50/-25/-12/-6/-3）：ploss 0 時 noise -6 → MCS 17~18（TCP 14~16）、-3 → MCS 6；ploss 20 時雜訊無效果（MCS 28 全程）。**負的 ploss 才是衰減，且效果很強**：UE12 在 -20 dB 已降到 MCS 3（TCP 5.4 Mbps）、-30 dB 幾乎斷線（重傳 65%、BLER 0.71）——基準訊號振幅本來就低，int16 動態範圍讓可用衰減範圍只有約 0 到 -15~-20 dB。(4) 掉線後 UE 不會自動恢復，需乾淨重啟（單獨 `docker restart` 該 UE 10 分鐘未恢復）。**待辦**：以「負 ploss × noise」二維校準出 MCS 由 28 單調降到 ~3、不斷線的安全路徑，改寫 `traffic_scenario.py` 的 UL/DL 映射（含 A/B/C/D/R/T 所有場景），並以短 Scenario T 驗證；Stage 1~3 全部需在正確的通道惡化下重測。
+
+## 2026-09-26（續四）— 下行通道校準、場景改寫、速度調節器 S 選定與驗證
+
+**二維校準（UE 端下行，UE3／UE11，TCP `-R`，S=0.6）**：(ploss, noise)→MCS：(0,-50)=28；(-10,-20)=27~28；(0,-10)=26；(-15,-50)=23；(-5,-10)=18~21；(-10,-10)=12~13；(-15,-10)=5；(-10,-6)=3~4；**(-15,-6)=0（BLER 0.5~0.7）→ UE 斷線且不會自動恢復（單獨 `docker restart` 亦不行，需乾淨重啟）**。負 ploss 單獨：-20 dB→MCS 3、-30 dB 幾乎斷線。**採用的單一旋鈕路徑**（s=L/25；L=場景損耗指標）：s=0→(0,-50)、0.25→(-5,-20)、0.5→(-5,-10)、0.75→(-10,-10)、1.0→(-10,-6)，線性內插，終點離斷線格 5 dB ploss。
+
+**場景改寫（`scenarios/traffic_scenario.py`、`channelmod_ctrl.py`）**：A/B/C/D/R/T 全部經 `apply_ue_config()`→`_apply_channel()`→`UEChannelController.set_channel()`（docker exec 進 UE 容器 telnet 9301，一次設 ploss+noise），**只改 UE 端下行，DU 端上行完全不動**（上行維持 ploss=0、noise=-50 的正常通道；過去對 DU 送的正 ploss 是增益，已移除）。場景的損耗指標 L（R 抽的 0~25、T 的 3/12/22、A/B/C/D 的 CQI 對照表）語意不變，只是換成上述路徑；`--no-dl-degrade`／`SCENARIO_DL_DEGRADE=0` 關閉。以假控制器單元測試 R 連續值、T 檔位、A/B/C CQI 三條路徑：皆只送下行、不送上行。
+
+**短 Scenario T 驗證（UDP，1/2/3 Mbps，S=0.4，2 相位×100 s，PC2/PC3 同 seed）**：低/中/高損耗檔位 → 實際 UE 端通道 (-2.4,-35.6)/(-5,-10.8)/(-10,-7.9) → 逐 UE DL MCS **28／22~23／7~9**、BLER 0／0.05~0.15／0.07~0.13，每個 UE 的 iperf 實收等於 offered、0% 遺失；場景結束後 17 UE 全部連通、無任何 UE 掉線。**驗證腳本踩坑**：第一次把流量檔位設成 0.5/1/2 Mbps，場景以 `%.0f` 格式化成 `0M`，iperf3 `-b 0` 代表不限速，16 UE 同時灌爆導致全系統 ping 100% 遺失（與通道無關）；流量檔位務必用整數 Mbps（此問題在正式的 5/25/120 檔位不會出現，但若日後改小檔位要注意）。
+
+**速度調節器 S 選定**：(1) 空載（`speed_test.py`）：S=0.6/0.7/0.8/0.9/1.0 → CPU 閒置 PC2 79/71/65/31/3%、PC3 76/71/59/30/0.3%；S=1.0 時實際只跑 0.90~0.95 倍且 ping 最大 RTT 627 ms。(2) 4 個 UE 灌滿 TCP 下行時（每 relay 一個）所有 S 的 PC2/PC3 CPU 都被吃滿（閒置 0~7%），且 S 越大牆鐘吞吐量越低（總量 55.8/40.5/23.3/16.1/10.9 Mbps，S=0.6→1.0）——資料真的在傳時 PHY 解碼 CPU 需求高很多，CPU 一飽和吞吐量崩。(3) 貼近實驗的負載（`speed_test2.py`：16 UE 各 2 Mbps 下行 UDP，UE15 排除）：S=0.3 CPU 閒置 71/64% 但牆鐘 2 Mbps 在模擬時間是 6.7 Mbps 造成超載（ping 掉 40~50%、RTT 5 s）；**S=0.4：CPU 閒置 45/48%、UDP 每 UE 2.00、0 掉包、max RTT 81 ms**；S=0.5：閒置 20.5/29.4%、0 掉包（PC2 餘裕剛達 20%）；S=0.6：PC2 閒置 2.8%；S=0.7：PC2 閒置 2.8%、PC2 的 8 個 UE UDP 不足 1.8、ping 掉 10~30% 與 892 ms。**採用 S=0.4**（0.5 為上限）。**時間膨脹換算**：模擬時間 = 牆鐘時間 × S；模擬時間吞吐量 = 牆鐘 Mbps ÷ S（例如 S=0.4 時牆鐘 2 Mbps = 模擬 5 Mbps），RTT 中屬於 RAN 的部分（牆鐘）= 模擬 RTT ÷ S；所有 Stage 必須用同一個 S，論文方法論需說明。
+
+**環境事件**：重啟時 access MT 附著間歇卡住的一種成因——父 relay DU 對同一 RNTI 回報「SRB0 already exists」而無法轉發 CCCH（`prepare_initial_ul_rrc_message() returned false`），MT 端 `Contention resolution failed` 反覆；`docker restart rfsim5g-iab-du-<relay>` 讓該 DU 重新 F1 setup 即可讓 MT 附著，不必整個系統重來。UE15 重啟後偶爾卡住，重跑該主機啟動腳本可恢復。
+
+**2026-09-26 補：TCP 灌滿的速度掃描（4 個 UE 各一個 relay 同時 TCP 下行，牆鐘總量 mean/min/std，PC2/PC3 負載下 CPU 閒置）**：S=0.3 31.1/14.7/9.5（74/71%）、**0.4 42.6/33.5/4.7（57/55%，最穩定）**、0.5 49.0/25.1/11.0（12.5/50%）、**0.6 55.8/16.8/14.7（7/3%，峰值但 CPU 吃光）**、0.7 40.5/17.8/8.1、0.8 23.3/16.8/5.1、0.9 16.1/5.2/8.6、1.0 10.9/4.8/5.7（ping 最大 RTT 627 ms）。**依此採用 S=0.4**（不再以舊的「每 UE ~2 Mbps」估計為依據——那是網卡瓶頸時期的舊容量）；Scenario T 的流量檔位待依新容量與 S 重新決定。
+
+**2026-09-26 S 改為 0.5（使用者決定）**：三台速度檔設 0.5，實測 DU 模擬速度精確 0.50，空載 CPU 閒置 PC2 89%／PC3 85%。取捨（同上方 TCP 灌滿掃描）：0.5 比 0.4 的 TCP 總量高 15%（49.0 vs 42.6 Mbps），但 PC2 負載下 CPU 閒置只有 12.5%（低於 20% 餘裕判準）、標準差較大（11.0 vs 4.7）；若長時間訓練/量測出現 CPU 抖動、掉包或 RTT 尖峰，退回 0.4（不需重啟，改速度檔即可）。
+
+## 2026-09-26（續五）— S=0.5 下的容量量測與 Scenario T 流量檔位定案（C 方案、S=0.4）
+
+**容量（S=0.5，牆鐘 Mbps；模擬時間 = ÷0.5）**：單 UE TCP 下行 UE1/5/9/13 = 38.3/38.5/31.5/34.1。同時多 UE TCP 灌滿：n=1/2/4/8/16 總量 38.4/47.2/52.7/53.1/50.4（每 UE 平均 38.4/23.6/13.2/6.6/3.2；PC2 CPU 閒置 10/41/30/5/5%、PC3 77/41/14/15/14%）。16 UE 各固定 offered 的 UDP：1M→16.0（CPU 閒置 64/60%）、2M→32.0（25/35%）、4M→54.1（3/8%，每 UE 實收 3.38）、8M→54.0。**結論**：全系統總容量平台 ~54 Mbps 牆鐘（~108 模擬），與 UE 數/協定無關，是 **CPU 限制**（封頂時 PC2 閒置僅 3~5%）；CPU 餘裕 ≥20% 的最大總 offered 約 32~35 Mbps 牆鐘。早先 S 掃描換算成模擬時間後平台一致（TCP 灌滿 4 UE：S=0.3/0.4/0.5/0.6 → 104/106/98/93 Mbps 模擬）——CPU 上限的模擬時間負載約 100 Mbps 不隨 S 變，**降低 S 是用時間換 CPU 餘裕**。
+
+**決定（使用者）：流量檔位選 C（重負載）、S 降到 0.4**。實作：`scenarios/traffic_scenario.py` 的頻寬（`TRAFFIC_TIERS` 與 A/B/C/D/R 的 BW）改為**模擬時間 Mbps**，`start_iperf_client()` 啟動時乘上 S（讀各主機 `rfsim_speed.txt`，`SCENARIO_SPEED_S` 可覆寫）換成牆鐘 `-b`（0.05M 下限、`%.3g` 格式，小數不再被格式化成 0），場景設定因此與 S 無關；`TRAFFIC_TIERS = {low: 2, medium: 6, high: 12}`（模擬 Mbps；S=0.5 時牆鐘 1/3/6、S=0.4 時 0.8/2.4/4.8）。17 UE 的總 offered ≈ 5.7×(2+6+12)≈113 模擬 Mbps，剛好壓過 ~100~108 的 CPU 平台，高檔位在最差通道（MCS~8）的單 UE 容量（~17 模擬 Mbps）之內。舊的 5/25/120 是網卡瓶頸與舊拓樸時期的設計，作廢。量到的牆鐘吞吐量要 ÷S 換算成模擬時間。
+
+## 2026-09-26 續六：方案 C（S=0.4，檔位 2/6/12）穩定度 + UE17 跨主機 telnet 位址修正
+
+- 3 相位 UDP Scenario T（各 120s）：加載相位期間 PC3 CPU idle 最低 11.9%，UE13/UE17 有 ping 遺失（50%/100%）、RTT 暫時到 ~3.6 s；17 UE 的總牆鐘下行速率 33–43 Mbps（≈83–108 sim Mbps）。場景結束後全部恢復（idle >80%、RTT ≤167 ms、17 UE 連線、CU/DU/FlexRIC RestartCount 皆 0）。第 2 相位末各 UE 的 iperf3 supervisor 集體 rc=1 重啟（原因未查）。
+- 發現：Node4 DU chanmod telnet 的 `192.168.88.1:9092` 從來連不上（macvlan 網路下 compose `ports:` 映射無效）；改連容器自己的 macvlan IP `192.168.88.153:9092`（PC1/PC3 均驗證可連）。09-22 以來 UE17 的 UL ploss 控制因此沒生效（警告只是 WARNING，靜默失敗）。
+
+## 2026-09-26 續七：檔位改 2/5/8（S=0.4）驗證
+
+- 原因：2/6/12 總 offered ≈113 模擬 Mbps 超過 CPU 平台（~100~108），重載相位 UE13/UE17 掉包、RTT 秒級。降 S 不改變模擬時間容量（牆鐘 = 模擬 × S），所以改降 high 檔而非降 S。
+- 3 相位 UDP Scenario T（各 120 s）：CPU idle 最低 30.4%（原 11.9%）；17 UE 總牆鐘下行 28~35 Mbps（≈71~86 模擬）；RTT 除 175 s 一次 2.3 s 尖峰外 ≤169 ms；UE17 前 70 s 抽樣 ping 100% 遺失（105 s 起恢復，疑為冷啟動/RA 暫態，未查）；場景後 UE1/5/9/13/15/17 ping 0% 遺失，CU/DU/FlexRIC RestartCount 皆 0。
+- 場景中段各 UE 的 iperf3 supervisor 集體 rc=1 重啟仍在（兩次驗證皆有，成因未查）。
+
+## 2026-09-26 續八：iperf3 集體 rc=1 根因、UE segfault 事件、UE17 掉包
+
+- **iperf3 supervisor 集體 rc=1（已修）**：`setup_iperf_servers.sh` 每個 server 包 `timeout 400`（+`sleep 1`），17 個 server 同時啟動→每 401 秒同步被砍一次，不管有沒有 session；14:03:53 對上 (14:03:53−server 啟動 12:23:32)=6021 s≈15×401。改成 `iperf3 -s -1`（無 timeout）。
+- **UE segfault 事件（未根治）**：14:23~14:28 pc3 的 UE9/10/11/12/14 與 MT9/10 的 `nr-uesoftmodem` 在 `init_RA`（`UL__actor`，NULL+0x20）segfault，時間與場景的 UE 端 `set_channel` 同一秒（例：UE9 set 14:23:51、segfault 14:23:51；UE11/14 的 reset 回 (0,-50) 在 14:27:28 得到 no-resp 並 segfault）。docker 自動重啟→UE IP 改變（UE9 .30→.12），舊 F1-U 位址（12.1.1.12）失效，CU↔UPF 間 GTP-U 封包迴圈（UPF 閒置時 ~300 Mbps、CPU 100%），pc3 UE 與 relay MT 隧道全部掉包；乾淨重啟後恢復。之後 3 次場景（含乾淨重啟後 1 相位）都沒有再 segfault，尚無法重現；懷疑 UE 端通道變更觸發 RLF→re-RA→`init_RA` 空指標。
+- **UE17 前段掉包**：乾淨重啟後 1 相位（每 4 秒對 UE17/13/15/9/1 ping）UE17 全程 0 遺失（RTT 65~167 ms），只有 UE13 在 15~26 s 有一次 1.9 s 尖峰/1 次遺失。UE17 單獨在壞通道 (−10,−7.9) 3.2 Mbps UDP 也 0 遺失。先前兩次 UE17 掉包出現在平台已跑很久、且遇過多次手動中斷（含遺留 iperf3）之後；未證實根因，視為髒狀態，之後每次量測前先乾淨重啟。
+- **CrashGuard（已實作）**：`traffic_scenario.py` 新增 `CrashGuard`/`ScenarioCrash`/`--on-crash {abort,warn}`（規則見 CLAUDE.md §6）。PC1 單元測試（假造 RestartCount 變化）abort/warn 兩模式行為正確；PC2/PC3 真實 1 相位 Scenario T（60 s）無誤報、exit 0。只涵蓋各主機本機容器（PC1 的 relay/Donor 不在 PC2/PC3 的 process 監控範圍內）。
+
+## 2026-09-26 續九：修正後平台 Stage 1（PF）Scenario T 重測
+
+- 流程：`iab/measure_stage.py` 接上 CrashGuard 標記檔（`.invalid`、exit 2）；新增 `iab/clean_env.sh`（整套重啟前三台清理並驗證，使用者要求）；每輪（TCP、UDP）都「clean_env → 依序乾淨重啟 → 檢查 13/13 E2、RestartCount、17 UE ping、17 個 iperf3 server、S」後才量測。
+- 結果（sim 值）：TCP JFI 0.9915／4.91 Mbps／RTT 35.6 ms；UDP JFI 0.9915／5.01 Mbps／27.1 ms；無崩潰、無零吞吐量 UE。完整表與限制見 `ci-scripts/yaml_files/5g_rfsimulator/experiment_results/PF.md` 最末章節，原始 CSV 在同目錄 `data_20260926_pf/`。
+
+## 2026-09-26 續十：Scenario T 檔位重設計前的容量量測（UDP 下行，模擬 Mbps = 牆鐘 ÷ 0.4，Node5 的 UE1/UE2，其餘 UE 閒置）
+
+- 各通道檔位（DEGRADE_PATH 對應場景損耗 L=3/12/22 → (ploss,noise)=(-2.4,-35.6)/(-5,-10.8)/(-10,-7.92)），offered 每 UE 40 sim（牆鐘 16M）灌爆：
+  - 單 UE：low 40 sim 全數收到（0.17% 遺失）；medium 40 sim 全收；**high 只收到 11.8 sim（牆鐘 4.73）**。
+  - 同節點 2 UE 同時灌：low 79 sim（14.8+16.8 牆鐘，近乎全收）；medium 71 sim（14.2+14.3）；**high 約 18 sim（3.67+3.56 牆鐘；後段穩態約 24）**。
+- 結論：只有「高損耗」通道下容量才明顯小於可 offered 的量（每 UE ~12、每節點 ~20 sim）；低/中損耗每節點容量 ~70–80 sim，接近全平台 CPU 平台（~100–108 sim），單靠流量檔位無法在低/中損耗通道造成競爭。
+- 量測注意：高損耗下 iperf3 結束握手被排在灌爆的下行佇列後面，摘要行要等 >50 s 才出現（RTT 秒級的 bufferbloat）；讀 log 太早會誤判為空。
+- **容量曲線（單 UE1、UDP 下行、offered 40 sim、乾淨重啟後，sim Mbps）**：L=10→40.2、15→35.5、18→30.8、20→22.2、22→16.8、24→8.6、25→5.4（1% 遺失，接近斷線邊緣）。同一點 L=22 前一次量到 11.8，run 間變異約 ±30%，檔位邊界不宜貼太近。
+- **壅塞比例設計**（使用者要求 ~45%）：壅塞 = 該 UE 的目標流量 > 其通道下的單 UE 容量。CPU 平台限制每相位 17 UE 總「送達」≤~105 sim，因此 45% 只能靠「兩個通道檔位都很差」達成（好通道下高流量的送達量太貴）。候選 A：通道 L=(10,24,25)、流量 (1,10,14) → 壅塞 4/9=44%、期望送達 ~104、offered ~142。
+
+## 2026-09-26 續十一：兩狀態 Scenario T 與 Stage 1（PF）基準重測
+
+- 使用者要求「量測期間 ~45% 的時間壅塞」：重寫 Scenario T 為兩狀態（見 CLAUDE.md §8），加 `--phase-origin`（相位連號、剛好 110 s）；壅塞相位通道用 L=22/23/24（同節點兩 UE 合計容量 23.2/17.6/13.2，實測），避開 L=25。相位跳號問題：舊做法 phase_index 用絕對時間 ÷120，而每相位實際 ~132 s，會跳號（第一次 TCP 跳過一個壅塞相位，壅塞只佔 3/9），改為 grid 對齊後 5/11=45%。
+- 兩輪（UDP 先、TCP 後）都先 `clean_env.sh` → 依序重啟 → 預檢查 → 量測；CrashGuard 無觸發。TCP 那輪 UE16 附著後上行同步不良（DU12 SRB1 max RETX、UE16 UL HARQ 1654/4999 失敗，同節點 UE15 正常），17:08 與 18:22 各出現一次；單獨重啟該 UE 容器後 RAN 鏈路恢復，但預設路由被清掉，需補 `ip route replace default via 12.1.1.1 dev oaitun_ue1`。根因未查（懷疑附著時 UL 時序同步）。
+- 新增獨立背景健康檢查（每 20 分鐘記錄容器重啟/segfault/CPU/標記檔），結果無異常。
+- 結果：見 `experiment_results/PF.md` 最末章節；TCP 壅塞相位 PC2 CPU idle 曾低至 ~11%。
+
+- 2026-09-26：判讀指標（壅塞相位滿足率/滿足率 JFI/RTT、壅塞驗證）寫進 CLAUDE.md §3；量測流程腳本從暫存目錄搬入 `iab/`（`precheck_measure.sh`、`run_stage_measure.sh`、`analyze_stage.py`），以 UDP 基準資料驗證 `analyze_stage.py` 輸出與先前一致。
+
+- 2026-09-26（使用者決定）：不論開發或正式量測，Stage 1~5 一律 TCP＋UDP 各量一份。
+
+## 2026-09-26 續十二：Scenario R 流量模型依 T 重設（使用者要求）
+
+- 舊版 R：profile×p_idle 使閒置時間約 31%（空白太多），且頻寬 2~80 Mbps 是網卡瓶頸時期的舊量級。新版：每 UE 每相位依 idle:burst:traffic=1:2.5:6.5 抽三態；burst 8~16、traffic 依 profile 1~8（sim Mbps）；路徑損耗指標上限由 25 改 24。模擬 2000 相位：比例 1:2.53:6.52、每 UE offered 5.19、17 UE 總 offered 平均 88.3／p95 115.3／最大 149.5、L>22 佔 16%。
+- 舊 R 的 seed 抽樣序列與 PF/avgFL/clusterFL 的 R 數據（09-13、09-19）不再可比；本來這些數據就因環境瑕疵需重測。
+- 尚未實測 R 的平台穩定度（總 offered 的尾端 p95 略高於 CPU 平台 ~105）；正式用 R 量測前先跑一次短測。
+
+- 2026-09-26（使用者決定）：目前實驗以 Scenario T 為主，Scenario R 暫不納入 Stage 比較。

@@ -23,6 +23,7 @@
 
 
 #include <complex.h>
+#include <stdlib.h>
 #include <common/utils/LOG/log.h>
 #include <openair1/SIMULATION/TOOLS/sim.h>
 #include "openair2/LAYER2/NR_MAC_gNB/mac_config.h"
@@ -42,6 +43,9 @@
   either we regenerate the channel (call again random_channel(desc,0)), or we keep it over subframes
   legacy: we regenerate each sub frame in UL, and each frame only in DL
 */
+// 雜訊振幅（LSB）低於此值視為無雜訊，見 rxAddInput()
+#define NOISE_SKIP_AMPLITUDE 0.01
+
 void rxAddInput(const c16_t *input_sig,
                 cf_t *after_channel_sig,
                 int rxAnt,
@@ -199,10 +203,52 @@ void rxAddInput(const c16_t *input_sig,
   // Energy in one sample to calibrate input noise
   // the normalized OAI value seems to be 256 as average amplitude (numerical amplification = 1)
   const double noise_per_sample = add_noise ? pow(10,channelDesc->noise_power_dB/10.0) * 256 : 0;
+  // [CPU] 每個取樣產生 2 個高斯亂數是通道模型最貴的部分。雜訊振幅低於 ~0.01 LSB（noise_power_dB <= -45）時，
+  // 加上去只會在極少數取樣（~1%）造成 ±1 LSB 的四捨五入差異，實質上等於沒有雜訊，因此略過亂數產生。
+  // 雜訊高於門檻時行為與原本完全相同。預設基準值 -50 dB 即落在略過範圍內。
+  const bool apply_noise = noise_per_sample >= NOISE_SKIP_AMPLITUDE;
   const uint64_t dd = channelDesc->channel_offset;
   const int nbTx=channelDesc->nb_tx;
   double Doppler_phase_cur = channelDesc->Doppler_phase_cur[rxAnt];
   Doppler_phase_cur -= 2 * M_PI * round(Doppler_phase_cur / (2 * M_PI));
+
+  // [CPU] 快速路徑：單天線、單分接頭（AWGN）、無都卜勒——本專案所有通道模型都屬於這種。
+  // 原本的通用迴圈每個取樣做一次取模與雙精度複數運算，61.44 Msps 下每個通道就吃掉約一個核心；
+  // 這裡改成對環形緩衝區的連續區段做單精度運算（可向量化），數學上與通用迴圈相同
+  // （out += tx * h * pathLoss + noise），僅浮點精度由 double 改 float（相對誤差 ~1e-7）。
+  // RFSIM_CHAN_FAST=0 可關閉，回到原本的通用迴圈（A/B 對照用）。
+  static int fast_enabled = -1;
+  if (fast_enabled < 0) {
+    const char *e = getenv("RFSIM_CHAN_FAST");
+    fast_enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+  }
+  if (fast_enabled && nbTx == 1 && channelDesc->channel_length == 1 && channelDesc->Doppler_phase_inc == 0.0) {
+    const struct complexd *h = channelDesc->ch[rxAnt];
+    const float gr = (float)(h->r * pathLossLinear);
+    const float gi = (float)(h->i * pathLossLinear);
+    // 與通用迴圈相同的環形索引：idx(i) = ((TS + i - dd) + CirSize) % CirSize
+    const uint64_t start = ((TS - dd) + CirSize) % CirSize;
+    int done = 0;
+    while (done < nbSamples) {
+      const uint64_t idx = (start + done) % CirSize;
+      const int seg = (int)(CirSize - idx < (uint64_t)(nbSamples - done) ? CirSize - idx : (uint64_t)(nbSamples - done));
+      const c16_t *in = &input_sig[idx];
+      cf_t *out = after_channel_sig + done;
+      for (int k = 0; k < seg; k++) {
+        const float tr = in[k].r, ti = in[k].i;
+        out[k].r += tr * gr - ti * gi;
+        out[k].i += ti * gr + tr * gi;
+      }
+      if (apply_noise) {
+        for (int k = 0; k < seg; k++) {
+          out[k].r += noise_per_sample * gaussZiggurat(0.0, 1.0);
+          out[k].i += noise_per_sample * gaussZiggurat(0.0, 1.0);
+        }
+      }
+      done += seg;
+    }
+    return;
+  }
 
   for (int i=0; i<nbSamples; i++) {
     cf_t *out_ptr = after_channel_sig + i;
@@ -239,8 +285,13 @@ void rxAddInput(const c16_t *input_sig,
       Doppler_phase_cur += channelDesc->Doppler_phase_inc;
     }
 
-    out_ptr->r += rx_tmp.r * pathLossLinear + noise_per_sample * gaussZiggurat(0.0, 1.0);
-    out_ptr->i += rx_tmp.i * pathLossLinear + noise_per_sample * gaussZiggurat(0.0, 1.0);
+    if (apply_noise) {
+      out_ptr->r += rx_tmp.r * pathLossLinear + noise_per_sample * gaussZiggurat(0.0, 1.0);
+      out_ptr->i += rx_tmp.i * pathLossLinear + noise_per_sample * gaussZiggurat(0.0, 1.0);
+    } else {
+      out_ptr->r += rx_tmp.r * pathLossLinear;
+      out_ptr->i += rx_tmp.i * pathLossLinear;
+    }
     out_ptr++;
   }
 

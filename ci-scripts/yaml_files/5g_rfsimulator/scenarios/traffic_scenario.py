@@ -53,17 +53,19 @@ import argparse
 import hashlib
 import logging
 import math
+import os
 import random
 import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from channelmod_ctrl import ChannelModController
+from channelmod_ctrl import ChannelModController, UEChannelController
 
 # =============================================================================
 # 全域設定
@@ -125,12 +127,12 @@ UE_HOST_OVERRIDE: dict[str, str] = {
 # Node → 跨主機 chanmod telnet 位址覆寫。UE17 的 traffic control 現在在 pc3
 # 執行（見上），但它的 pathloss channelmod 仍必須透過 Node4 的 DU telnetsrv
 # 下達，而 Node4 的 DU 實際跑在 pc1（HOST_OF_NODE[4]="pc1"）——telnet port
-# 原本只綁 127.0.0.1，2026-09-22 已把 Node4 這個 port 額外開放到 macvlan-br
-# 位址（見 docker-compose-iab-server.yaml 對應註解），讓 pc3 能跨主機連過去。
+# 原本只綁 127.0.0.1；容器接在 macvlan 網路，compose 的 ports: 映射無效，
+# 但 telnetsrv 監聽 0.0.0.0，直接連 Node4 容器自己的 macvlan IP（.153）即可跨主機。
 # 只有 Node4 需要這個覆寫；其餘節點的 telnet 永遠跟自己的 DU 同機，用
 # 127.0.0.1 即可，不需要出現在這個字典裡。
 NODE_TELNET_HOST_OVERRIDE: dict[int, str] = {
-    4: "192.168.88.1",
+    4: "192.168.88.153",
 }
 
 # 校正掃描的 path_loss 值（單位 dB）；上限 25dB，超過會斷線
@@ -144,21 +146,122 @@ _STANDARD_CQIS: list[int] = [15, 12, 10, 8, 6, 4, 2, 1]
 # 重用校正掃描已驗證安全的上限（超過會斷線）。
 PATHLOSS_SAFE_MAX_DB: float = 25.0
 
-# 每 UE 持久化使用者 profile：開場抽一次、整個執行期間不變，比「每個 phase 完全
-# 獨立同分布抽樣」更貼近真實世界「同一個用戶的行為模式有慣性」。三種原型：
-#   heavy    ：重度串流／下載，頻寬需求高、很少閒置
-#   light    ：輕度瀏覽，頻寬需求低、常常閒置
-#   bursty   ：間歇性高峰（視訊通話／遊戲），頻寬變化大、閒置機率中等偏高
-# lognorm_mu/sigma 疊加在 min_mbps 之上（只在上界裁切），p_idle 為該 profile 的
-# 閒置機率。權重決定抽到各 profile 的機率（加總為 1，不必嚴格相等，貼近真實
-# 世界「重度用戶是少數」的分布）。
+# ── 模擬速度 S 與「模擬時間 Mbps」（2026-09-26）──────────────────────────────
+# rfsim 速度調節器讓模擬時間 = 牆鐘時間 × S（見 CLAUDE.md 第 5、8 節；S 存在各主機 build 目錄的 rfsim_speed.txt）。
+# iperf3 跑在牆鐘時間，因此**場景裡的所有頻寬（Scenario T 的各狀態流量檔位、A/B/C/D/R 的 BW）一律代表「模擬時間 Mbps」**，
+# 啟動 iperf3 時才乘上 S 換成牆鐘 Mbps（wall = sim × S）；這樣場景設定與 S 無關，換 S 不必改檔位。
+# 量到的牆鐘吞吐量要除以 S 才是模擬時間吞吐量。SCENARIO_SPEED_S 環境變數可覆寫（測試用）。
+RFSIM_SPEED_FILE = Path("/home/lindor/openairinterface5g/cmake_targets/ran_build/build/rfsim_speed.txt")
+_SIM_SPEED: Optional[float] = None
+
+
+def sim_speed() -> float:
+    """目前的 rfsim 速度比例 S（0<S≤1；檔案不存在或無效視為 1.0＝不調節）。啟動時讀一次並快取。"""
+    global _SIM_SPEED
+    if _SIM_SPEED is None:
+        v = os.environ.get("SCENARIO_SPEED_S")
+        try:
+            val = float(v) if v else float(RFSIM_SPEED_FILE.read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            val = 0.0
+        if val <= 0.0:
+            log.warning("讀不到有效的 rfsim 速度 S（%s），以 S=1.0（不換算）處理", RFSIM_SPEED_FILE)
+            val = 1.0
+        _SIM_SPEED = val
+        log.info("rfsim 速度 S=%.2f：場景頻寬視為模擬時間 Mbps，iperf3 牆鐘頻寬 = 模擬 × S", val)
+    return _SIM_SPEED
+
+# ── 通道惡化（2026-09-26 重寫）──────────────────────────────────────────────
+# 重要更正：rfsim 的 `channelmod modify ... ploss X` 直接把 X 當「增益」（pow(10, X/20)），**正值是放大、負值才是衰減**。
+# 2026-09-26 前場景對 DU 端送的 0~25「路徑損耗」實際是對上行做 0~25 dB 增益，下行完全沒動（UE 端無通道模型）——
+# Stage 1~3 從未有過真正的通道惡化。而且基準訊號振幅本來就低（int16 取樣），可用衰減範圍很窄，正值太大會削波、
+# 負值太大（如 ploss=-15 且 noise=-6）會讓 UE 斷線且不會自動恢復（需乾淨重啟）。
+#
+# 場景仍用原本的 0~PATHLOSS_SAFE_MAX_DB「損耗指標」L（Scenario R 抽的值、T 的 3/12/22、A/B/C/D 的 CQI 對照表），
+# 只是把它視為劣化程度的純量 s=L/PATHLOSS_SAFE_MAX_DB∈[0,1]，再沿著下面這條「已實測、不斷線」的 (ploss, noise)
+# 路徑套用到 UE 端下行通道（UE3/UE11 二維網格，下行 TCP MCS：s=0→28、0.25→27~28、0.5→18~21、0.75→12~13、1→3~4）。
+# 終點 (-10,-6) 離會斷線的 (-15,-6) 有 5 dB 餘裕。**上行（DU 端）通道完全不動**（維持 conf 的正常通道
+# ploss=0、noise=-50；不再送過去那種實為增益的正 ploss），只改變下行。
+# SCENARIO_DL_DEGRADE=0 或 --no-dl-degrade 關閉下行惡化（此時上下行都是正常通道）。
+DL_DEGRADE_ENABLED: bool = os.environ.get("SCENARIO_DL_DEGRADE", "1") != "0"
+# (s, ploss_dB(負=衰減), noise_power_dB)
+DEGRADE_PATH: list[tuple[float, float, float]] = [
+    (0.00, 0.0, -50.0),
+    (0.25, -5.0, -20.0),
+    (0.50, -5.0, -10.0),
+    (0.75, -10.0, -10.0),
+    (1.00, -10.0, -6.0),
+]
+
+
+def degrade_settings(loss_db: float) -> tuple[float, float]:
+    """場景損耗指標 L → (UE 端下行 ploss, UE 端下行 noise)。沿 DEGRADE_PATH 線性內插。"""
+    s = max(0.0, min(1.0, loss_db / PATHLOSS_SAFE_MAX_DB))
+    for (s0, p0, n0), (s1, p1, n1) in zip(DEGRADE_PATH, DEGRADE_PATH[1:]):
+        if s <= s1:
+            f = 0.0 if s1 == s0 else (s - s0) / (s1 - s0)
+            dl_ploss, dl_noise = p0 + f * (p1 - p0), n0 + f * (n1 - n0)
+            break
+    else:
+        dl_ploss, dl_noise = DEGRADE_PATH[-1][1], DEGRADE_PATH[-1][2]
+    return dl_ploss, dl_noise
+
+
+_UE_DL_CTRL: dict[str, UEChannelController] = {}
+
+
+def _ue_dl_ctrl(container: str) -> UEChannelController:
+    if container not in _UE_DL_CTRL:
+        _UE_DL_CTRL[container] = UEChannelController(container)
+    return _UE_DL_CTRL[container]
+
+
+def set_ue_dl_degradation(ue: "UEConfig", loss_db: float) -> None:
+    """在背景執行緒設定 UE 端下行通道（docker exec 每次約 1 秒，平行處理避免拖慢相位切換）。"""
+    if not DL_DEGRADE_ENABLED:
+        return
+    dl_ploss, dl_noise = degrade_settings(loss_db)
+    threading.Thread(target=_ue_dl_ctrl(ue.container).set_channel, args=(dl_ploss, dl_noise), daemon=True).start()
+
+
+def reset_ue_dl_degradation(ues: list["UEConfig"]) -> None:
+    if not DL_DEGRADE_ENABLED:
+        return
+    threads = [threading.Thread(target=_ue_dl_ctrl(ue.container).reset, daemon=True) for ue in ues]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+# ── Scenario R 的流量模型（2026-09-26 依 Scenario T 的模擬 Mbps 量級重設）──
+# 每個 UE 每個相位處於三種狀態之一，比例 idle : burst : traffic = 1 : 2.5 : 6.5
+# （10% : 25% : 65%；舊版 profile×p_idle 的閒置時間約 31%，空白太多）：
+#   idle    ：整個相位不傳資料（bw=0.0 sentinel，真的停 iperf3）
+#   burst   ：高需求突發（對應 T 的高流量檔位量級，見 R_BURST_*）
+#   traffic ：一般持續流量，量級由 UE 的持久化 profile 決定（見 UE_PROFILES）
+# 單位一律是「模擬時間 Mbps」（同 Scenario T；iperf3 牆鐘頻寬 = 這裡的值 × S）。
+# 量級依 2026-09-26 容量實測訂定：全系統 CPU 平台 ~100 sim Mbps；期望每 UE offered ≈ 5 → 17 UE ≈ 85。
+R_STATE_WEIGHTS: dict[str, float] = {"idle": 1.0, "burst": 2.5, "traffic": 6.5}   # 比例 1:2.5:6.5（自動正規化）
+R_BURST_MIN_MBPS: float = 8.0
+R_BURST_MAX_MBPS: float = 16.0            # 對應 T 壅塞相位的高流量（12）到舊 high（16）
+R_BURST_LOGNORM_MU: float = math.log(3.0)
+R_BURST_LOGNORM_SIGMA: float = 0.4
+# R 的路徑損耗指標上限：不用 25（容量 5.4、近斷線邊緣），與 T 一致最高用 24
+R_PATHLOSS_MAX_DB: float = 24.0
+
+# 每 UE 持久化使用者 profile：開場抽一次、整個執行期間不變，決定 traffic 狀態下的流量量級，
+# 比「每個 phase 完全獨立同分布抽樣」更貼近「同一個用戶的行為模式有慣性」。
+#   heavy  ：重度用戶（串流／下載），traffic 流量較高
+#   light  ：輕度瀏覽，traffic 流量低
+#   bursty ：中間型（視訊通話／遊戲）
+# lognorm_mu/sigma 疊加在 min_mbps 之上（只在上界裁切）。權重決定抽到各 profile 的機率。
 UE_PROFILES: dict[str, dict[str, float]] = {
-    "heavy":  {"weight": 0.25, "min_mbps": 15.0, "max_mbps": 80.0,
-               "lognorm_mu": math.log(20.0), "lognorm_sigma": 0.5, "p_idle": 0.08},
-    "light":  {"weight": 0.45, "min_mbps": 2.0,  "max_mbps": 20.0,
-               "lognorm_mu": math.log(3.0),  "lognorm_sigma": 0.5, "p_idle": 0.45},
-    "bursty": {"weight": 0.30, "min_mbps": 5.0,  "max_mbps": 60.0,
-               "lognorm_mu": math.log(8.0),  "lognorm_sigma": 0.9, "p_idle": 0.30},
+    "heavy":  {"weight": 0.25, "min_mbps": 3.0, "max_mbps": 8.0,
+               "lognorm_mu": math.log(2.0), "lognorm_sigma": 0.4},
+    "light":  {"weight": 0.45, "min_mbps": 1.0, "max_mbps": 4.0,
+               "lognorm_mu": math.log(1.0), "lognorm_sigma": 0.5},
+    "bursty": {"weight": 0.30, "min_mbps": 2.0, "max_mbps": 6.0,
+               "lognorm_mu": math.log(1.5), "lognorm_sigma": 0.5},
 }
 
 # TCP/UDP 協定混合：大部分真實流量仍是 TCP（網頁/檔案/串流走 adaptive bitrate
@@ -260,7 +363,7 @@ def start_iperf_client(ue: UEConfig) -> bool:
         "docker", "exec", ue.container,
         "timeout", str(IPERF_DURATION + 30),
         "iperf3", "-c", EXT_DN_IP,
-        "-b", f"{ue.bandwidth_mbps:.0f}M",
+        "-b", f"{max(ue.bandwidth_mbps * sim_speed(), 0.05):.3g}M",   # 模擬時間 Mbps × S = 牆鐘 Mbps
         "-R", "-t", str(IPERF_DURATION),
         "-p", str(ue.iperf_port),
         "-B", ue_ip,
@@ -283,9 +386,9 @@ def start_iperf_client(ue: UEConfig) -> bool:
         )
         ue._last_rx_bytes = 0
         ue._last_rx_check = time.time()
-        log.info("iperf3 start: %s → %s:%d @ %.0fMbps/%s (bind=%s)",
-                 ue.container, EXT_DN_IP, ue.iperf_port, ue.bandwidth_mbps,
-                 ue.protocol.upper(), ue_ip)
+        log.info("iperf3 start: %s → %s:%d @ %.3gMbps(牆鐘，模擬 %.3gMbps × S=%.2f)/%s (bind=%s)",
+                 ue.container, EXT_DN_IP, ue.iperf_port, ue.bandwidth_mbps * sim_speed(),
+                 ue.bandwidth_mbps, sim_speed(), ue.protocol.upper(), ue_ip)
         return True
     except FileNotFoundError:
         log.error("找不到 docker 指令")
@@ -332,6 +435,11 @@ def stop_all_iperf(ues: list[UEConfig]) -> None:
 # 場景應用
 # =============================================================================
 
+def _apply_channel(ue: "UEConfig", ctrl: ChannelModController, loss_db: float) -> None:
+    """套用場景損耗指標到通道：只改下行（UE 端 ploss+noise 路徑）；上行（DU 端）維持正常通道不動。"""
+    set_ue_dl_degradation(ue, loss_db)
+
+
 def apply_ue_config(
     ue: UEConfig,
     ctrl: ChannelModController,
@@ -360,13 +468,15 @@ def apply_ue_config(
     if new_path_loss_db is not None:
         if ue.path_loss_db is None or abs(new_path_loss_db - ue.path_loss_db) > 0.05:
             ue.path_loss_db = new_path_loss_db
-            ctrl.set_path_loss(ue.ue_id, new_path_loss_db)
+            _apply_channel(ue, ctrl, new_path_loss_db)
             table = ctrl.cqi_to_pathloss
             ue.target_cqi = min(table, key=lambda c: abs(table[c] - new_path_loss_db))
             changed = True
     elif new_cqi is not None and new_cqi != ue.target_cqi:
         ue.target_cqi = new_cqi
-        ctrl.set_target_cqi(ue.ue_id, new_cqi)
+        table = ctrl.cqi_to_pathloss
+        nearest = min(table, key=lambda c: abs(c - new_cqi))
+        _apply_channel(ue, ctrl, table[nearest])
         changed = True
 
     protocol_changed = new_protocol is not None and new_protocol != ue.protocol
@@ -491,13 +601,30 @@ def scenario_d_random(ues: list[UEConfig]) -> list[tuple[int, float]]:
     return configs
 
 
-# ── Scenario T（分層交叉：低/中/高流量 × 低/中/高路徑損耗，2026-09-18 新增）──
-# high tier 刻意遠高於單一 UE 實測可達吞吐量（理論峰值 227Mbps，多跳實測約
-# 43.8Mbps，見 CLAUDE.md 第 2 節），確保訓練資料涵蓋「需求真的超過供給」的
-# 壅塞狀態，不是只有溫和對比。
-TRAFFIC_TIERS: dict[str, float] = {"low": 5.0, "medium": 25.0, "high": 120.0}
-PLOSS_TIERS: dict[str, float] = {"low": 3.0, "medium": 12.0, "high": 22.0}
-TIER_COMBOS: list[tuple[str, str]] = [(t, p) for t in TRAFFIC_TIERS for p in PLOSS_TIERS]
+# ── Scenario T（兩狀態：正常 / 壅塞相位 × 分層交叉 低/中/高流量 × 低/中/高路徑損耗）──
+# 2026-09-26 重設計（使用者要求：量測期間約 45% 的「時間」處於壅塞狀態，其餘時間為正常狀態，
+# 兩種狀態內流量與通道仍然變化）。以 11 個相位為一個週期，其中 5 個為壅塞相位（45.5%）；
+# 相位編號用（--phase-origin 起算的）絕對時間換算，PC2/PC3 兩邊自動一致。
+# 單位：模擬時間 Mbps（iperf3 牆鐘頻寬 = 這裡的值 × S，S=0.4）；通道欄位是場景損耗指標 L
+# （0~25，見 DEGRADE_PATH）。單 UE 下行容量曲線（sim Mbps，2026-09-26 實測）：
+#   L=10→40、15→35.5、18→30.8、20→22.2、22→16.8、24→8.6、25→5.4（run 間變異約 ±30%）。
+# 全系統 CPU 限制的「送達」總量平台約 100~108 sim Mbps。
+#   正常相位：流量 1/4/8、L=3/10/18（容量 ≥30，全部送得完，總 offered ≈ 74）。
+#   壅塞相位：流量 1/10/12、L=22/23/24。同節點兩 UE 合計容量（實測，sim Mbps）：L=20→31、21→28、22→23、23→17.6、24→13.2；
+#     相鄰兩 UE 通常同流量檔位，成對 offered = 2/20/24，故約 5/9 的節點過載，期望送達 ≈ 105。不用 L=25（容量 5.4、1% 遺失，近斷線邊緣）。
+NORMAL_TRAFFIC_TIERS: dict[str, float] = {"low": 1.0, "medium": 4.0, "high": 8.0}
+NORMAL_PLOSS_TIERS: dict[str, float] = {"low": 3.0, "medium": 10.0, "high": 18.0}
+CONGESTED_TRAFFIC_TIERS: dict[str, float] = {"low": 1.0, "medium": 10.0, "high": 12.0}
+CONGESTED_PLOSS_TIERS: dict[str, float] = {"low": 22.0, "medium": 23.0, "high": 24.0}
+T_CYCLE_PHASES = 11
+T_CONGESTED_PHASES = frozenset({2, 4, 5, 7, 9})   # 週期內第幾個相位是壅塞相位（5/11=45.5%，分散排列）；跑 11 個相位 = 一整個週期
+TIER_COMBOS: list[tuple[str, str]] = [
+    (t, p) for t in NORMAL_TRAFFIC_TIERS for p in NORMAL_PLOSS_TIERS]
+
+
+def t_phase_congested(phase_index: int) -> bool:
+    """Scenario T 這個相位是否為壅塞相位。"""
+    return (phase_index % T_CYCLE_PHASES) in T_CONGESTED_PHASES
 
 
 def scenario_t_tiered(
@@ -527,10 +654,15 @@ def scenario_t_tiered(
     """
     configs: list[tuple[float, float, str]] = []
     n_combos = len(TIER_COMBOS)
+    congested = t_phase_congested(phase_index)
+    traffic_tiers = CONGESTED_TRAFFIC_TIERS if congested else NORMAL_TRAFFIC_TIERS
+    ploss_tiers = CONGESTED_PLOSS_TIERS if congested else NORMAL_PLOSS_TIERS
+    log.info("Scenario T 相位狀態：%s（phase_index=%d，週期內第 %d/%d 個）",
+             "壅塞" if congested else "正常", phase_index, phase_index % T_CYCLE_PHASES, T_CYCLE_PHASES)
     for i, _ in enumerate(ues):
         combo_idx = (i + phase_index) % n_combos
         traffic_name, ploss_name = TIER_COMBOS[combo_idx]
-        configs.append((PLOSS_TIERS[ploss_name], TRAFFIC_TIERS[traffic_name], protocol))
+        configs.append((ploss_tiers[ploss_name], traffic_tiers[traffic_name], protocol))
     return configs
 
 
@@ -558,7 +690,7 @@ def scenario_r_realistic(
     通道品質：真實蜂巢網路裡 UE 均勻分布在細胞「面積」上，而非均勻分布在 CQI
     值上——面積隨半徑平方成長，代表更多 UE 落在訊號較差的邊緣區域。抽樣
     r = sqrt(U)，U ~ Uniform(0,1)，使 r 的機率密度 f(r) = 2r（隨半徑線性增加，
-    對應環狀面積 ∝ r），再線性映射到 [0, PATHLOSS_SAFE_MAX_DB] dB，直接送
+    對應環狀面積 ∝ r），再線性映射到 [0, R_PATHLOSS_MAX_DB]（=24，場景損耗指標 L，見 DEGRADE_PATH），直接送
     set_path_loss()（繞過 8 點 CQI 對照表，連續值，通道解析度比 A/B/C/D 都細）。
 
     流量需求：每個 UE 開場已抽定一個持久化 profile（見 UE_PROFILES），本函式依
@@ -569,9 +701,10 @@ def scenario_r_realistic(
     協定：每個 UE 每個相位額外抽一個協定（TCP/UDP 混合，見 P_UDP），modeling
     真實流量裡少數即時語音/視訊/遊戲走 UDP、多數網頁/串流走 TCP 的組成。
 
-    時間動態：每個 UE 有其 profile 對應的 p_idle 機率整個相位完全閒置（bw=0.0
-    sentinel，apply_ue_config() 見到會真的停止 iperf3，不是把頻寬設到接近 0），
-    模擬 burst→idle→burst 的真實間歇使用型態。path_loss 不受閒置影響，仍照常
+    時間動態：每個 UE 每個相位依 idle:burst:traffic = 1:2.5:6.5（R_STATE_WEIGHTS）抽
+    三態之一：idle 整個相位完全閒置（bw=0.0 sentinel，apply_ue_config() 見到會真的停止
+    iperf3，不是把頻寬設到接近 0）、burst 高需求突發、traffic 一般持續流量（量級依 profile），
+    模擬 burst→idle→burst 的真實間歇使用型態。頻寬單位是模擬時間 Mbps（同 Scenario T）。path_loss 不受閒置影響，仍照常
     抽樣套用——通道條件是物理環境的屬性，跟有沒有資料在傳輸無關。
 
     seed/phase_index：每個 UE 用 `_rng_for(seed, ue.global_id, phase_index)` 導出
@@ -588,14 +721,27 @@ def scenario_r_realistic(
         prof = UE_PROFILES[ue.profile]
 
         r = math.sqrt(rng.random())
-        path_loss = r * PATHLOSS_SAFE_MAX_DB
+        path_loss = r * R_PATHLOSS_MAX_DB
 
-        if rng.random() < prof["p_idle"]:
+        # 三態抽樣（idle/burst/traffic = 1:2.5:6.5）
+        u = rng.random() * sum(R_STATE_WEIGHTS.values())
+        if u < R_STATE_WEIGHTS["idle"]:
+            state = "idle"
+        elif u < R_STATE_WEIGHTS["idle"] + R_STATE_WEIGHTS["burst"]:
+            state = "burst"
+        else:
+            state = "traffic"
+
+        if state == "idle":
             bw = 0.0
             proto = ue.protocol  # 閒置時協定無意義，維持原值即可
         else:
-            bw = prof["min_mbps"] + rng.lognormvariate(prof["lognorm_mu"], prof["lognorm_sigma"])
-            bw = min(bw, prof["max_mbps"])
+            if state == "burst":
+                bw = R_BURST_MIN_MBPS + rng.lognormvariate(R_BURST_LOGNORM_MU, R_BURST_LOGNORM_SIGMA)
+                bw = min(bw, R_BURST_MAX_MBPS)
+            else:
+                bw = prof["min_mbps"] + rng.lognormvariate(prof["lognorm_mu"], prof["lognorm_sigma"])
+                bw = min(bw, prof["max_mbps"])
             proto = "udp" if rng.random() < P_UDP else "tcp"
             if protocol is not None:
                 proto = protocol
@@ -689,12 +835,90 @@ def wait_for_ue_interfaces(ues: list[UEConfig], max_wait: int = 120) -> bool:
     return False
 
 
+# =============================================================================
+# 崩潰防護（CrashGuard）
+# =============================================================================
+# 場景執行期間，UE / MT / DU 容器若崩潰並被 docker 自動重啟（2026-09-26 事件：
+# nr-uesoftmodem 在 init_RA segfault，重啟後 IP 改變、留下失效 F1-U 位址，造成核心網
+# GTP-U 封包迴圈、整台主機掉包），後續量測全是壞資料，卻沒有任何訊號。這裡在場景開始
+# 時記下本機所有 RAN 容器的 (RestartCount, StartedAt)，之後定期比對；不一樣、或容器
+# 不在 running 狀態，就是崩潰。只涵蓋「本機」容器（PC2/PC3 各自跑自己的 process）。
+
+_GUARD_NAME_RE = re.compile(r"^rfsim5g-(end-ue|iab-mt|iab-du)-\d+$")
+
+
+class ScenarioCrash(RuntimeError):
+    """場景期間偵測到 RAN 容器崩潰/重啟，本次場景（與其量測）視為無效。"""
+
+
+class CrashGuard:
+    def __init__(self, abort: bool) -> None:
+        self.abort = abort
+        self.base: dict[str, tuple[str, str]] = {}
+        self.crashed: dict[str, str] = {}
+
+    @staticmethod
+    def _snapshot() -> dict[str, tuple[str, str, str]]:
+        try:
+            names = subprocess.run(
+                ["docker", "ps", "-a", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout.split()
+            names = [n for n in names if _GUARD_NAME_RE.match(n)]
+            if not names:
+                return {}
+            out = subprocess.run(
+                ["docker", "inspect", "--format",
+                 "{{.Name}}|{{.RestartCount}}|{{.State.StartedAt}}|{{.State.Status}}", *names],
+                capture_output=True, text=True, timeout=30,
+            ).stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return {}
+        snap: dict[str, tuple[str, str, str]] = {}
+        for line in out.splitlines():
+            parts = line.strip().lstrip("/").split("|")
+            if len(parts) == 4:
+                snap[parts[0]] = (parts[1], parts[2], parts[3])
+        return snap
+
+    def arm(self) -> None:
+        snap = self._snapshot()
+        self.base = {n: (v[0], v[1]) for n, v in snap.items()}
+        bad = [n for n, v in snap.items() if v[2] != "running"]
+        for n in bad:
+            self._mark(n, "場景開始時就不在 running 狀態")
+        log.info("CrashGuard 已啟用：監控本機 %d 個 RAN 容器（%s）", len(self.base),
+                 "崩潰即中止場景" if self.abort else "崩潰只警告")
+
+    def _mark(self, name: str, why: str) -> None:
+        if name not in self.crashed:
+            self.crashed[name] = why
+            log.error("⚠ CrashGuard：%s %s", name, why)
+
+    def check(self) -> None:
+        """比對快照；發現新崩潰時標記，abort 模式下丟出 ScenarioCrash。"""
+        if not self.base:
+            return
+        for name, (rc, started, status) in self._snapshot().items():
+            b = self.base.get(name)
+            if status != "running":
+                self._mark(name, f"狀態為 {status}")
+            elif b is not None and (rc, started) != b:
+                self._mark(name, f"已被重啟（RestartCount {b[0]}→{rc}）")
+        if self.crashed:
+            Path(f"/tmp/scenario_invalid_{socket.gethostname()}.txt").write_text(
+                "".join(f"{n}: {w}\n" for n, w in self.crashed.items()))
+            if self.abort:
+                raise ScenarioCrash("、".join(self.crashed))
+
+
 def run_fixed_scenario(
     scenario_name: str,
     ues: list[UEConfig],
     ctrls: dict[int, ChannelModController],
     duration: int,
     protocol: str = "tcp",
+    guard: Optional[CrashGuard] = None,
 ) -> None:
     """執行固定場景，持續 duration 秒後結束。"""
     scenario_fn = {
@@ -713,7 +937,11 @@ def run_fixed_scenario(
             start_iperf_client(ue)
 
     try:
-        time.sleep(duration)
+        end = time.time() + duration
+        while time.time() < end:
+            time.sleep(min(10, max(0.0, end - time.time())))
+            if guard:
+                guard.check()
     except KeyboardInterrupt:
         log.info("收到中斷，停止場景")
     finally:
@@ -723,6 +951,7 @@ def run_fixed_scenario(
             for ue in ues:
                 if ue.node_id == node_id:
                     ctrl.reset_channel(ue.ue_id)
+        reset_ue_dl_degradation(ues)
 
 
 def run_dynamic_scenario(
@@ -734,6 +963,8 @@ def run_dynamic_scenario(
     scenario_label: str = "D",
     max_phases: Optional[int] = None,
     epoch: float = 0.0,
+    guard: Optional[CrashGuard] = None,
+    grid_align: bool = False,
 ) -> None:
     """
     場景 D/R：動態模式，每 phase_duration 秒切換一次相位。
@@ -753,6 +984,9 @@ def run_dynamic_scenario(
     log.info("=== 場景 %s 動態訓練開始，相位間隔 %d 秒 ===", scenario_label, phase_duration)
     phase = 0
     try:
+        if grid_align and epoch and time.time() < epoch:
+            log.info("等待相位原點（%.0f 秒後）開始，兩台主機同時起跑", epoch - time.time())
+            time.sleep(epoch - time.time())
         while True:
             phase += 1
             if epoch:
@@ -762,6 +996,8 @@ def run_dynamic_scenario(
                 configs = phase_fn(ues)
             log.info("── 相位 %d ──", phase)
             apply_scenario_phase(ues, ctrls, configs, raw_path_loss=raw_path_loss)
+            if guard:
+                guard.check()   # 崩潰多半發生在改 UE 端通道的同一秒，套完相位立刻檢查
 
             # 確保所有 iperf3 在第一個相位啟動（跳過刻意閒置的 UE，否則會
             # 立刻把 Scenario R 剛停掉的閒置 UE 重新啟動，閒置機制形同虛設）
@@ -775,10 +1011,15 @@ def run_dynamic_scenario(
             #      （while loop 在容器內自行 sleep 2 後重啟新 session；UDP 沒有壅塞
             #      控制回退問題，但仍可能因 DU 端無資料可送而長期無 rx，watchdog
             #      同樣適用）
-            deadline = time.time() + phase_duration
+            # grid_align：相位邊界固定在 epoch + k×phase_duration（套用通道的耗時算在相位內），
+            # phase_index 才會連號、不跳號，壅塞相位的時間比例才會等於設計值。
+            deadline = (epoch + (phase_index + 1) * phase_duration
+                        if (grid_align and epoch) else time.time() + phase_duration)
             while time.time() < deadline:
                 time.sleep(10)
                 now = time.time()
+                if guard:
+                    guard.check()
                 for ue in ues:
                     # ── 容器級別失敗 ──────────────────────────────────────────
                     if ue._iperf_proc is not None and ue._iperf_proc.poll() is not None:
@@ -810,6 +1051,8 @@ def run_dynamic_scenario(
                     ue._last_rx_check = now
 
             if max_phases is not None and phase >= max_phases:
+                if guard:
+                    guard.check()
                 log.info("已達 max_phases=%d，自動結束場景 %s", max_phases, scenario_label)
                 break
     except KeyboardInterrupt:
@@ -820,6 +1063,7 @@ def run_dynamic_scenario(
             for ue in ues:
                 if ue.node_id == node_id:
                     ctrl.reset_channel(ue.ue_id)
+        reset_ue_dl_degradation(ues)
 
 
 def _build_full_cqi_mapping(observed: list[tuple[float, int]]) -> dict[int, float]:
@@ -964,11 +1208,32 @@ def parse_args() -> argparse.Namespace:
              "直接反映排程器實際分配的容量；TCP 的達成吞吐量會被視窗/RTT 乘積卡住，"
              "見 scenario_t_tiered() 說明。UDP 模式下 DL frozen watchdog 會略過該 UE。",
     )
+    parser.add_argument(
+        "--no-dl-degrade", action="store_true",
+        help="不對 UE 端下行通道加損耗（回到只惡化上行的舊行為；等同 SCENARIO_DL_DEGRADE=0）",
+    )
+    parser.add_argument(
+        "--phase-origin", type=float, default=None,
+        help="Scenario T/R：相位原點（Unix 秒）。兩台主機傳同一個值（例如 `date +%%s` + 10），相位 0 從此刻開始、"
+             "每相位剛好 --phase-duration 秒、編號連號；未指定則沿用固定 epoch（相位可能跳號）。",
+    )
+    parser.add_argument(
+        "--on-crash", choices=["abort", "warn"], default=None,
+        help="場景期間本機 UE/MT/DU 容器崩潰重啟時的處理：abort=清理後以 exit code 2 結束"
+             "（本次量測無效）、warn=只記錄錯誤繼續跑。預設：有限相位/固定場景（量測）=abort，"
+             "無限訓練=warn（訓練由 training_watchdog.sh 負責復原）。偵測到時也會寫 "
+             "/tmp/scenario_invalid_<hostname>.txt。",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    global DL_DEGRADE_ENABLED
+    if args.no_dl_degrade:
+        DL_DEGRADE_ENABLED = False
+    log.info("UE 端下行通道惡化：%s（場景損耗指標 0~%.0f → DEGRADE_PATH，終點 ploss=%.0f noise=%.0f）",
+             "啟用" if DL_DEGRADE_ENABLED else "關閉", PATHLOSS_SAFE_MAX_DB, DEGRADE_PATH[-1][1], DEGRADE_PATH[-1][2])
     host = args.host or _my_hostname_role()
     if host:
         log.info("--host=%s：只控制該主機負責的 UE/Node 子集", host)
@@ -988,8 +1253,22 @@ def main() -> None:
     if not args.no_wait:
         wait_for_ue_interfaces(ues)
 
+    finite = args.scenario in ("A", "B", "C") or (
+        args.scenario in ("T", "R") and args.num_phases is not None)
+    on_crash = args.on_crash or ("abort" if finite else "warn")
+    guard = CrashGuard(abort=(on_crash == "abort"))
+    guard.arm()
+    try:
+        _run_selected(args, ues, ctrls, guard)
+    except ScenarioCrash as exc:
+        log.error("場景因 RAN 容器崩潰而中止（%s）：本次量測無效，需乾淨重啟後重跑", exc)
+        sys.exit(2)
+
+
+def _run_selected(args: argparse.Namespace, ues: list[UEConfig],
+                  ctrls: dict[int, ChannelModController], guard: CrashGuard) -> None:
     if args.scenario == "D":
-        run_dynamic_scenario(ues, ctrls, phase_duration=args.phase_duration)
+        run_dynamic_scenario(ues, ctrls, phase_duration=args.phase_duration, guard=guard)
     elif args.scenario == "T":
         FIXED_EPOCH = 1700000000.0  # 同 Scenario R 用的錨點，純粹是絕對時間基準，兩者不衝突
         t_protocol = args.protocol or "tcp"
@@ -1001,7 +1280,9 @@ def main() -> None:
             raw_path_loss=True,
             scenario_label="T",
             max_phases=args.num_phases,
-            epoch=FIXED_EPOCH,
+            epoch=(args.phase_origin if args.phase_origin else FIXED_EPOCH),
+            guard=guard,
+            grid_align=bool(args.phase_origin),
         )
     elif args.scenario == "R":
         import secrets
@@ -1019,11 +1300,13 @@ def main() -> None:
             raw_path_loss=True,
             scenario_label="R",
             max_phases=args.num_phases,
-            epoch=FIXED_EPOCH,
+            epoch=(args.phase_origin if args.phase_origin else FIXED_EPOCH),
+            guard=guard,
+            grid_align=bool(args.phase_origin),
         )
     else:
         run_fixed_scenario(args.scenario, ues, ctrls, duration=args.duration,
-                           protocol=args.protocol or "tcp")
+                           protocol=args.protocol or "tcp", guard=guard)
 
 
 if __name__ == "__main__":

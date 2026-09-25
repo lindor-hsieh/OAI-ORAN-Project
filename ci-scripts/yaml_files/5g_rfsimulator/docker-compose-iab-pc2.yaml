@@ -119,10 +119,10 @@ services:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001200 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
         volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001200 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001200 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
     # ========================================== 
     # UE2 -> Node5 (access)
@@ -140,10 +140,10 @@ services:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001201 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
         volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001201 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001201 --rfsimulator.serveraddr 192.168.74.20 --rfsimulator.serverport 4048 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
     # ========================================== 
     # UE3 -> Node6 (access)
@@ -161,10 +161,10 @@ services:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001202 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time
         volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001202 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001202 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
     # ========================================== 
     # UE4 -> Node6 (access)
@@ -182,10 +182,10 @@ services:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001203 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time
         volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001203 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001203 --rfsimulator.serveraddr 192.168.74.21 --rfsimulator.serverport 4049 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
     # ========================================== 
     # IAB Node 5 (access) — 子節點掛在 relay Node 1 底下
@@ -308,10 +308,10 @@ services:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001204 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time
         volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001204 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001204 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
     # ========================================== 
     # UE6 -> Node7 (access)
@@ -330,10 +330,10 @@ services:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001205 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time
         volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001205 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001205 --rfsimulator.serveraddr 192.168.74.22 --rfsimulator.serverport 4050 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
     # ========================================== 
     # UE7 -> Node8 (access)
@@ -352,10 +352,10 @@ services:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001206 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time
         volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001206 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001206 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
     # ========================================== 
     # UE8 -> Node8 (access)
@@ -374,10 +374,10 @@ services:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
             USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001207 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time
         volumes:
-             - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001207 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001207 --rfsimulator.serveraddr 192.168.74.23 --rfsimulator.serverport 4051 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
 
 networks:

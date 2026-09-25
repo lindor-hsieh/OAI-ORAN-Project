@@ -278,3 +278,73 @@ class ChannelModController:
             time.sleep(wait_s)
             print("  ← 請記錄 CQI")
         print("\n[校正完成] 請更新 ChannelModController.cqi_to_pathloss")
+
+
+class UEChannelController:
+    """UE 端（下行）通道模型控制器（2026-09-26 起）。
+
+    rfsimulator 的通道模型只作用於「接收端」：gNB/DU 端的 `rfsimu_channel_ue*`（ChannelModController）
+    只影響上行；下行必須改 **UE 端** 的 `rfsimu_channel_enB0`。終端 UE 容器使用
+    `conf/nrue.uicc.chanmod.conf`（啟用 rfsim chanmod）並以 `--telnetsrv --telnetsrv.listenport 9301`
+    開 telnet；UE 在 docker 內部網路，本機（該 UE 所在的主機）無法直接連 127.0.0.1，
+    因此透過 `docker exec <container> bash /dev/tcp` 送指令。UE 只有一條連線，模型索引固定為 0。
+    """
+
+    MODEL_INDEX = 0
+
+    def __init__(self, container: str, port: int = 9301, timeout: float = 5.0) -> None:
+        self.container = container
+        self.port = port
+        self.timeout = timeout
+
+    def _send_command(self, cmd: str) -> str:
+        script = (
+            f"exec 3<>/dev/tcp/127.0.0.1/{self.port}; sleep 0.3; "
+            f"echo '{cmd}' >&3; sleep 0.5; timeout 1 cat <&3"
+        )
+        try:
+            res = subprocess.run(
+                ["docker", "exec", self.container, "bash", "-c", script],
+                capture_output=True, text=True, timeout=self.timeout,
+            )
+            return res.stdout
+        except (subprocess.SubprocessError, OSError) as exc:
+            log.warning("UE 端 telnet 失敗 (%s:%d): %s", self.container, self.port, exc)
+            return ""
+
+    def set_path_loss(self, loss_db: float) -> bool:
+        resp = self._send_command(f"channelmod modify {self.MODEL_INDEX} ploss {loss_db:.1f}")
+        ok = "path loss" in resp
+        log.info("UE-DL set_path_loss %s = %.1f dB → %s", self.container, loss_db, "ok" if ok else "no-resp")
+        return ok
+
+    def set_noise_power(self, noise_db: float) -> bool:
+        resp = self._send_command(f"channelmod modify {self.MODEL_INDEX} noise_power_dB {noise_db:.1f}")
+        ok = "noise" in resp
+        log.info("UE-DL set_noise %s = %.1f dB → %s", self.container, noise_db, "ok" if ok else "no-resp")
+        return ok
+
+    def set_channel(self, ploss_db: float, noise_db: float) -> bool:
+        """一次 docker exec 同時設定 ploss 與 noise_power_dB（各一個 telnet 指令）。
+
+        注意 ploss 的符號：rfsim 把它直接當「增益」（pow(10, ploss/20)），**負值才是衰減**，正值是放大。
+        """
+        script = (
+            f"exec 3<>/dev/tcp/127.0.0.1/{self.port}; sleep 0.3; "
+            f"echo 'channelmod modify {self.MODEL_INDEX} ploss {ploss_db:.1f}' >&3; sleep 0.4; "
+            f"echo 'channelmod modify {self.MODEL_INDEX} noise_power_dB {noise_db:.1f}' >&3; sleep 0.6; "
+            f"timeout 1 cat <&3"
+        )
+        try:
+            res = subprocess.run(["docker", "exec", self.container, "bash", "-c", script],
+                                 capture_output=True, text=True, timeout=self.timeout)
+            ok = "noise" in res.stdout and "path loss" in res.stdout
+        except (subprocess.SubprocessError, OSError) as exc:
+            log.warning("UE 端 telnet 失敗 (%s:%d): %s", self.container, self.port, exc)
+            ok = False
+        log.info("UE-DL set_channel %s ploss=%.1f noise=%.1f → %s", self.container, ploss_db, noise_db, "ok" if ok else "no-resp")
+        return ok
+
+    def reset(self) -> None:
+        """恢復不惡化的基準（ploss=0、noise=-50，同 conf 預設值）。"""
+        self.set_channel(0.0, -50.0)

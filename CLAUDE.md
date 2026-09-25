@@ -25,7 +25,7 @@ Donor→Relay→Access→UE 為 3-hop；UE17→Node4 為 2-hop。**全部 4 個 
 
 > **拓樸設計原則**：全部 4 個 relay 集中在 PC1（跟 Donor 同機），access 節點平均分散到 PC2/PC3，讓四條分支的路徑結構完全一致（Donor→Relay 全部同機、Relay→Access 全部跨主機），避免「跟 Donor 同主機的分支吞吐量系統性領先」的量測 confound（2026-09-22 由舊分布搬遷而來，動機、逐 UE 證據與搬遷過程見 `HISTORY.md`、`experiment_results/PF.md`）。即時 RF process 數約 **PC1:10、PC2:16、PC3:17**（均低於已驗證安全的 ≤18 上限）。
 >
-> UE17 的 pathloss channelmod 控制（Node4 的 DU telnetsrv，PC1）與它的 iperf 流量控制（容器，PC3）分屬兩台主機，因此 Node4 的 chanmod telnet port 額外綁了 macvlan-br 位址 `192.168.88.1:9092`，讓 PC3 的 `traffic_scenario.py` 能跨主機連（見 `NODE_TELNET_HOST_OVERRIDE`）。
+> UE17 的 pathloss channelmod 控制（Node4 的 DU telnetsrv，PC1）與它的 iperf 流量控制（容器，PC3）分屬兩台主機，因此 Node4 的 chanmod telnet port 由 PC3 直接連容器自己的 macvlan IP `192.168.88.153:9092`（macvlan 下 compose `ports:` 映射無效，telnetsrv 監聽 0.0.0.0），讓 PC3 的 `traffic_scenario.py` 能跨主機連（見 `NODE_TELNET_HOST_OVERRIDE`）。
 
 ### 硬體與節點配置表
 
@@ -46,7 +46,7 @@ Donor→Relay→Access→UE 為 3-hop；UE17→Node4 為 2-hop。**全部 4 個 
 | `physCellId` | `0` | `1`~`4` | `5`~`12` | — |
 | E2 `TARGET_NODE_ID`（xApp .c，= gNB_ID 十進位） | — | `3585`~`3588` | `3589`~`3596` | — |
 | `rfsimulator.serverport` | `4043` | `4044`~`4047` | `4048`~`4055` | — |
-| FlexRIC telnet debug port（chanmod 通道控制） | — | `9089`~`9092`（Node4=`9092` 額外開放 macvlan-br 位址 `192.168.88.1`，供 PC3 跨主機控制 UE17，其餘仍 `127.0.0.1`-only） | `9093`~`9100` | — |
+| FlexRIC telnet debug port（chanmod 通道控制） | — | `9089`~`9092`（Node4=`9092` 供 PC3 跨主機控制 UE17，連 `192.168.88.153:9092`；其餘本機用 `127.0.0.1`） | `9093`~`9100` | — |
 | IMSI (`208990100001xxx`) | — | 尾碼 `100`~`103` | 尾碼 `104`~`111` | 尾碼 `200`~`216`（跟 MT 區段刻意拉開） |
 | macvlan IP | `.144`（DU）| Node1=`.150`,Node2=`.151`,Node3=`.152`,Node4=`.153`（全部在 PC1）—— MT/DU 共用同一 netns、同一 IP，這個位址不因實際跑在哪台主機而改變（三台共用同一個 macvlan L2 網段） | Node5=`.160/.161`,Node6=`.162/.163`,Node7=`.164/.165`,Node8=`.166/.167`（PC2）; Node9=`.168/.169`,Node10=`.170/.171`,Node11=`.172/.173`,Node12=`.174/.175`（PC3） | 動態，共用 `12.1.1.0/24` SMF pool；UE17 額外占用 macvlan `.176`（直連 relay，需要自己的 macvlan IP；容器在 PC3，位址不變） |
 | internal bridge IP | — | 不需要（relay 的 MT/DU 共用 netns，沒有獨立位址） | **PC2 用 `192.168.74.0/24`**：Node5=`.10/.20`,Node6=`.11/.21`,Node7=`.12/.22`,Node8=`.13/.23`；**PC3 用 `192.168.75.0/24`**：Node9=`.10/.20`,Node10=`.11/.21`,Node11=`.12/.22`,Node12=`.13/.23` | — |
@@ -104,7 +104,7 @@ CN5G（`.131`~`.134`）、FlexRIC（`.141`）全部在 PC1。
 
 $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \times 12}{T_s^\mu} \times (1-OH) \approx 227\ \text{Mbps（下行，MAC 層理論峰值）}$$
 
-這是規格書定義的絕對上限（假設每個 RE 都排到最高 MCS、最大編碼率），**不是**實際 iperf3 會量到的數字。2026-09-12 機制驗證（`experiment_results/backhaul_mechanism_verification.md`，Node2+Node7 兩個節點都在 PC1 同機、單一 UE、旁邊 UE 閒置）量到 **43.8 Mbps**，比理論峰值低了約 5 倍，受 rfsimulator 軟體模擬與 iperf3/TCP goodput 損耗影響，各項貢獻未拆解驗證。**這個數字是同機路徑量到的，不含跨主機鏈路，不能類比現行「relay 同機、access 跨主機」拓樸的多跳吞吐量**（現行跨主機路徑在 PC3 USB 2.0 網卡瑕疵下，單 UE 容量只有 ~2 Mbps 級，見第 6 節「網路健檢」）。
+這是規格書定義的絕對上限（假設每個 RE 都排到最高 MCS、最大編碼率），**不是**實際 iperf3 會量到的數字。2026-09-12 機制驗證（`experiment_results/backhaul_mechanism_verification.md`，Node2+Node7 兩個節點都在 PC1 同機、單一 UE、旁邊 UE 閒置）量到 **43.8 Mbps**，比理論峰值低了約 5 倍，受 rfsimulator 軟體模擬與 iperf3/TCP goodput 損耗影響，各項貢獻未拆解驗證。**這個數字是同機路徑量到的，不含跨主機鏈路，不能類比現行「relay 同機、access 跨主機」拓樸的多跳吞吐量**（跨主機路徑的容量見第 8 節）。
 
 **多跳鏈路（Donor→Relay→Access→UE）下，backhaul-aware PRB 預算機制本身造成的自我節流上限**：上面 227 Mbps 只考慮「每跳是獨立不競爭的模擬載波」這件事，沒有考慮這次上線的 backhaul-aware 動態 PRB 預算機制（第 3 節）本身在多跳鏈路上會形成一個自我節流的回饋迴圈——因為 UE 的下行資料要送達，必須先實際流過**該 UE 所屬 access 節點自己的 MT 無線鏈路**（DU 的 F1-U 資料是透過該節點 MT 的 tunnel relay 進來的），所以這個節點 MT 的忙碌度，正好就等於它正在 relay 給下游 UE 的那份流量本身，形成自己餵自己的迴圈；Relay 節點的 DU→Access-MT 這一段也是同樣的迴圈。
 
@@ -133,15 +133,22 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 
 | Stage | 策略 | Global 層（配額協調/FL 聚合） | Local 層（單節點 DRL） | 狀態 |
 |---|---|---|---|---|
-| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**，數據見 `experiment_results/PF.md`（該檔頂端有「基準選用表」）。Scenario R（舊拓樸，09-19）：JFI=0.3017、平均 7.33 Mbps、平均 RTT 238.12 ms；Scenario T（舊拓樸，09-21）：0.2811／4.23 Mbps／308.66 ms；**新拓樸 Scenario T（09-22）：0.9810／1.06 Mbps／342.08 ms**——新拓樸下 UE5~8 對其餘 UE 的優勢消失，證實舊拓樸的「同主機分支領先」是 confound，但 JFI≈0.98 主要是所有 UE 被同一個跨主機瓶頸（見下方警語）壓在 ~1 Mbps 的「均貧」，不代表排程更公平，也不是平台真實容量。UE17（Node4 三重負載）現場複測 ICMP 100% 遺失，是已知極端案例（PF.md「UE17 特別說明」） |
+| 1 | PF baseline | 無 | 無（OAI 內建 PF 排程器，全部 12 個 xApp 停止） | **已完成**，數據見 `experiment_results/PF.md`（該檔頂端有「基準選用表」）。Scenario R（舊拓樸，09-19）：JFI=0.3017、平均 7.33 Mbps、平均 RTT 238.12 ms；Scenario T（舊拓樸，09-21）：0.2811／4.23 Mbps／308.66 ms；**新拓樸 Scenario T（09-22）：0.9810／1.06 Mbps／342.08 ms**——新拓樸下 UE5~8 對其餘 UE 的優勢消失，證實舊拓樸的「同主機分支領先」是 confound，但 JFI≈0.98 主要是所有 UE 被同一個跨主機瓶頸（見下方警語）壓在 ~1 Mbps 的「均貧」，不代表排程更公平，也不是平台真實容量。UE17（Node4 三重負載）現場複測 ICMP 100% 遺失，是已知極端案例（PF.md「UE17 特別說明」）。**修正後平台重測（2026-09-26，S=0.4、下行通道真惡化、兩狀態 Scenario T：45.5% 時間壅塞，各 20 分鐘，數字為模擬時間）：UDP 整段 JFI=0.9831／4.80 Mbps／RTT 25.9 ms、壅塞相位需求滿足率 0.789（JFI 0.945）；TCP 0.9871／4.93 Mbps／59.3 ms、壅塞相位滿足率 0.767（JFI 0.936）**——Stage 2~5 一律與這組比較，鑑別指標看壅塞相位的滿足率/JFI/RTT，整段 JFI 因時間平均天然偏高（見 PF.md 最末章節；先前 2/5/8 檔位的結果因無壅塞已作廢） |
 | 2 | avg FL + 最基礎 DRL | Global xApp（全域公平性軟性廣播，Stage 2~5 全程固定）+ Global rApp：標準 FedAvg，全部 12 節點一起聚合 | Local xApp+Local rApp：最基礎 DRL（`REWARD_MODE=throughput_only`，無 Lagrangian／無限制式） | **已完成**（舊拓樸），見 `experiment_results/avgFL.md`。Scenario R（09-19）：JFI=0.2453、6.81 Mbps、RTT 260.14 ms（對照同批 PF 0.3017／7.33／238.12，**三項皆較差**）；Scenario T（09-21）：0.3006／4.35 Mbps／370.13 ms（對照 PF 0.2811／4.23／308.66，JFI、吞吐量小幅較好、在 PF 自身 ~10% 重測雜訊內，RTT 較差）。**尚未達單調遞增**；RTT 變差的原因尚未驗證（假說：DRL Actor 推論延遲疊加進 MAC 排程週期）。訓練資料品質限制：訓練期間曾 10/12 節點閒置（iperf3 server 只監聽 5201），見 avgFL.md |
 | 3 | soft cluster FL + 最基礎 DRL | Global xApp+Global rApp：Soft/Weighted Clustered FL——依節點連續角色比例 `role_ratio_i` 加權聚合出 relay/access 兩個原型模型，每個節點依自己的 `role_ratio_i` 混合接收（硬性二分群是 `role_ratio∈{0,1}` 的特例，設計見下方「Stage 3 分群設計」） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2，只有 Global 聚合方式不同） | **已完成**（舊拓樸），見 `experiment_results/clusterFL.md`。Scenario R（09-19）：JFI=0.3113、5.23 Mbps、RTT 301.93 ms；Scenario T（09-21）：0.2552／4.13 Mbps／350.59 ms（皆**未優於** avg FL 與 PF 同批數字，**未達單調遞增**）。**方法論限制**：訓練/量測視窗內 FL 聚合機會有限、各節點訓練資料品質不對等（Stage 2/3 checkpoint 的訓練流量覆蓋不同），差異不能直接歸因為聚合演算法；聚合公式已離線數學驗證。要在網卡修復、重訓後才有意義 |
 | 4 | 自訂 FL + 最基礎 DRL | Global xApp+Global rApp：自訂聚合演算法（設計見 `inference/STAGE4_CUSTOM_FL_DESIGN.md`） | Local xApp+Local rApp：最基礎 DRL（同 Stage 2/3） | 未開始 |
 | 5 | 自訂 FL + 改良版 DRL | Global xApp+Global rApp：自訂聚合演算法（同 Stage 4，不變） | Local xApp+Local rApp：改良版 DRL（`REWARD_MODE=lagrangian`，重新啟用 Lagrangian JFI 限制機制） | 未開始 |
 
-> **⚠️ 量測條件警語（2026-09-25 發現）**：PC3 的 USB 網卡自 2026-09-11 19:13 起接在 USB 2.0 埠（~320 Mbps 上限），使所有跨主機 rfsim 鏈路變慢（每 UE 只有 ~2 Mbps 級容量、RTT 數百 ms）。**上表全部 Stage 1~3 數據都是在這個硬體瑕疵下量得**，絕對值（吞吐量、RTT）與「哪個 UE/分支較快」的歸因都混有此瓶頸，不代表平台或演算法真實表現；硬體修復（PC3 網卡移到 USB 3.x 埠）並重測前，只能當「同一瑕疵條件下的相對比較」看，Stage 4~5 的驗收也應在修復後的環境進行。詳見第 6 節「網路健檢」、第 8 節、`HISTORY.md` 2026-09-25。
+> **⚠️ 量測條件警語（2026-09-26）**：上表 Stage 1~3 全部數據都是在三個已修正的環境瑕疵下量得——(1) PC3 網卡曾在 USB 2.0；(2) rfsim 網路頻寬瓶頸（已加稀疏傳輸、通道融合讀取、速度調節器，見第 5、8 節）；(3) **場景的「路徑損耗」從未真正惡化過通道**：`ploss` 正值在 rfsim 是增益（負值才是衰減），且 DU 端通道只影響上行、UE 端原本沒有通道模型，下行完全沒被惡化。絕對值與「通道差異」的歸因不代表平台或演算法真實表現；**所有 Stage 需在修正後的同一版 `librfsimulator.so`、同一個速度 S、新的下行通道惡化下重測**。調查細節見 `HISTORY.md` 2026-09-25~26。
 
 **量測方法**（Stage 1~5 沿用同一套以確保公平比較）：`iab/measure_stage.py` 與 `scenarios/traffic_scenario.py` 同時執行，併發取樣全部 17 個 UE 在同一組動態流量+路徑損耗場景下的即時吞吐量與 RTT；每個 stage 的完整數據記錄在 `experiment_results/<方法名>.md`。
+
+**判讀指標（Stage 1~5 一律照這組比較，2026-09-26 起）**：
+* **整段 JFI（每 UE 全程平均吞吐量的 Jain 指數）因時間平均天然偏高（~0.98），Stage 2~5 比較不能只看它。**
+* 必須同時報告 **壅塞相位** 的：① **需求滿足率**（每 UE 達成÷目標，上限 1）平均；② **滿足率 JFI**（UE 間、逐相位計算後取平均，把目標不同的 UE 放在同一尺度）；③ **RTT**；並附各 UE 的個別吞吐量與壅塞相位滿足率（看誰被壓得最兇，例如 UE17）。正常相位只當對照（滿足率應≈1）。
+* 同時驗證場景確實壅塞：壅塞相位佔時間比例（設計 5/11=45.5%）、壅塞相位過載 UE 比例（目標≥3 且 達成/目標<0.85）、總送達 vs 總目標；正常相位過載應≈0%。沒有壅塞的量測沒有鑑別力，視為無效。
+* 數字一律用模擬時間（吞吐量 ÷S、RTT ×S）。**不論開發或正式定案，每次量測一律 TCP 與 UDP 各量一份（不省略任一種）**、各自比較；兩者吞吐量相近，但 RTT（壅塞相位 TCP 約 116 ms／UDP 約 32 ms）、滿足率與 CPU 負載不同，論文驗收標準也同時列 TCP-DL 與 UDP。基準：PF 兩狀態 Scenario T（`experiment_results/PF.md` 最末章節）：壅塞相位滿足率 UDP 0.789／TCP 0.767，滿足率 JFI 0.945／0.936。
+* 工具：`iab/clean_env.sh`（重啟前清理）→ 依序重啟 → `iab/precheck_measure.sh`（13/13 E2、RestartCount、17 UE、iperf3 server；Stage 2~5 設 `EXPECT_XAPP=12`）→ `OUT_DIR=<dir> iab/run_stage_measure.sh {tcp,udp} <tag>` → `python3 iab/analyze_stage.py <dir> <tag>`（輸出上述全部指標）。
 
 **單調遞增要求**：PF < avg FL + 最基礎DRL < cluster FL + 最基礎DRL < 自訂FL + 最基礎DRL < 自訂FL + 改良版DRL。Stage 2→3→4 只換 Global 聚合方式、Local 模型不變，單獨驗證「聚合策略」的貢獻；Stage 4→5 只換 Local reward 機制、Global 聚合不變，單獨驗證「改良版 DRL（Lagrangian）」的貢獻——每次只換一個變數，才能把進步歸因到正確的地方。
 
@@ -216,7 +223,7 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 | `R/docker-compose-iab-server.yaml` | PC1：CN5G、Donor CU/DU、FlexRIC、MongoDB、12 組 `xapp-nodeN`+`inference-nodeN`、**全部 4 個 relay（Node1~4，Node4 含直連 UE17 的 DU）**、Global 層（`profiles: ["stage2-fl"]`）。由 `iab/run_local_pc1.sh` → `iab/start_iab_server.sh` 啟動 |
 | `R/docker-compose-iab-pc2.yaml` | PC2：Node5~8 access + UE1~8（parent relay 在 PC1，跨主機）。`iab/run_local_pc2.sh` → `start_iab_pc2.sh` |
 | `R/docker-compose-iab-pc3.yaml` | PC3：Node9~12 access + UE9~17（含 UE17，邏輯上掛 Node4）。`iab/run_local_pc3.sh` → `start_iab_pc3.sh` |
-| `R/conf/` | `donor_cu.conf`、`donor_du.conf`、`iab_du_node{1..12}.conf`、`flexric.conf`、`nrue.uicc.conf`（IP/ID 對照見第 1 節；`iab_du_node*.conf` 的 `local_n_address` 等欄位會被啟動腳本在執行期覆寫，所以 git 上常顯示為已修改） |
+| `R/conf/` | `donor_cu.conf`、`donor_du.conf`、`iab_du_node{1..12}.conf`、`flexric.conf`、`nrue.uicc.conf`（MT 用）、`nrue.uicc.chanmod.conf`（17 個終端 UE 用：啟用 UE 端 DL 通道模型；IP/ID 對照見第 1 節；`iab_du_node*.conf` 的 `local_n_address` 等欄位會被啟動腳本在執行期覆寫，所以 git 上常顯示為已修改） |
 | `R/experiment_results/` | 各 stage 量測結果（`PF.md`、`avgFL.md`、`clusterFL.md`、`backhaul_mechanism_verification.md`）與 `checkpoints_archive/` |
 | `HISTORY.md`（專案根） | 歷史踩坑/量測紀錄（見文件開頭慣例） |
 
@@ -226,7 +233,7 @@ $$\text{Data Rate} = v_{layers} \times Q_m \times R_{max} \times \frac{N_{PRB} \
 |---|---|
 | 啟動 / 網路 | `run_local_pc{1,2,3}.sh`、`start_iab_{server,pc2,pc3}.sh`、`start_xapp_node{1..12}.sh`（compose 使用）、`setup_lab_net.sh`（三主機網卡與 SSH）、`run_stage2_fl.sh`（帶起 Global 層並清空經驗/checkpoint） |
 | 訓練（長時間收斂訓練） | `training_scenario_driver.sh`（場景輪替）、`training_watchdog.sh`（崩潰復原）、`training_healthcheck.sh` |
-| 量測 | `measure_stage.py`（併發取樣 17 UE 吞吐量與 RTT，輸出 CSV） |
+| 量測 | `measure_stage.py`（併發取樣 17 UE 吞吐量與 RTT，輸出 CSV；場景期間有容器崩潰會寫 `.invalid` 並 exit 2）、`clean_env.sh`（整套重啟前三台清理並驗證）、`precheck_measure.sh`（量測前檢查）、`run_stage_measure.sh`（兩狀態 Scenario T 量測，TCP/UDP）、`analyze_stage.py`（判讀指標分析，見第 3 節） |
 | 資料封存 | `archive_stage_data.sh`、`restore_stage_data.sh`（MongoDB 經驗與 checkpoint 封存/還原到 `checkpoints_archive/`） |
 | 收斂診斷（現行） | `check_convergence_mongo.py`（讀 MongoDB `node{N}_experiences` 的 reward 趨勢；`training_healthcheck.sh` 有呼叫，且不受容器重啟清 log 影響） |
 | **保留但未被現行流程呼叫的工具（用途待定，未刪除）** | `check_convergence_weights.py`：2026-09-18 新增的權重穩定度版收斂判斷——因 reward 的視窗內變化量幾乎完全由「目前輪替到哪個訓練場景 slot」決定（方波），不反映 policy 學習進度，改直接量測 policy 權重是否停止變化；沒有任何腳本呼叫，需手動執行。`check_convergence.py`：舊版，解析 `docker logs inference-nodeN` 的訓練摘要（預設只看 Node1~5；容器每次崩潰復原重啟就會清掉 log，長訓練幾乎湊不齊輪數，已被上面兩支取代，`training_healthcheck.sh` 仍提到它）。`calibrate_fl_rate.py`：一次性校準探測，輪詢 MongoDB 量出各節點「可訓練經驗筆數」的實際成長曲線（`STAGE3_CLUSTER_FL_DESIGN.md` §8 用來估 FL 量測視窗長度；需搭配 RAN + `traffic_scenario.py` 同時在跑、MongoDB 剛清空）。`clean_lambda_contamination.py`：一次性資料清潔，刪除 MongoDB 裡混入的 Lagrangian 污染經驗（帶 `lambda_applied` 欄位者；預設 dry-run，`--execute` 才真刪；為 2026-09-18 `REWARD_MODE` 被 watchdog 短暫重設回 lagrangian 的事後補救） |
@@ -268,7 +275,7 @@ openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
 openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
 ```
 
-**Backhaul-aware PRB 預算機制（第 3 節）**：`openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c`（把 `backhaul_prb_ratio` 套進可用 RB）、`openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB_backhaul_poll.{c,h}`（DU 端輪詢執行緒：連 MT 的 `bhload query` 取 RB 使用量、換算成 `backhaul_prb_ratio`）、`common/utils/telnetsrv/telnetsrv_bhload.{c,h}`（`bhload` telnet 模組，直接编進 `nr-softmodem`/`nr-uesoftmodem`，非獨立 `.so`）、`radio/rfsimulator/simulator.c`（`librfsimulator.so`，跨主機同步時要一起重編）。
+**Backhaul-aware PRB 預算機制（第 3 節）**：`openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c`（把 `backhaul_prb_ratio` 套進可用 RB）、`openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB_backhaul_poll.{c,h}`（DU 端輪詢執行緒：連 MT 的 `bhload query` 取 RB 使用量、換算成 `backhaul_prb_ratio`）、`common/utils/telnetsrv/telnetsrv_bhload.{c,h}`（`bhload` telnet 模組，直接编進 `nr-softmodem`/`nr-uesoftmodem`，非獨立 `.so`）、`radio/rfsimulator/simulator.c`（`librfsimulator.so`，跨主機同步時要一起重編；含 2026-09-26 起的**稀疏傳輸** patch：只送每個 slot 第一到最後一個非零取樣＋1 取樣結尾標記，接收端本來就會補零，取樣內容不變只降低傳輸量；`RFSIM_SPARSE=0` 可關閉回到完整傳送；另有通道模型融合讀取（`RFSIM_CHAN_FAST=0` 關閉）與**速度調節器**：伺服器端（gNB/DU）依各主機 build 目錄的 `cmake_targets/ran_build/build/rfsim_speed.txt`（值 S，模擬時間=牆鐘×S，可不重啟調整；檔案不存在=不調節）節流，**目前設 0.4**（三台都要一致，見第 8 節）。**所有 Stage 必須用同一版 `.so`、同一個 S**）。
 
 ---
 
@@ -291,6 +298,8 @@ sudo ./build_oai --gNB --nrUE --build-e2 --ninja -w USRP -C --cmake-opt -DE2AP_V
 > **PC2（Ubuntu 20.04）額外需求**（三台主機唯一不是 24.04 的，除錯過程見 HISTORY.md）：`libuhd-dev`（focal 原生倉庫有）、`libyaml-cpp-dev` 需從源碼建置 0.8.0（原生只有 0.6.2，OAI CMake 需要新版 ALIAS target 支援）、CMake 需用 Kitware 倉庫裝到 3.28.3（原生 3.16.3 太舊）、GCC 需用 `ppa:ubuntu-toolchain-r/test` 裝 gcc-13/g++-13 並設為預設（原生 9.4.0 編譯 AVX512 SIMD 會報錯）。**執行期額外需求**：`nr-uesoftmodem`/`nr-softmodem` 連結 host 的 `libssl.so.1.1`，但容器基底只有 `libssl3`，需把 `/usr/lib/x86_64-linux-gnu/{libssl,libcrypto}.so.1.1` 複製進 `cmake_targets/ran_build/build/`（此檔案不在版控裡，`ran_build` 目錄重建後要重做）。
 
 ### 一鍵啟動三主機系統
+
+**重啟前先清理：每次整套重啟前先在 PC1 跑 `bash iab/clean_env.sh`**（三台一次清掉殘留容器/行程/遺留 iperf3/暫存檔並驗證，不乾淨會 exit 1，此時不可重啟；docker volume 不動）。
 
 **建議做法（2026-09-14 驗證更穩定）：完全依序啟動，不要三台同時跑**——先讓 PC1 的基礎設施（不含 E2 等待、不含 xApp 啟動）單獨跑完，再依序（不要同時）跑 PC2、PC3，最後回 PC1 做 E2 等待＋啟動 xApp：
 
@@ -319,6 +328,8 @@ ping -c 30 -i 0.1 -q 192.168.88.2; ping -c 30 -i 0.1 -q 192.168.88.3
 ```
 
 **⚠️ 每次乾淨重啟後、啟動任何 `traffic_scenario.py`（不管是量測用的一次性呼叫，還是 `training_scenario_driver.sh` 的訓練用長駐呼叫）之前，必須先在 PC1 執行 `bash scenarios/setup_iperf_servers.sh`**：這支腳本在 `rfsim5g-oai-ext-dn` 容器裡啟動 17 個各自獨立的 iperf3 server（port 5201~5217，一個 UE 一個 port）。`start_iab_server.sh` 自己內建的 `docker exec -d rfsim5g-oai-ext-dn iperf3 -s`（無 `-p` 參數，只監聽預設的 5201）**不是這支腳本的替代品**——用預設埠的單一 server 只能服務到剛好對應 5201 的那個 UE（依現行對照即 UE1），其餘 16 個 UE 的 iperf3 client 會持續 `connection refused` / `rc=1` crash-loop，且是靜默失敗（scenario log 只會印 `WARNING iperf3 supervisor 退出...重啟 loop`，不會讓整個腳本報錯、也不會讓 UE 的 ping 連通性檢查失敗），非常容易在乾淨重啟時被忽略，讓訓練或量測在「看起來正常運作」的情況下，實際上只有 1/17 UE 真正產生流量、其餘節點的 MAC 層狀態近乎閒置——訓練跟量測都會失去意義（現場案例見 `HISTORY.md` 2026-09-20 條目）。`training_watchdog.sh` 的 `full_recovery()` 目前**沒有**自動呼叫這支腳本，是已知缺口，之後排查「崩潰復原後訓練資料看起來正常但品質不對」時應優先檢查這裡。
+
+server 用 `iperf3 -s -1`（服務完一個連線才退出、迴圈重啟），**不可再加 `timeout N`**：17 個 server 同時啟動，會每 N+1 秒同步被砍一次，讓所有 UE 的 client 同一秒集體 rc=1。場景跑完後應在 PC2/PC3 檢查 `sudo journalctl -k --since "-10min" | grep segfault`：曾發生 `nr-uesoftmodem` 在 `init_RA`（UE MAC RA 初始化，空指標）segfault，與場景的 UE 端通道變更同一秒發生，被 docker 自動重啟後 IP 改變、留下失效的 F1-U 位址，導致 UPF 在閒置時仍被封包迴圈吃滿，整個 pc3 掉包；發生時只能乾淨重啟（見 `HISTORY.md` 2026-09-26 續八）。`traffic_scenario.py` 內建 **CrashGuard**：場景開始時記下本機 UE/MT/DU 容器的 RestartCount/StartedAt，每 10 秒與每次套完相位後比對，發現重啟就記 ERROR、寫 `/tmp/scenario_invalid_<hostname>.txt`；有限相位/固定場景（量測）預設 `--on-crash abort`（清理後 exit code 2，該次量測無效），無限訓練預設 `warn`。量測腳本要檢查場景 exit code 與該標記檔。
 
 ### 啟動 Stage 2 起的 Global 層（avg FL / cluster FL / 自訂 FL）
 ```bash
@@ -397,7 +408,7 @@ GLOBAL_XAPP_LOOKBACK = 50（global_xapp.py，計算節點平均吞吐量時往�
 
 `scenarios/traffic_scenario.py` 提供多種流量場景，透過 `channelmod_ctrl.py` 對 OAI rfsimulator 的 telnet chanmod 介面（`channelmod modify <ue_id> ploss <val>`，即時生效不需重啟容器）動態調整每個 UE 的路徑損耗，模擬通道劣化環境。
 
-**場景清單**：A（CQI 差異化）、B（流量不均）、C（最差公平性）、D（動態訓練，均勻隨機）、**R（真實隨機，推薦）**。Scenario R 用面積均勻抽樣模擬細胞邊緣 UE 較多、lognormal 重尾分佈模擬真實流量需求（多數適中、少數高需求）、間歇閒置機率模擬 burst→idle→burst 使用型態、持久化的每 UE 使用者 profile（heavy-streaming/light-browsing/bursty-iot）避免每個 phase 完全獨立同分布、TCP/UDP 協定混合，並支援 `--seed` 重現同一串隨機條件供 PF vs DRL 的 paired comparison 使用。
+**場景清單**：A（CQI 差異化）、B（流量不均）、C（最差公平性）、D（動態訓練，均勻隨機）、**R（真實隨機）**、**T（兩狀態壅塞，量測基準用，見下）**。Scenario R：面積均勻抽樣模擬細胞邊緣 UE 較多（場景損耗指標 L 最高 24，不用 25）、每 UE 每相位依 **idle : burst : traffic = 1 : 2.5 : 6.5**（10%:25%:65%）抽三態（idle 整相位不傳、burst 高需求 8~16 sim Mbps、traffic 一般流量依持久化 profile heavy/light/bursty 為 1~8 sim Mbps；量級與 Scenario T 同為模擬時間 Mbps，期望每 UE offered ≈5.2、17 UE 總 offered 平均 ≈88、p95 ≈115）、TCP/UDP 混合（`P_UDP=0.25`），並支援 `--seed` 重現同一串隨機條件供 PF vs DRL 的 paired comparison 使用、`--phase-origin` 讓相位連號。R 沒有「壅塞/正常」狀態標籤，`analyze_stage.py` 只適用 Scenario T。 **目前實驗（Stage 1~5 比較）以 Scenario T 為主**；R 已改好但未在真實平台驗證，需要時再跑短測。
 
 **UDP 版本（2026-09-25 起，`--protocol {tcp,udp}`）**：`traffic_scenario.py` 的 T/R/A/B/C 五個場景都支援 `--protocol udp`，把全部 UE 統一改用 UDP 跑，通道/頻寬設定不變、只換傳輸層，供 TCP/UDP 1:1 對照。未指定時各場景維持原行為（T/A/B/C=tcp、R=TCP/UDP 混合）；R 指定 `--protocol` 時同 seed 的路徑損耗/頻寬/閒置抽樣序列與原本完全一致，只有協定被覆寫。UDP 模式下 DL frozen watchdog 會略過該 UE（UDP 沒有壅塞退讓，重啟 iperf3 不會有幫助，反而會覆寫 log 抹掉 `measure_stage.py` 的取樣）。
 
@@ -409,14 +420,20 @@ nohup bash iab/training_scenario_driver.sh --host pc2 --epoch <EPOCH> --protocol
 nohup bash iab/training_watchdog.sh --epoch <EPOCH> --protocol udp > /tmp/training_watchdog.log 2>&1 &
 ```
 
-**平台整體容量上限（2026-09-25 實測，根因是硬體）**：目前每個 UE 的單獨 DL 容量只有 ~1.7~2 Mbps（UDP 5 Mbps 灌 10 秒，6.25MB 全部送達、0% 遺失但花 ~35 秒；8 個 UE 同時各送 1 Mbps 加總也只有 ~1.8 Mbps），TCP/UDP 撞到同一個上限（先前「TCP 卡在視窗÷RTT」「PF 輪流餓 UE」的說法已被推翻）。根因：PC3 的 USB 網卡接在 USB 2.0 埠（~320 Mbps），而每條跨主機 rfsimulator 鏈路都要傳連續 IQ 取樣（同機鏈路 RTT 0.04 ms／~2.2 Gbps，跨主機 ~9 ms／~45 Mbps），慢的鏈路讓模擬時間變成「慢動作」，且 PC3 的瓶頸會連帶拖慢 PC2 的鏈路（PC3 容器暫停後 PC2 網卡流量 165 Mbps→1.7 Gbps、UE1 UDP 容量 ~1.7→~12 Mbps）。修法是把網卡移到 USB 3.x 埠（**尚未實體修復／驗證**）。完整證據鏈與已排除項目見 `HISTORY.md` 2026-09-25 各條目。
+**平台容量與量測注意事項（2026-09-26）**：
+* **速度調節器與時間膨脹**：rfsim 預設「跑多快算多快」，網路不再是瓶頸後會吃光 PC2/PC3 CPU（17 個即時程序互搶→秒級延遲、掉包）。以速度檔設 **S=0.4**（使用者決定；TCP 灌滿 4 UE 時牆鐘總量 42.6 Mbps＝~106 模擬 Mbps，標準差 4.7 為所有 S 最穩、CPU 閒置 ~55%）。S=0.5 為上限（PC2 負載下閒置僅 12.5%）、≥0.6 負載下 CPU 飽和。CPU 上限的模擬時間負載約 100 Mbps 不隨 S 變，**降低 S 是用時間換 CPU 餘裕**。**模擬時間 = 牆鐘 × S**：牆鐘量到的吞吐量 = 模擬時間吞吐量 × S，RAN 相關 RTT 牆鐘值 = 模擬值 ÷ S；所有 Stage 用同一個 S，論文方法論須說明。
+* **容量（S=0.5 實測，牆鐘 Mbps；÷S 為模擬時間）**：單 UE TCP 下行 32~38；全系統總容量平台 ~54（~108 模擬），與 UE 數/協定無關，是 **CPU 限制**；CPU 餘裕 ≥20% 的最大總 offered 約 32~35 牆鐘。每條跨主機 rfsim 鏈路即時需 ~2 Gbps，網卡曾是瓶頸。
+* **場景頻寬單位 = 模擬時間 Mbps**：`start_iperf_client()` 啟動時乘上 S 換成牆鐘 `-b`，場景設定與 S 無關；量到的牆鐘吞吐量要 ÷S。**Scenario T 為兩狀態設計**（`NORMAL_*`／`CONGESTED_*` 檔位，11 個相位一週期，第 2/4/5/7/9 個為壅塞相位＝45.5% 的時間；狀態內保留 3×3 流量×通道輪替）：正常相位 流量 1/4/8、L=3/10/18（總 offered ≈74，全送得完）；壅塞相位 流量 1/10/12、L=22/23/24（同節點兩 UE 合計容量 23/17.6/13，約 5/11 的 UE 過載，總送達 ≈95 對目標 ≈128）。量測用 `--phase-origin <epoch>`（兩台主機傳同一個值）使相位剛好 `--phase-duration` 秒且連號；未指定則相位會因套用通道耗時而跳號。容量曲線與設計推導見 `HISTORY.md` 2026-09-26（續十）。**不要用 L=25**（容量 5.4、近斷線邊緣）。
+* **量測方法**：一律用 `-R`（下行）看**接收端**報告；UDP 傳送端永遠顯示送出速率與 0% 遺失；不要用 offered ≫ 容量估容量；TCP 下「冷 UE」（第一次傳的 UE）吞吐量偏低，成因未明。
+* **協定/資料**：TCP 與 UDP 狀態分佈不同，切換協定前比照 `REWARD_MODE` 先清空 MongoDB 經驗與 checkpoint。
+* **`measure_stage.py`**：2026-09-25 前的 regex 讀不到 `0.00 bits/sec`，該日前的 CSV（含 Stage 1~3）平均值與 JFI 偏高。
 
-注意：（1）在修復前，UDP 版 Scenario T/A/B/C 的目標頻寬（5/25/120 Mbps 等）比實測容量高 3~60 倍，傳送端持續灌入、佇列（無丟包）越積越深，新連線與 iperf3 控制連線、ICMP 都排在佇列後面，造成「先啟動的流拿走全部、其餘長時間 0 吞吐量、iperf3 server busy、洪水後 ping 暫時 100% 遺失」——這是過載造成的佇列/首發優勢，不是 PF 排程器公平性行為；要在 UDP 下量測，offered load 必須依修復後重新實測的容量調整。（2）TCP 與 UDP 產生的狀態分佈不同，**不要把兩種協定的訓練經驗混在同一批 MongoDB/checkpoint 裡**——切換協定前比照 `REWARD_MODE` 的規則先清空經驗與 checkpoint。（3）既有 Stage 1~3 數字（`PF.md`/`avgFL.md`/`clusterFL.md`）是 TCP（或 R 的混合）量的，跟 UDP 版不可直接比較，要在 UDP 下重跑 PF baseline 才有對照基準。（4）`measure_stage.py` 的速率 regex 在 2026-09-25 前讀不到 `0.00 bits/sec`（零吞吐量被略過、記成空白），該日期前產生的 CSV（含 Stage 1~3 全部量測）平均值與 JFI 會偏高；修復後零樣本記為 `0.00` 並計入平均，**修復前後的量測數字不可直接比較**。
+**通道惡化機制（2026-09-26 重寫，所有場景 A/B/C/D/R/T 共用）**：
+* **rfsim 通道模型只作用於接收端**：DU 端的 `rfsimu_channel_ue*`（`ChannelModController`）只影響上行；下行要改 **UE 端** `rfsimu_channel_enB0`（終端 UE 用 `nrue.uicc.chanmod.conf`，telnet port 9301，`UEChannelController` 經 `docker exec` 連入）。
+* **`ploss` 的符號：正值是增益、負值才是衰減**（`pow(10, ploss/20)`）。正值太大會 int16 削波；負值/雜訊太大會讓 UE 斷線且**不會自動恢復**（需乾淨重啟）。已知會斷線的點：UE 端 (ploss -15, noise -6)、ploss ≥ +36。
+* **場景只惡化下行、上行維持正常通道**：場景損耗指標 L（0~25）→ s=L/25 → 沿 `DEGRADE_PATH` 內插 UE 端 (ploss, noise)：s=0→(0,-50)、0.25→(-5,-20)、0.5→(-5,-10)、0.75→(-10,-10)、1→(-10,-6)；實測下行 MCS 由 28 單調降到 3~4（T 的低/中/高檔位 = MCS ~28/~23/~8）。`--no-dl-degrade` 或 `SCENARIO_DL_DEGRADE=0` 關閉。`PATHLOSS_SAFE_MAX_DB=25.0` 只是 L 的上限（s=L/25 的分母），不是實際 dB；A/B/C/D 的 CQI 經 `cqi_to_pathloss` 對照表轉成 L（舊的 `--calibrate` 流程量的是上行增益，已失效，勿用）。校準數據見 `HISTORY.md` 2026-09-26（續四）。
 
-
-路徑損耗安全上限 `PATHLOSS_SAFE_MAX_DB=25.0`（超過會讓 UE 斷線，已現場驗證）。Scenario R 直接送連續 ploss 值，不需要 CQI 校正；Scenario A/B/C/D 需要（`--calibrate --node N`）。
-
-**跨主機執行**：telnet chanmod port 原則上只在該主機本機（`127.0.0.1`）可連，`traffic_scenario.py` 用 `--host {pc2,pc3}` 各自在本地執行、只套用自己負責的 UE/Node 子集；兩台主機用同一個 `--seed`，每個 UE 每個 phase 的隨機值用 `(seed, ue_global_id, phase_index)` 三元組獨立導出（`phase_index` 以絕對時間換算），不需要跨主機即時通訊即可保持同步。**唯一例外是 UE17**（2026-09-22 起）：它的容器在 pc3、但邏輯上掛的 Node4 telnet 在 pc1，`build_controllers()` 用 `NODE_TELNET_HOST_OVERRIDE` 讓 pc3 這邊跨主機連 `192.168.88.1:9092`（見第 1 節）——PC1 不需要、也不會執行這支腳本（PC1 沒有任何 UE 容器）。
+**跨主機執行**：telnet chanmod port 原則上只在該主機本機（`127.0.0.1`）可連，`traffic_scenario.py` 用 `--host {pc2,pc3}` 各自在本地執行、只套用自己負責的 UE/Node 子集；兩台主機用同一個 `--seed`，每個 UE 每個 phase 的隨機值用 `(seed, ue_global_id, phase_index)` 三元組獨立導出（`phase_index` 以絕對時間換算），不需要跨主機即時通訊即可保持同步。**唯一例外是 UE17**（2026-09-22 起）：它的容器在 pc3、但邏輯上掛的 Node4 telnet 在 pc1，`build_controllers()` 用 `NODE_TELNET_HOST_OVERRIDE` 讓 pc3 這邊跨主機連 `192.168.88.153:9092`（見第 1 節）——PC1 不需要、也不會執行這支腳本（PC1 沒有任何 UE 容器）。
 
 ```bash
 # PC2：控制 UE1~8

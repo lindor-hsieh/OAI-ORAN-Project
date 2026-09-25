@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -76,6 +77,20 @@ def _ping_rtt_ms(container: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+# traffic_scenario.py 的 CrashGuard 偵測到本機 UE/MT/DU 容器崩潰重啟時寫的標記檔。
+# 只認「本腳本啟動之後」才出現/更新的標記（mtime >= 啟動時間），避免上一次殘留的舊檔誤判。
+INVALID_MARK = Path(f"/tmp/scenario_invalid_{socket.gethostname()}.txt")
+
+
+def _invalid_reason(started: float) -> str | None:
+    try:
+        if INVALID_MARK.stat().st_mtime >= started:
+            return INVALID_MARK.read_text().strip()
+    except FileNotFoundError:
+        pass
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", choices=["pc1", "pc2", "pc3"], required=True)
@@ -94,6 +109,10 @@ def main() -> None:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_path = Path(str(out_path) + ".invalid")
+    invalid_path.unlink(missing_ok=True)
+    started = time.time()
+    invalid: str | None = None
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["timestamp", "host", "ue_container", "achieved_mbps", "rtt_ms"])
@@ -104,6 +123,9 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=max(len(ues), 1)) as pool:
             deadline = time.time() + args.duration
             while time.time() < deadline:
+                invalid = _invalid_reason(started)
+                if invalid:
+                    break
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 mbps_list = [_latest_rate_mbps(Path(f"/tmp/iperf_client_{ue.container}.log")) for ue in ues]
                 rtt_list = list(pool.map(lambda ue: _ping_rtt_ms(ue.container), ues))
@@ -114,6 +136,13 @@ def main() -> None:
                 f.flush()
                 time.sleep(args.interval)
 
+    invalid = invalid or _invalid_reason(started)
+    if invalid:
+        invalid_path.write_text(invalid + "\n")
+        print(f"[measure_stage] ⚠ 量測無效：場景期間偵測到 RAN 容器崩潰重啟\n{invalid}\n"
+              f"已寫入 {invalid_path}；CSV（{out_path}）只含崩潰前的樣本，不可當作有效數據。",
+              file=sys.stderr)
+        sys.exit(2)
     print(f"[measure_stage] 完成，結果寫入 {out_path}")
 
 

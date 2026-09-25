@@ -75,7 +75,7 @@ ROLE_RATIO: dict[int, float] = {
 
 ### 3.1 公式
 
-`IABClusterFedAvg.aggregate_train()`（`server_app.py:224-263`）不是把節點切成兩組
+`IABClusterFedAvg.aggregate_train()`（`server_app.py`）不是把節點切成兩組
 各自獨立 FedAvg，而是讓**每個節點依自己的 `role_ratio_i` 同時、按比例貢獻進兩個
 「原型」模型**：
 
@@ -84,10 +84,10 @@ W_relay  = Σ_i (1-role_ratio_i)·n_i·ΔW_i  /  Σ_i (1-role_ratio_i)·n_i     
 W_access = Σ_i   role_ratio_i  ·n_i·ΔW_i  /  Σ_i   role_ratio_i  ·n_i     (i ∈ 全部 12 節點)
 ```
 
-程式碼裡（`server_app.py:227-239`）用兩個桶子（`relay_items`／`access_items`）
+程式碼裡（`server_app.py` 的 `aggregate_train()` 內）用兩個桶子（`relay_items`／`access_items`）
 收集每個節點的 `(flat_state_dict, weight)`，`weight` 分別是
 `(1-role)*num_examples` 與 `role*num_examples`，再各自丟給共用的加權平均函式
-`_weighted_average_flat()`（`server_app.py:134-143`）。
+`_weighted_average_flat()`（`server_app.py`）。
 
 ### 3.2 與標準硬分群公式的關係
 
@@ -114,7 +114,7 @@ W_relay = Σ_i (1-role_ratio_i)·n_i·ΔW_i / Σ_i (1-role_ratio_i)·n_i
 ### 3.3 冷啟動防呆
 
 跟 Stage 2 的 `IABFedAvg` 共用同一套「全部節點 `num-examples=0` 時跳過本輪聚合」
-的降級語意（見 `server_app.py:169-187` 的 `ZeroDivisionError` 防呆），但因為
+的降級語意（見 `IABFedAvg.aggregate_train()` 的 `ZeroDivisionError` 防呆），但因為
 cluster 模式要分兩組分別判斷，`_weighted_average_flat()` 改成「權重總和 ≤ 0 時
 回傳 `None`」而非拋例外，讓 relay／access 兩側可以獨立判斷「這一側這輪是否有
 新資料可聚合」——例如只有 relay 側節點這輪湊到訓練門檻，`w_access` 會是 `None`，
@@ -124,7 +124,7 @@ cluster 模式要分兩組分別判斷，`_weighted_average_flat()` 改成「權
 
 ## 4. 廣播公式
 
-`_broadcast_cluster_weights()`（`server_app.py:266-290`）把兩個原型依每個節點
+`_broadcast_cluster_weights()`（`server_app.py`）把兩個原型依每個節點
 自己的 `role_ratio_i` 混合後，個別寫回各自的 checkpoint：
 
 ```
@@ -153,24 +153,24 @@ Multi-Center FL 的 soft assignment、或 APFL（Adaptive Personalized FL）的�
 
 ### 5.1 `IABClusterFedAvg` 繼承 `IABFedAvg`
 
-`server_app.py:203-263`。只覆寫 `aggregate_train()`；`aggregate_evaluate()`
+`server_app.py` 的 `IABClusterFedAvg` 類別。只覆寫 `aggregate_train()`；`aggregate_evaluate()`
 （跟分群無關的診斷用 eval_loss 平均）直接繼承沿用，不重寫。
 
 ### 5.2 兩個原型的資料通道：`self._last_w_relay` / `self._last_w_access`
 
 Flower 的 `Result` 物件一輪只能裝一個 `ArrayRecord`，裝不下「兩個原型」。
 `aggregate_train()` 算完後直接存在 strategy 實例的 `self._last_w_relay`／
-`self._last_w_access` 上（`server_app.py:244-247`），回傳值裡的 `arrays` 只是
-用來滿足 Flower 內部「Result.arrays 非空」的判斷（`server_app.py:256-258` 的
+`self._last_w_access` 上（`IABClusterFedAvg.aggregate_train()` 尾段），回傳值裡的 `arrays` 只是
+用來滿足 Flower 內部「Result.arrays 非空」的判斷（`aggregate_train()` 回傳處的
 註解特別強調這點），**真正的廣播邏輯在 `main()` 裡 `strategy.start()` 跑完後
-直接讀這兩個屬性**（`server_app.py:365-369`），不透過 `aggregate_train()` 的
+直接讀這兩個屬性**（`main()` 內），不透過 `aggregate_train()` 的
 回傳值傳遞。
 
 ### 5.3 `client_app.py` 的必要改動：`node_id` 欄位
 
 Stage 3 是這個檔案唯一需要改動的地方（CLAUDE.md 原本假設 Stage 2→3 只換 Global
 聚合方式、`client_app.py` 完全不變，但這裡有一個例外）：`train()` 的回覆 metrics
-多加一個整數欄位 `node_id`（`client_app.py:130-133`）。
+多加一個整數欄位 `node_id`（`client_app.py` 的 `train()`）。
 
 原因：Server 端要依 `role_ratio_i` 分組加權，必須知道每筆回覆來自哪個實體節點，
 但 Flower 的 `Message` 內部 node id 是 SuperLink 指派的亂數、跟本專案的
@@ -179,7 +179,7 @@ Stage 3 是這個檔案唯一需要改動的地方（CLAUDE.md 原本假設 Stag
 
 ### 5.4 `FL_MODE` 切換
 
-`main()`（`server_app.py:340`）依環境變數 `FL_MODE` 決定 instantiate
+`main()`（`server_app.py`）依環境變數 `FL_MODE` 決定 instantiate
 `IABClusterFedAvg`（`cluster`）還是 `IABFedAvg`（`avg`，預設值），比照既有的
 `REWARD_MODE` 模式：
 
@@ -188,7 +188,7 @@ FL_MODE=cluster REWARD_MODE=throughput_only bash iab/run_stage2_fl.sh
 ```
 
 `min_train_nodes`/`min_evaluate_nodes`/`min_available_nodes` 三個 Flower 參數
-維持對全部 12 節點的門檻（`server_app.py:345-347`），因為現在是全體節點都貢獻
+維持對全部 12 節點的門檻（`main()` 內建立 strategy 處），因為現在是全體節點都貢獻
 進兩個原型，不是子集分群，不需要拆成兩組各自的門檻。
 
 ---
@@ -210,7 +210,12 @@ FL_MODE=cluster REWARD_MODE=throughput_only bash iab/run_stage2_fl.sh
 
 ## 7. 量測結果摘要與已知限制
 
-完整數據見 `experiment_results/clusterFL.md`。核心結論：
+> **⚠️ 資料條件（2026-09-25 標註）**：下表是 **2026-09-13/14 舊拓樸（UE5~8 與 Donor 同機）+ TCP 流量 +
+> `MODEL_ARCH=gru`（GRU 架構，當時尚無 MLP 開關，見 `DRL_DESIGN.md` 檔頭）** 下量到的歷史數據，且量測期間
+> PC3 網卡在 USB 2.0 埠（見 `CLAUDE.md` §3 量測條件警語）。`experiment_results/clusterFL.md` 之後另有
+> 2026-09-19/21 的重測版；新拓樸（2026-09-22 起）／UDP／網卡修復後皆需重測，本表僅供歷史對照，不可當現況引用。
+
+完整數據見 `experiment_results/clusterFL.md`。當時（舊條件）的核心結論：
 
 | 指標 | Stage 1 PF | Stage 2 avg FL | **Stage 3 cluster FL** |
 |---|---|---|---|
@@ -312,7 +317,7 @@ python3 iab/calibrate_fl_rate.py --duration 600 --interval 30 --out /tmp/fl_cali
 
 > **2026-09-18 更新**：上述「連續性門檻不能隨便放寬」的但書**僅在
 > `MODEL_ARCH=gru` 時適用**。`drl_agent.py` 現在預設 `MODEL_ARCH=mlp`
-> （Stage 2~4「最基礎 DRL」的架構釐清，見 `DRL_METHODOLOGY_PLAN.md` 補記），
+> （Stage 2~4「最基礎 DRL」的架構釐清，見 `DRL_DESIGN.md` 檔頭 MODEL_ARCH 補記），
 > `mlp` 模式下訓練走 `training_pipeline.fetch_experiences()` 打散抽樣，
 > 完全不受 `_is_contiguous()`／`TRAIN_SEQ_LEN`／`TRAIN_SEQ_COUNT` 限制，只看
 > `MIN_TRAIN_EXPERIENCES=200` 原始經驗數——上面提到「理論 20 秒 vs 實測 57

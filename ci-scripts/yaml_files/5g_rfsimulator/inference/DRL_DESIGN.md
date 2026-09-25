@@ -18,7 +18,7 @@
 
 ## 1. 系統定位
 
-每個 IAB Node（共 5 個）部署一個獨立的 **Local xApp**，負責該節點的下行 PRB 資源分配。
+每個 IAB Node（共 12 個，Node1~12）部署一個獨立的 **Local xApp**，負責該節點的下行 PRB 資源分配。
 OAI MAC 排程週期是 **10 ms**，但 C xApp 有 Rate Limiter（每 10 個 MAC callback 才觸發
 一次 ZMQ），所以 Python 推論伺服器實際感受到的**有效控制週期是 100 ms**，不是 10ms——
 這點會直接影響 state 裡 `Δtbs` 的量測窗口（見 §2.1）與 MongoDB 經驗的寫入頻率（見 §8）。
@@ -70,14 +70,20 @@ OAI gNB (C 語言)
 > 見 §5.2）。訓練資料現在**刻意**混入間歇性流量（見 `traffic_scenario.py` Scenario R 的
 > `P_IDLE` 機制），讓 policy 也能學會處理真實世界常見的非飽和流量情境。
 
+> **⚠️ 歷史記錄（2026-07-09，舊拓樸）＋ 2026-09-25 更正**：下方「單一 TCP 串流天花板 ~8-12 Mbps 是協定/RTT
+> 物理限制」的解釋**已被推翻**——2026-09-25 查出當時（及之後）的低吞吐量主因是 PC3 的 USB 網卡接在
+> USB 2.0 埠（~320 Mbps 上限）拖慢所有跨主機 rfsimulator 鏈路，並非 TCP 視窗×RTT；詳見 `CLAUDE.md` §8 與
+> `HISTORY.md` 2026-09-25。另外，現行 Stage 量測與訓練輪替主要使用 Scenario T（5/25/120 Mbps 三檔）與 R，
+> 下方 `[5, 50]` Mbps 僅是當時 Scenario R 的校準結果。
+>
 > **Scenario R 頻寬範圍（`REALISTIC_BW_MIN_MBPS`／`REALISTIC_BW_MAX_MBPS`，2026-07-09 現場測試訂出）**：
 > 訓練流量的目標頻寬（iperf3 `-b` 參數）現在是 `[5, 50]` Mbps 的 lognormal 抽樣
 > （median≈11、mean≈12.2，詳見 `traffic_scenario.py` 常數區塊註解），不是文件過去暗示的
 > 固定高頻寬。這個範圍是實測校準出來的，不是憑感覺選的：
 > - **單一 UE、最佳通道（path_loss=0dB）下，掃描目標頻寬 5~200 Mbps，實測吞吐量天花板
 >   卡在 ~8-12 Mbps，不管目標設多高都一樣**——這是 testbed 本身單一 TCP 串流 + RTT 的
->   物理限制，不是 OAI 排程器的問題（跟 CLAUDE.md §8 記錄的 4/20 PF baseline 逐 UE 數字
->   高度吻合，6.81~11.35 Mbps）。
+>   物理限制，不是 OAI 排程器的問題（跟當時 4/20 PF baseline 逐 UE 數字高度吻合，
+>   6.81~11.35 Mbps；**此歸因已被更正，見上方警語**）。
 > - 同一次測試也證實「目標頻寬超過 50 Mbps 會讓 DU 崩潰」的舊說法**不成立**——測到
 >   200 Mbps，DU 全程穩定運行，沒有任何 crash/assert。
 > - 既然目標頻寬只要略高於這個 ~10 Mbps 天花板就足以讓 RLC buffer 持續有積壓（`Δtbs`
@@ -92,8 +98,8 @@ OAI gNB (C 語言)
 ### 2.2 State 向量編碼
 
 State 為固定長度 **50 維**的 float32 向量（MAX\_UE\_COUNT = 16，2026-07-09 同日先從
-33 維擴充到 49 維加入 `dl_buffer_info`，稍晚再加一維 `prb_quota_ratio` 到 50 維，
-見下方說明）：
+33 維擴充到 49 維加入 `dl_buffer_info`，稍晚再加一維全域 context 特徵到 50 維；該維最初是
+`prb_quota_ratio`，**Stage 2 起改為 `fairness_bias`**，見下方說明）：
 
 ```
 state_vec = [
@@ -102,7 +108,7 @@ state_vec = [
     ...
     norm_tbs_15, norm_mcs_15, norm_buf_15,  # UE slot 15（不足補 0）
     active_ratio,                            # 全域 context 特徵
-    prb_quota_ratio                          # 全域 context 特徵（Global xApp 回傳配額）
+    fairness_bias_norm                       # 全域 context 特徵（Global xApp 公平性廣播）
 ]
 ```
 
@@ -112,7 +118,7 @@ state_vec = [
 | `norm_mcs_i` | `mcs_i / 28.0` | [0, 1] |
 | `norm_buf_i` | `log(1 + buf_i) / log(1 + MAX_BUF_INFO)`，`MAX_BUF_INFO=2,000,000` | [0, 1] |
 | `active_ratio` | `n_active / 16` | [0, 1] |
-| `prb_quota_ratio` | `1.0`（relay node，恆不受限）／`prb_quota / 106`（access node） | [0, 1] |
+| `fairness_bias_norm` | `(clip(fairness_bias, 0.5, 2.0) - 0.5) / 1.5`（12 個節點對稱，Global xApp 每 2 秒廣播） | [0, 1] |
 
 - `Δtbs`／buffer occupancy 都使用 **log 正規化**，壓縮大數值差距；`MAX_BUF_INFO` 取
   2,000,000 是現場實測（2026-07-09，Scenario R，**當時頻寬範圍還是舊版 `[25,50]`
@@ -121,14 +127,13 @@ state_vec = [
   整體需求壓力只會變低不會變高，這個常數邏輯上仍是安全的上界，未重新校準
 - MCS 使用**線性正規化**，MCS=0 合法（反映最差通道品質）
 - 非活躍 UE 的 slot 填 0，並透過 **mask** 在 softmax 中遮蔽
-- **`prb_quota_ratio`（2026-07-09 新增，Global 配額特徵）**：在此之前，Global xApp
-  的回傳配額只在 Actor 輸出「之後」拿來裁切分配（見 §3.1 的 Phase 5a 邏輯），Actor
-  本身完全不知道配額限制存在。加入這個特徵後，`InferenceServer._current_quota_ratio()`
-  在 `infer()`／`encode_state()` 每個呼叫點都算好比例傳入，讓 Actor 能在輸出分配「之前」
-  就感知配額緊繃程度，提前學會避免過度分配（而不是每次都被動裁切、浪費探索）。
-  relay node（Node1/2）不受配額限制，恆為 1.0；access node（Node3/4/5）依
-  `_quota_sub_worker()` 收到的最新配額換算。`DRLAgent` 本身不需要知道 relay/access
-  的區別，這個職責劃分維持在 `InferenceServer` 層。
+- **`fairness_bias_norm`（Stage 2 起，Global 公平性特徵；取代 2026-07-09 舊版 `prb_quota_ratio`）**：
+  `global_xapp.py` 每 `GLOBAL_XAPP_INTERVAL_S`（預設 2 秒）依 MongoDB 全部 12 個節點近期平均吞吐量算出
+  `fairness_bias = clip(global_mean / (node_mean + eps), 0.5, 2.0)`，經 ZMQ PUB（`tcp://127.0.0.1:5560`，
+  topic `nodeN`）廣播；`InferenceServer._fairness_sub_worker()` 接收、`_current_fairness_bias()` 在
+  `infer()`／`encode_state()` 各呼叫點取值傳入。它是**純軟性 state 特徵**，不做任何 PRB 裁切，全部
+  12 個節點（relay／access）處理方式相同。舊版 `prb_quota_ratio`（relay 恆 1.0、access 依 Global 配額）
+  與其 Python 端配額裁切邏輯已整段移除。`STATE_DIM=50` 不變。
 - **破壞性變更**：State 維度改變會讓所有舊 checkpoint 的 Actor/Critic 第一層權重
   input_dim 對不上，2026-07-09 已清空 MongoDB 經驗與 checkpoint、從隨機初始化重新訓練
   （此次連同下方 §4 的 GRU 架構改動一起做，兩者都要求同一次「清空重來」）
@@ -143,18 +148,15 @@ Actor Network 輸出每個 UE 的 **PRB 分配比例**（經 Masked Softmax）�
 
 | 參數 | 數值 |
 |---|---|
-| 系統 PRB 總數 | 106（對應 100 MHz 頻寬） |
+| 系統 PRB 總數 | 106（30 kHz SCS，等效 40 MHz 頻寬） |
 | 最小 PRB 保底 | **5** PRB / 活躍 UE（`MIN_PRB_PER_UE`／`MIN_PRB`，防止 MAC 層 SIGSEGV；DRL 與啟發式兩條路徑一致） |
 | Action 輸出維度 | 16（MAX\_UE\_COUNT） |
 | 非活躍 UE | Mask 遮蔽（logit = −∞，softmax 輸出 ≈ 0） |
 
-> **Phase 5 額外限制（Global xApp 回傳配額）**：Node3/4/5（access node）在完成 PRB 分配後，
-> 若收到 Global xApp 下發的配額 `quota < 106`，會依比例裁切超額分配，讓實際下發的
-> `sum(prb_abs) ≤ quota`（見 `inference_server.py` 主迴圈的 Phase 5a 邏輯），模擬 in-band
-> IAB 回傳瓶頸。這一步發生在 Actor 輸出之後、寫回 OAI 之前，reward 仍以裁切後的實際
-> 分配計算。**2026-07-09 起**，`prb_quota_ratio` 已加入 state（見 §2.2），Actor 事前就能
-> 感知配額緊繃程度，這裡描述的裁切邏輯本身沒有改變，只是不再是 Actor「唯一」得知配額
-> 限制的管道——裁切仍然保留，作為 Actor 輸出誤判時的硬性安全網。
+> **可用 PRB 池的縮小發生在 C 層，不在 Python 端**：Backhaul-aware 動態 PRB 預算（`gNB_scheduler_dlsch.c`，
+> `n_rb_sched = (int)(bw * backhaul_prb_ratio)`）依該節點 MT 的忙碌度縮小 DU 可用 PRB 池，對 PF 與 DRL
+> 一視同仁，是排程器的輸入約束；Python 端不再對 Actor 輸出做任何配額裁切（舊 Phase 5a 邏輯已移除）。
+> 機制說明見 `CLAUDE.md` 第 3 節「環境層新增機制」。
 
 ### 3.2 PRB 分配計算流程
 
@@ -164,7 +166,7 @@ Actor logits (16 維)
   → Softmax → 比例向量 (加總 = 1.0)
   → × 106 → 浮點 PRB 數
   → 取整 + 餘數補最大分數 UE
-  → 每個活躍 UE 至少 1 PRB
+  → 每個活躍 UE 至少 5 PRB（MIN_PRB）
   → MAC_CTRL_REQ 寫回 OAI
 ```
 
@@ -322,8 +324,8 @@ $$R = W_{tp} \cdot R_{tp} + W_{fair} \cdot R_{fair} - W_{delay} \cdot R_{delay}$
 
 | 版本 | $W_{tp}$ | $W_{fair}$ | $W_{delay}$ | 說明 |
 |---|---|---|---|---|
-| 歷史值（複合 reward） | 0.5 | 0.4 | 0.1 | 提高公平性權重至 0.4，防止 2-UE policy monopoly collapse（見 CLAUDE.md §7） |
-| 純 Throughput Ablation（2026-07-06 起） | 1.0 | 0.0 | 0.0 | 刻意拿掉公平性/延遲校正，直接對比 PF 的 sum throughput，驗證了固定權重無法同時適應 A/B/C 三場景的問題，促成改用 Lagrangian（見 CLAUDE.md 純 Throughput Reward Ablation 量測結果） |
+| 歷史值（複合 reward） | 0.5 | 0.4 | 0.1 | 提高公平性權重至 0.4，防止 2-UE policy monopoly collapse（見 `HISTORY.md` 早期 reward 設計條目） |
+| 純 Throughput Ablation（2026-07-06 起） | 1.0 | 0.0 | 0.0 | 刻意拿掉公平性/延遲校正，直接對比 PF 的 sum throughput，驗證了固定權重無法同時適應 A/B/C 三場景的問題，促成改用 Lagrangian（見 `HISTORY.md` 2026-07 純 Throughput Reward Ablation 量測記錄） |
 
 `reward_calculator.py` 裡 `W_THROUGHPUT`/`W_FAIRNESS`/`W_DELAY` 常數與 `compute_reward()`
 函式**都還在，只是不再是 `inference_server.py` 呼叫的路徑**（現在呼叫的是
@@ -364,8 +366,8 @@ $$R_{fair} = \frac{JFI_{raw} - 1/N}{1 - 1/N}$$
 model-dependent 的固定值、缺乏梯度意義；這個問題不影響 Lagrangian 公式，因為 Lagrangian
 比較的是 $JFI_{raw}$ 與 $JFI_{min}$ 的差距，不需要先縮放到 $[0,1]$。）
 
-論文優化目標仍是 JFI 盡量接近或超過 PF baseline（CLAUDE.md §8 的舊全域基準 0.924，
-或 2026-07-09 現場量測、Scenario R 條件下的 0.8291，見 §5.1），但 Lagrangian 公式的
+論文優化目標仍是 JFI 盡量接近或超過 PF baseline（現行 PF 基準見 `experiment_results/PF.md`；
+`JFI_MIN=0.8291` 是 2026-07-09 現場量測、Scenario R 舊條件下的門檻，見 §5.1），但 Lagrangian 公式的
 語意稍有不同：目標不是「JFI 越高越好」，而是「JFI 不低於門檻，其餘全力衝 throughput」。
 
 **R_delay（PRB 效率懲罰）**：本研究以 **PRB 效率**作為延遲代理指標：
@@ -472,7 +474,7 @@ $s'_t$ 的完整歷史」的函數，剛好就是 `value_seq` 往後移一位。
 **Phase 5 之後，訓練迴圈的實際程式碼被抽到共用模組 `training_pipeline.py` 的
 `run_training_round()`**，`inference_server.py` 的 `_train_worker`（本節，每 60 秒）與
 Phase 5 的 Flower `ClientApp`（`flower-app/iab_fl/client_app.py` 的 `@app.train()`，
-每小時的聯邦學習輪次）**共用同一份訓練邏輯**，只是呼叫的時機、資料存檔的時機不同。
+每 `FL_ROUND_INTERVAL_S` 秒的聯邦學習輪次，compose 目前為 180 秒）**共用同一份訓練邏輯**，只是呼叫的時機、資料存檔的時機不同。
 `_train_worker` 呼叫時會傳入 `self._model_lock`，包住實際碰觸 `actor`/`critic` 權重的
 forward/backward 段落（不包 MongoDB I/O），因為近即時 ZMQ 推論迴圈也會用同一個
 `DRLAgent` 實例的 `infer()`，兩者必須互斥存取，避免權重被「撕裂」讀取。
@@ -622,7 +624,7 @@ DRL 推論使用**隨機策略**：以 actor softmax 輸出乘以集中度 K 作
 ## 8. Experience 儲存格式（MongoDB）
 
 **每次收到 C xApp 的 ZMQ 請求儲存一筆 document**——因 C xApp Rate Limiter，實際週期是
-**100ms**，不是原始 MAC callback 的 10ms（見 §1、CLAUDE.md §7「狀態觀測窗口」）：
+**100ms**，不是原始 MAC callback 的 10ms（見 §1、`CLAUDE.md` 第 7 節「狀態觀測窗口與正規化常數」）：
 
 ```json
 {
@@ -640,7 +642,7 @@ DRL 推論使用**隨機策略**：以 actor softmax 輸出乘以集中度 K 作
   "jfi_raw":        float,
   "r_fairness":     float,
   "r_delay":        float,
-  "lambda_applied": float,
+  "lambda_applied": float,   # 僅 REWARD_MODE=lagrangian 時寫入；throughput_only 時不含此鍵
   "is_idle":        bool,
   "used_drl":       bool
 }
@@ -668,7 +670,7 @@ xApp 重連後的空白 state，`len(ues) == 0`）時才跳過寫入——這種
 怎麼處理閒置狀態），只是不計入公平性平均。副作用：每個節點的文件量大約增加
 （對應 Scenario R 的 `P_IDLE` 比例）。
 
-Collection 命名規則：`node{1~5}_experiences`（各 Node 獨立儲存）。
+Collection 命名規則：`node{1~12}_experiences`（各 Node 獨立儲存）。
 
 ---
 
@@ -684,8 +686,8 @@ Collection 命名規則：`node{1~5}_experiences`（各 Node 獨立儲存）。
         │
         ▼
 [Inference Server Python / ZeroMQ REP]
-  quota_ratio = _current_quota_ratio()
-  encode_state(ues, quota_ratio) → state_vec (50,)
+  fairness_bias = _current_fairness_bias()（Global xApp 廣播的最新值）
+  encode_state(ues, fairness_bias=...) → state_vec (50,)
   （取得 _model_lock）
   DRL: Actor.forward(state, mask, _actor_hidden) → probs, new_hidden
        → _actor_hidden = new_hidden.detach()
@@ -693,9 +695,6 @@ Collection 命名規則：`node{1~5}_experiences`（各 Node 獨立儲存）。
   啟發式: _infer_heuristic() → action_ratios
   → allocations: [{"rnti", "prb_abs"}, ...]
   （釋放 _model_lock）
-        │
-        ▼ Phase 5a（僅 access node 3/4/5）：依 Global xApp quota 裁切
-  effective_prb = min(106, quota_from_global) → 依比例裁切 allocations
         │
         ▼
 [xApp C / MAC_CTRL_REQ]
@@ -718,10 +717,10 @@ Collection 命名規則：`node{1~5}_experiences`（各 Node 獨立儲存）。
   比對 model_nodeX.pt 的 mtime，若被 Flower ClientApp 覆寫過 → 熱重載進記憶體
 ```
 
-**Phase 5b（relay node 1/2 專屬）**：`_alloc_pub_sock` 會把該節點對其下游 MT 的即時
-PRB 分配結果 PUB 出去（`tcp://127.0.0.1:556{1,2}`），由 `global_xapp_bridge.py` 訂閱、
-彙整成 access node 的配額，再 PUB 到 `tcp://127.0.0.1:5560` 給 Node3/4/5 訂閱——這條
-資料流跟上面近即時 ZMQ REQ/REP 迴圈平行運作、互不阻塞。詳見 `PHASE5_GLOBAL_DEV_LOG.md`。
+**Global xApp 公平性廣播（與上面近即時迴圈平行、互不阻塞）**：`global_xapp.py` 每 2 秒讀 MongoDB 算出每節點
+`fairness_bias`，PUB 到 `tcp://127.0.0.1:5560`（topic `nodeN`），由 `_fairness_sub_worker()` 更新
+`_current_fairness_bias()` 取用的值。舊版 Phase 5a/5b（relay 分配 PUB → `global_xapp_bridge.py` → access
+配額裁切）已移除，歷史脈絡見 `HISTORY.md`「附錄：已刪除的 PHASE5_GLOBAL_DEV_LOG…」。
 
 ---
 
@@ -739,7 +738,7 @@ os.replace(tmp_path, path)
 ```
 
 背景是 Phase 5 之後，同一個 checkpoint 檔案有**兩個行程**可能同時寫入：`inference_server.py`
-的 `_train_worker`（每 60 秒）與 Flower `ClientApp`（每小時 FL round，見下方 §10.2，
+的 `_train_worker`（每 60 秒）與 Flower `ClientApp`（每 `FL_ROUND_INTERVAL_S` 秒一輪 FL，見下方 §10.2，
 以 `--isolation subprocess` 跑在獨立行程）。若不是原子寫入，`_reload_worker` 可能讀到
 寫一半的檔案（`torch.load()` 拋例外或載入損毀權重）。`os.replace()` 保證讀者永遠讀到
 「完整的舊檔」或「完整的新檔」，不會讀到中間狀態。
@@ -767,5 +766,5 @@ Flower `ClientApp` 因為 `--isolation subprocess`（SuperNode 預設模式）�
 
 這代表**近即時推論行程用的模型權重，最多會延遲 30 秒（`RELOAD_POLL_INTERVAL_S`）才會
 反映 FL 聚合後的最新結果**，不是 FL round 結束的當下就立即生效。這個延遲是刻意的
-（輪詢間隔而非檔案系統事件通知），因為 FL round 本身是小時級週期，30 秒的反應延遲
+（輪詢間隔而非檔案系統事件通知），因為 FL round 週期（`FL_ROUND_INTERVAL_S`，目前 180 秒）遠大於 30 秒，這個反應延遲
 相對可忽略。

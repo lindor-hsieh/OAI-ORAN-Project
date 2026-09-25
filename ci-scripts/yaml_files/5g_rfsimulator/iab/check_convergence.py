@@ -18,8 +18,8 @@ check_convergence.py — DRL 訓練收斂狀態檢查
     - 兩者都通過才判定「疑似收斂」，否則說明卡在哪個條件
 
 這只是輔助判斷用的啟發式工具，不是嚴謹的統計檢定——疑似收斂之後仍建議
-再觀察幾輪，且最終要不要採信收斂結果，還是要配合實際跑 Scenario A/B/C
-量測（iab/drl_report.py）的數字來看。
+再觀察幾輪，且最終要不要採信收斂結果，還是要配合實際 15 分鐘量測
+（iab/measure_stage.py）的數字來看。
 """
 
 from __future__ import annotations
@@ -192,7 +192,7 @@ def main() -> None:
     if any_pending:
         print("[提示] 還有節點未達「疑似收斂」，建議之後再跑一次本腳本追蹤趨勢。")
     else:
-        print("[提示] 全部節點都已疑似收斂，可以考慮跑 iab/drl_report.py 做正式的 Scenario 對比量測。")
+        print("[提示] 全部節點都已疑似收斂，可以考慮跑 iab/measure_stage.py 做正式的 15 分鐘量測。")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# Backhaul-aware 動態 PRB 預算機制 — 生效驗證
+# Backhaul-aware 動態 PRB 預算機制 — 2026-09-12 首次驗證（已作廢，僅留作除錯歷史）
 
 **驗證日期：2026-09-12**
 **狀態**：純 PF、無 xApp 連線（Stage 1 baseline 條件）
@@ -15,7 +15,7 @@
 
 ## 驗證項目與結果
 
-### 1. 機制端到端運作確認（直接證據）
+### 1. 機制端到端運作確認（直接證據）——**原結論已作廢，見頁首更正**
 
 **DU 端輪詢執行緒正確啟動**：全部 12 個非 Donor 節點（Node1~12）的 DU log 都出現：
 ```
@@ -23,13 +23,13 @@
 ```
 Donor DU（沒有 MT）確認 **0 次**這個訊息，符合設計預期。
 
-**MT 端 telnetsrv 命令正確回應**：Node1、Node2（relay）、Node9（access）的 MT log 都反覆出現：
+**MT 端 telnetsrv 收到查詢（當時誤判為「正確回應」；實際回傳的是「未知命令」錯誤）**：Node1、Node2（relay）、Node9（access）的 MT log 都反覆出現：
 ```
 [TELNETSRV] Telnet client connected....
 [TELNETSRV] Command received: readc 11 filled 11 "bhload get"
 [TELNETSRV] Telnet Client disconnected.
 ```
-證實 DU 端輪詢執行緒（每 300ms 一次）成功連線到自己 MT 的 telnetsrv、送出查詢、取得回應、正常斷線——整個 C 語言端的資料管線（MT 統計寫入 → telnetsrv 暴露 → DU 輪詢讀取）運作正常。Node1 累積 5858 次查詢、Node2 累積 167 次、Node9 累積 4 次以上，皆為連續穩定的正常頻率。
+證實 DU 端輪詢執行緒（每 300ms 一次）成功連線到自己 MT 的 telnetsrv、送出查詢、取得回應、正常斷線——當時據此判斷整條資料管線運作正常，事後證實有誤（見頁首更正）；此處只能確認「連線建立與斷線」本身正常。Node1 累積 5858 次查詢、Node2 累積 167 次、Node9 累積 4 次以上，皆為連續穩定的正常頻率。
 
 ### 2. 因果效應觀察（間接證據）
 
@@ -44,6 +44,8 @@ UE6 併發測試期間，Node7 DU log 顯示兩個 UE 都有大量排程活動�
 
 **方法論限制（誠實記錄）**：這個測試沒有完全隔離「我的 backhaul-aware 機制」跟「PF 排程器本身在同一個 cell 內對多個 UE 做公平分配」這兩件事的個別貢獻——UE5、UE6 本來就同屬 Node7 這個 cell，就算沒有這次新增的機制，PF 排程器本身也會因為 UE6 加入競爭而降低 UE5 的份額。這次測試能確認的是：**機制上線後，系統行為符合預期方向（有負載時吞吐量下降），且沒有任何崩潰或異常**，但無法從這個測試單獨精確量化「backhaul-aware 機制」相對於「單純 PF 同 cell 公平分配」額外貢獻了多少下降幅度。若要精確隔離，需要在移除 backhaul-aware 機制的對照組下重跑同一組測試比較，目前受限於時間沒有做這一步。
 
+（註：本節路徑全在 PC1 同機內（Node2+Node7），不含跨主機鏈路，43.8 / 30.4 Mbps 不能直接類比現行「relay 集中 PC1、access 跨主機」拓樸的 3-hop 吞吐量，也不受 PC3 USB 2.0 網卡影響。）
+
 ## 結論
 
-機制的**資料管線（MT 統計 → telnetsrv 暴露 → DU 輪詢 → 動態縮小 PRB 池）已確認端到端正常運作**，且系統在機制上線後沒有出現崩潰、卡死或吞吐量歸零等異常，可以安心進入 Stage 1 PF baseline 重新量測。
+**（原結論已作廢）** 當時判斷「資料管線已確認端到端正常運作、可以進入 Stage 1 PF baseline 重新量測」是錯的：機制當時實為靜默 no-op（`bhload` 命名撞 telnetsrv 保留字）。真正有效的驗證見 `PF.md`「機制生效驗證」，根因見 `HISTORY.md` 2026-09-13 條目。

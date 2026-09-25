@@ -7,10 +7,10 @@
 # `docker compose run --rm` 容器不管用（每個新容器的 $HOME 都是全新的，
 # 沒有機會先跑過一次遷移）。
 #
-# local-deployment：現況（Node1~5 全部在 PC1）用，SuperLink Control API
-#   在同一台主機，用 loopback。
-# pc1-remote：預留給之後 Node3/4/5 真的搬去 PC2 時、PC2 上的 scheduler
-#   要打 PC1 位址用。
+# local-deployment：現況用（SuperLink、flower-scheduler 與全部 12 個
+#   SuperNode 都在 PC1），Control API 走 loopback。
+# pc1-remote：目前沒有服務使用（Flower 層全部集中在 PC1），保留供日後
+#   若有 FL 元件搬到其他主機、需要跨主機打 SuperLink 時使用。
 
 [superlink]
 default = "local-deployment"

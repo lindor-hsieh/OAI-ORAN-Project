@@ -32,7 +32,9 @@ from traffic_scenario import EXT_DN_IP, build_ue_list  # noqa: E402
 # iperf3 -i 1 的即時進度行範例：
 #   "[  5]   4.00-5.00   sec  3.75 MBytes  31.5 Mbits/sec"
 # 結尾摘要行含 "sender"/"receiver"，故意排除，只抓「進行中」的即時速率。
-_RATE_RE = re.compile(r"([\d.]+)\s+(Mbits|Kbits|Gbits)/sec")
+# 零吞吐量的行是 "0.00 bits/sec"（沒有 K/M/G 前綴），前綴必須可省略，否則零樣本會被
+# 略過、退回更早的非零樣本或記成空白，使平均與 JFI 偏高。
+_RATE_RE = re.compile(r"([\d.]+)\s+([KMG]?)bits/sec")
 
 
 def _latest_rate_mbps(log_path: Path) -> float | None:
@@ -52,9 +54,11 @@ def _latest_rate_mbps(log_path: Path) -> float | None:
         m = _RATE_RE.search(line)
         if m:
             val, unit = float(m.group(1)), m.group(2)
-            if unit == "Kbits":
+            if unit == "":
+                val /= 1e6
+            elif unit == "K":
                 val /= 1000.0
-            elif unit == "Gbits":
+            elif unit == "G":
                 val *= 1000.0
             return val
     return None

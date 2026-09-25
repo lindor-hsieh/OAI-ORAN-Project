@@ -710,3 +710,106 @@ Stage 2 要求切換 `REWARD_MODE` 前必須清空模型 checkpoint。第一次�
 **PF baseline 重測（Scenario T，跟 09-21 同方法論）**：`bash scenarios/setup_iperf_servers.sh` 確認 17 埠監聽後，PC2/PC3 分別背景執行 `traffic_scenario.py --scenario T --host {pc2,pc3} --num-phases 15` ＋ `measure_stage.py --host {pc2,pc3} --duration 900 --interval 5`（PC1 在新拓樸下不再有任何 UE，不需要執行這兩支腳本）。**結果完全驗證了遷移動機**：JFI 從 09-21 舊拓樸的 0.2812 躍升到 **0.9812**，UE5~8 對其餘 13 UE 的吞吐量比值從約 10~20 倍收斂到 **1.08 倍**，證實先前「固定幾個 UE 持續最高」現象的主因確實是同主機優勢，不是排程或場景差異。平均吞吐量從 4.23 Mbps 降到 1.06 Mbps——這不是系統劣化，而是舊拓樸的 4.23 Mbps 本來就是被 UE5~8 的異常高值拉高的假象（扣掉這 4 個 UE，舊拓樸其餘 13 個 UE 平均本來就只有約 1.4~1.5 Mbps，跟新拓樸全部 17 UE 收斂到的 1.06 Mbps 屬同一量級）。完整數據與分析見 `experiment_results/PF.md` 「2026-09-22 — 拓樸重新分配後的 Scenario T 重測」章節。
 
 **後續影響**：Stage 2（avg FL）／Stage 3（cluster FL）若要在新拓樸下重新量測比較，應該跟這份新的 PF 基準比較，不要跟 09-21 舊拓樸的數據比較——物理路徑結構不同，絕對數值量級的意義也不同；但相對改善幅度／JFI 仍可互相參照，用來判斷拓樸公平化之後，FL 聚合策略本身還能不能再貢獻額外的改善。Stage 2/3 已封存的訓練資料（`stage2_avgfl_retrain_20260920`／`stage3_clusterfl_20260919_v2`）完全不受這次遷移影響（只動了 RAN 資料面的 compose/腳本/conf，不動 MongoDB／checkpoint）。
+
+## 2026-09-25 — TCP 吞吐量天花板調查（09-22~23）與改用 UDP 流量場景
+
+**起因**：拓樸搬遷後的 PF baseline（見上方 2026-09-22 條目）JFI 雖然大幅改善，但 17 UE 平均吞吐量只有 1.06 Mbps，使用者擔心 TCP 數字太低、之後加上自己的方法也很難拉開差距。
+
+**調查結果（TCP 為何低）**：
+- 用 PC2 的 scenario log 把每筆吞吐量取樣對回當下的（路徑損耗, 目標頻寬）檔位：9 種組合的平均達成吞吐量全部落在 1.0~1.3 Mbps，且**整個資料集的單筆最高值都是 2.10 Mbps**——跟通道品質、目標頻寬檔位都沒有關聯（先前我把原因歸給「通道品質決定吞吐量」，被這份資料推翻）。
+- 同一 UE、同通道（3dB）、同目標速率（20Mbps）手動對照：TCP 卡在 ~1.05 Mbps（每秒穩定 128KB、Retr=0），UDP 乾淨跑到 20.0 Mbps、0/32664 遺失。**底層無線容量吃得下，瓶頸在 TCP 本身**。
+- 合理解釋（部分為推論）：TCP 吞吐量上限 ≈ 視窗 ÷ RTT，這個平台 RTT 300~700ms（多跳獨立 RF 模擬鏈路串接、無 BAP 層、軟體 RF 模擬受 CPU 排程影響、backhaul-aware PRB 預算再加重排隊），15 秒內慢啟動長不大。**backhaul-aware 機制與 TCP 陣發流量產生自我節流回饋迴圈是假說，尚未用 bhload 即時數值驗證。**
+- 排除項：（1）調大緩衝區無效——三台主機 `net.core.rmem_max/wmem_max` 原本就是 4MB/50MB(1MB write)，容器 `tcp_rmem/tcp_wmem` 上限原本 6MB/4MB，遠超所需；host 調到 16MB + 容器 tcp_rmem/wmem 調到 16MB 後重測反而更低（68.7Kbps~1.31Mbps，run-to-run 變異大），已全部調回原值。（2）docker-compose `sysctls:` 在這個環境不可靠：PC1 對 `net.core.rmem_max` 回 permission denied（非 per-netns）、PC2（Ubuntu 20.04）連 `tcp_rmem` 都在建立容器時失敗（`open /proc/sys/net/core/rmem_max: no such file`，8 個 UE 整批卡在 Created），已全部移除，改用 `docker exec sysctl -w` 才生效。（3）`iperf3 -w 2M` 僅小幅改善（1.78→2.10 Mbps）、`-P 4` 平行連線總和仍約 2 Mbps。
+
+**UDP 15 分鐘 Scenario T 量測（09-22）與其失真**：JFI=0.5973、平均 1.76 Mbps、最高單筆 8.54 Mbps、吞吐量取樣覆蓋率多數 0~40%、UE8/UE14 整場覆蓋率 0%。同一 access node 的兩個 UE 常一個有流量、一個近乎零（UDP 無退讓，PF 在需求遠超供給時把資源倒向其一）。**但這份數據被 traffic_scenario.py 的 DL frozen watchdog 污染**：該 watchdog 註解寫「僅 TCP 適用」，實作卻沒檢查協定，UDP 那次 PC2 單台被強制重啟 iperf3 17 次（TCP 那次 0 次；supervisor 退出 32 vs 11 次）；每次重啟 iperf3 log 以 `"w"` 模式覆寫，抹掉 `measure_stage.py` 正在讀的取樣，人為壓低覆蓋率與平均值（失真程度未量化）。**UDP 版數據需重測後才可引用**，目前未寫入 PF.md。
+
+**決策**：使用者決定改用 UDP 做訓練與測試，要求把訓練/測試會用到的流量場景多寫一份 UDP 版本。
+
+**實作**（`scenarios/traffic_scenario.py`、`iab/training_scenario_driver.sh`、`iab/training_watchdog.sh`）：
+- 新增/泛化 `--protocol {tcp,udp}` 到 T/R/A/B/C 全部場景（未指定時行為完全不變）；A/B/C 函式加 `protocol` 參數、回傳三元組；R 的協定覆寫不影響 RNG 消耗（同 seed 的路徑損耗/頻寬/閒置序列與混合版一致，已用 363 筆抽樣驗證）。
+- DL frozen watchdog 對 UDP UE 略過（mock 驗證：TCP 凍結流被重啟 2 次、UDP 0 次）。
+- 訓練驅動器與 watchdog 都接受 `--protocol` 並在每次（重）啟動驅動器時帶上，避免崩潰復原後悄悄變回 TCP；用假 `python3` 攔截參數驗證 T/R/A/B/C 五種 slot 都正確帶上 `--protocol udp`，未指定時不帶。
+- 三個檔案已 rsync 到 PC2/PC3 並確認內容抵達。
+
+**驗證範圍與未完成事項**：以上都是單元/mock/dry-run 驗證，**尚未在真實容器上跑過 UDP 版新程式碼**——09-25 發現 PC1 約 1.5 小時前重開機過（uptime 1:32），PC1 上全部容器（Donor/relay/CN5G/FlexRIC/inference）都是 Exited，PC2/PC3 的 access/UE 容器仍在跑但上游已不在，需依 CLAUDE.md 第 6 節依序做完整乾淨重啟後才能 live 驗證與量測。另外 09-23 收尾時 UE16 仍卡住（容器重啟後仍 100% 遺失），乾淨重啟後應會一併解決。
+
+## 2026-09-25（續）— UDP 吞吐量偏低調查：先前兩個解釋都被推翻，瓶頸指向跨主機 rfsim 鏈路
+
+**起因**：使用者質疑上次 UDP 15 分鐘量測吞吐量太低，且不認同「PF 輪流餓其中一個 UE」的說法，要求找出問題並檢查 UDP 場景需不需要修改。PC1 已於 09-25 約 20:33 重開機，先依序乾淨重啟三台（13/13 E2、RestartCount 0；UE15 未通、UE17 靠重新斷言預設路由恢復）再做對照實驗。
+
+**先前說法的更正**：
+1. 「同 node 兩 UE 一個有量一個為零是 PF 在真實壅塞下輪流」**不成立**：離線分析上次資料，兩 UE 不對稱狀態平均持續 69 秒（最長 160 秒），且誰有量跟通道好壞（47%）、iperf3 誰先啟動（47%）都無關；17 個 UE 任何時刻平均只有 2.3 個有非零流量，全體加總平均 4.8 Mbps，每個活躍 UE ≈2 Mbps 與活躍數無關。
+2. 「TCP 卡在 ~2Mbps 是視窗÷RTT」**不成立**：閒置系統上單一 UE，UDP 5Mbps 灌 10 秒（6.25MB），UE 以 **~1.7~2 Mbps** 的固定速率收了 ~30~40 秒才收完，累積剛好 100%、無丟包；TCP 的 2.1Mbps 與此同值。8 個 UE 同時各送 1Mbps UDP（總 8Mbps）→ 加總只收到 ~1.8Mbps，UE1/UE2（最先啟動）各 0.69、其餘六個各 0.07。→ 2Mbps 是整體共用的真實路徑容量。（09-22 手動測到「UE6 單流 UDP 20Mbps、0% 遺失」目前無法重現，同一平台速度隨時間差異大，原因未明。）
+3. 「backhaul-aware PRB 預算把 DU 壓到 0 PRB」**排除**：`bhload` 忙碌度分母是 `2×106×2000×interval`（含 UL），DL 最多佔一半，ratio 實際不會低於 ~0.5。DL MCS 在有流量的 UE 上是 28（最高），也不是調變/通道限制。
+
+**iperf3 UDP 上一次量測的另一項失真**：DL frozen watchdog 沒檢查協定（註解寫「僅 TCP 適用」），UDP 那次 PC2 被強制重啟 iperf3 17 次（TCP 0 次），重啟時 log 被覆寫；已修（略過 UDP）。另外 `measure_stage.py` 遇到 iperf3 印 `0.00 bits/sec`（無 K/M 前綴）時正則不匹配，會回傳更早的舊樣本或空白（記成空白而非 0），所以「零吞吐量」被當成缺值、之前算的平均值又只用非空白樣本，會系統性高估。
+
+**現象（過載 UDP 的後果）**：offered 遠超容量時傳送端持續灌入、路徑上的佇列不丟包地越積越深（約 35 秒才吐完 6.25MB），iperf3 控制連線與 ICMP 排在佇列後面：client 收不到 test end（`-t 8` 的 client 72 秒後仍在跑）、server 回 `the server is busy running a test`、洪水後 ping 暫時 100% 遺失（RTT 恢復要一陣子）。iperf3 UDP 送不出去的封包不計入序號，所以 client 顯示 0% 遺失但速率極低。
+
+**逐跳定位**：ext-dn→MT1（1 跳，Donor 與 Node1 同在 PC1）突發 4.8MB 頭 2 秒就收 3.35MB（~13Mbps）；ext-dn→MT5（2 跳，Node1 DU 在 PC1、MT5 在 PC2，**跨主機**）資料「一陣一陣」到、速率 ~1.6Mbps；到 UE1（3 跳）~1.7Mbps。閒置時 ext-dn→MT1 RTT 28ms、到 UE ~300ms。rfsim 每條無線鏈路是一條 TCP 連線傳時域 IQ：同主機連線 RTT 0.04ms、累積傳輸量 ~672GB（≈2.2Gbps/條）；跨主機連線（Node1 DU↔MT5）srtt 9.3ms（min 0.45ms）、累積 ~13.6GB（≈45Mbps/條），**差約 50 倍**。gNB/UE 以區塊同步交換，模擬時間推進速度 ≈ 區塊大小÷RTT，推論跨主機那幾跳的無線鏈路實際上在「慢動作」運行——這也應該就是 09-21 之前「跟 Donor 同主機的分支吞吐量高 10~20 倍」的真正成因（不是排程差異）。
+- 主機間原始 ping（不經 rfsim）：PC1↔PC2 min 0.52/avg 4.5/max 11 ms；PC1↔PC3 **min 29/avg 35 ms**（PC3↔PC1、PC3↔PC2 皆 ~30 ms，代表 PC3 這端有固定 ~30ms 延遲）。三台網卡都是 USB 的 `r8152`（RTL8156B），PC1/PC2 協商 2500Mb/s、**PC3 只有 1000Mb/s**；閒置時（無測試流量）實體網卡就有 PC1 ~350Mbps、PC2 ~165Mbps、PC3 ~185Mbps 的 rfsim IQ 流量。
+- 已試且**無效/已還原**：`ethtool -C rx-usecs 15000→200`（三台，ping 僅 4.5→3.7ms、PC3 不變、rfsim TCP RTT 仍 ~9ms、UDP 排空速率不變）；把 PC3 `ksoftirqd/8`（該 CPU 承接全部 xhci 網卡中斷，累積 20 分 55 秒 CPU，且與 8 條 SCHED_FIFO 80 執行緒同核）提到 FIFO 90（ping 不變）。網卡本身乾淨：PC3 0 錯誤 0 丟包、EEE 未啟用。PC1 CPU 80% 閒置、ksoftirqd 低，不是 PC1 瓶頸。**根因（跨主機那 9ms 排隊／PC3 的 30ms 固定延遲）尚未釘死**，待查：交換器與線材（PC3 為何只有 1G）、USB 網卡/xhci 的行為、PC2/PC3 上 SCHED_FIFO 執行緒對網路收包的影響。
+
+**對既有結論的影響（需誠實面對）**：Stage 1~3 與拓樸搬遷後的 TCP/UDP 數字，絕對值主要反映「跨主機 rfsim 鏈路速度」這個平台/網路 artifact，而非排程演算法。拓樸搬遷後每條 Relay→Access 都跨主機，JFI 0.98 有一部分是「大家一樣慢」；先前歸因給 TCP 視窗或 PF 行為的說法都不成立。UDP 場景（T/R/A/B/C）目標頻寬比實測整體容量高 3~60 倍，需縮小或先解掉瓶頸。
+
+**環境狀態**：測試環境仍在跑（15/17 UE 通；UE15 未通），PC2 的 Node5~8 UE 通道為做實驗被設成 3dB；`rx-usecs`、ksoftirqd 排程都已還原。
+
+## 2026-09-25（續二）— 跨主機延遲根因：PC3 的 USB 網卡自 9/11 起被接在 USB 2.0 埠
+
+**結論（實體修復尚未做，待使用者把 PC3 網卡移到 USB 3.x 埠後驗證）**：PC3 的 USB LAN 網卡（`r8152`, RTL8156B）在 2026-09-11 19:11~19:13 被連續拔插後，從 USB 3.0 埠（`usb 2-3`，開機時 13:58 的列舉）變成接在 **USB 2.0 埠（`usb 1-5: new high-speed USB device`，480Mb/s，`version 2.10`）**，此後 14 天一直如此；PC1/PC2 的同款網卡都在 USB 3.0（5000Mb/s，`version 3.20`）。PC3 的 xHCI 另有空著的 10Gb/s SuperSpeed 匯流排（Bus 2/4/6）。**這段期間（9/11 19:13 起）Stage 1~3 與拓樸搬遷後的所有量測都是在這個狀態下做的。**
+
+**證據鏈**（每一步都是實測）：
+1. 不經 rfsim 的飽和 UDP（iperf3 host-to-host）：PC1↔PC2 ~2.0Gbps（兩個方向）；**任何含 PC3 的主機對（PC1↔PC3、PC2↔PC3，後者不經過 PC1）都只有 ~310~330Mbps**，且與封包大小無關（200B 265Mbps~1350B 326Mbps → 是位元速率上限，不是 pps 上限）。飽和時 ping 由 0.4ms 跳到 ~19ms（標準佇列）。
+2. rfsim 全開時 PC3 網卡只有 rx 187 / tx 185 Mbps（合計 ~372Mbps，貼著上限），主機間 ping PC1↔PC3 平均 35ms（min 29ms）、PC1↔PC2 平均 4.5ms；把 PC3 全部容器暫停（流量 0）→ PC1↔PC3 **0.72ms**；只暫停 MT9~12（PC3 上真正跨網卡的 4 條鏈路）也是 ~0.5ms，有流量（>=2 條同時動）就回到 ~33ms。**延遲是負載造成的排隊，不是線材/交換器/網卡的固定延遲**。
+3. **PC3 拖累 PC2**：PC3 容器保持暫停、只恢復 PC2 → PC2 網卡流量從 ~165Mbps **暴增到 ~1.73Gbps**，PC1↔PC2 ping 4.5→2.6~2.9ms；此時單一 UE1 的 UDP 容量從 ~1.7Mbps 提高到 **~12Mbps**（60Mbps offered，穩態 11.2~12.4Mbps）。共用機制（PAUSE 訊框、PC1 網卡 TX 佇列、交換器緩衝...）未查明，但「PC3 一忙全系統變慢」是實測事實。
+4. rfsim 連線層面：同主機連線 TCP RTT 0.04ms、跨主機 9.3ms；跨主機每條鏈路累積傳輸量約為同主機的 1/50——rfsim 的 gNB/UE 以區塊同步交換，模擬時間推進速度受 RTT/頻寬限制，慢的鏈路在「慢動作」運行。
+
+**排除項**：`rx-usecs` 15000→200（三台）、`ksoftirqd/8` 提到 FIFO 90、把網卡 IRQ 移到 CPU7 並讓容器避開 CPU7/15、CPU 調節器（PC1/PC3 `performance`、PC2 `ondemand` 但閒置即 5GHz；三台皆 Ryzen 7 7700 約 5GHz）、網卡錯誤/丟包計數（0）、EEE（未啟用）——全部無效或無關，已還原。
+
+**對先前結論的影響**：(1) 09-25 稍早寫的「TCP/UDP 2Mbps 天花板是視窗×RTT」「PF 輪流餓 UE」都已被推翻（見上方條目）；(2) 「跟 Donor 同主機的分支吞吐量高 10~20 倍」與 09-12「PC2/PC3 CPU 資源競爭」等舊診斷，有可能有一部分其實是這個網卡問題（9/11 19:13 起才有），**這只是假說，需修復後用同一場景重測才能判斷**，尤其拓樸搬遷（relay 全集中 PC1）是否有必要、JFI 0.98 有多少是「大家一樣慢」；(3) 20Mbps 的 09-22 手動測試因此可以理解為系統速度隨 PC3 負載大幅變動下的一個快的時刻，而不是矛盾。
+
+**目前環境狀態**：PC3 的 17 個容器為了實驗被 `docker pause` 著（尚未恢復；停很久後 rfsim 連線大概已失效，修好網卡後建議依 CLAUDE.md 第 6 節做完整乾淨重啟），PC1/PC2 運作中，PC2 UE1~8 的通道被設成 3dB。
+
+**待辦**：（人工）把 PC3 網卡移到 USB 3.x（藍色）埠、最好直連主機板後方埠、換 USB3 線，確認 `cat $(readlink -f /sys/class/net/enxc84d4427aa8f/device)/../speed` = 5000/10000、PC1↔PC3 飽和 UDP 接近 2Gbps（若交換器/線材支援 2.5G，網卡也可望從 1G 升到 2.5G）；然後乾淨重啟三台、重做 UDP 對照實驗（單一 UE 容量、多 UE 同時），再決定 UDP 場景的目標頻寬與是否需要重測 Stage 1~3。
+
+## 2026-09-25（續三）— 依 Stage 1~5 開發階段整理程式碼與文件
+
+**移除（皆無實際呼叫者，只剩註解/提示字串互相提到，git 歷史可復原）**：`iab/watchdog.sh`、`iab/monitor_drl.sh`、`iab/iab_perf_test.sh`、`iab/drl_report.py`（雙主機期 PC2-only 版本，已被 `training_watchdog.sh`／`training_healthcheck.sh`／`measure_stage.py` 取代）；`inference/global_xapp_bridge.py`（舊 5-node 配額橋接，其 import 的 `compute_quotas()` 早已從 `global_xapp.py` 移除，檔案本身無法執行）及 `inference/Dockerfile` 對應的 COPY。`check_convergence*.py` 內指向已刪 `drl_report.py` 的提示改指 `measure_stage.py`；`flwr_config.toml`、`global_xapp.py` 的過期註解已修。保留未動（待使用者決定）：`iab/check_convergence.py`（舊 docker-logs 版，`training_healthcheck.sh` 仍提及）、`check_convergence_weights.py`、`calibrate_fl_rate.py`、`clean_lambda_contamination.py`。
+
+**CLAUDE.md 整併**：拓樸搬遷敘事縮成一段設計原則；§3 Stage 1~3 列改引用現行 md 的 09-19/09-21/09-22 數字（原本引用已被取代的 09-14 舊版數字）並加上 PC3 USB2 量測條件警語；Stage 1~5 逐階段長敘事併入路線圖（Stage 3 分群公式保留）；更正「backhaul-aware 機制尚未實作」為已實作（`gNB_scheduler_dlsch.c` 約 948 行）；43.8 Mbps 標明是同機路徑；§8 UDP 段落重寫（根因、容量上限、`measure_stage.py` 零值 regex 缺陷）；移除「已知過期腳本」清單改為現況說明。
+
+**文件修正**：`experiment_results/*.md` 加 USB2 量測條件警語、更正 JFI 0.98 為「均貧」而非公平（UE5~8 倍率 10~20x 更正為約 9x）、`backhaul_mechanism_verification.md` 標題與結論標為作廢；`inference/DRL_DESIGN.md`／`STAGE3`／`STAGE4` 修正過期事實（5 nodes、`prb_quota_ratio`、100MHz、TCP 天花板歸因等）；`PHASE5_GLOBAL_DEV_LOG.md`、`DRL_METHODOLOGY_PLAN.md` 只加「已過時」橫幅（整份刪除待使用者授權）。
+
+**未處理／待決**：`measure_stage.py` 的 `_RATE_RE` 不匹配 `0.00 bits/sec`（零吞吐量被記成空白，平均與 JFI 偏高）；PC3 網卡 USB 3.x 實體修復與重測。
+
+## 附錄：已刪除的 `inference/PHASE5_GLOBAL_DEV_LOG.md`、`DRL_METHODOLOGY_PLAN.md` 中仍有效的內容（2026-09-25 併入）
+
+這兩份文件（2026-07，5-node 時代）的主體——舊 relay→access 配額 Global xApp／`global_xapp_bridge.py`、硬性 2/3 分群、`prb_quota_ratio`——已被 Stage 2 的全域公平性廣播與 Stage 3 soft cluster 取代，隨檔案移除（完整內容在 git 歷史，`git log --diff-filter=D -- '*PHASE5_GLOBAL_DEV_LOG.md'`）。以下是仍適用的設計決策與踩坑：
+
+**Flower 架構決策**
+- 舊 `fl.server.start_server()`／`start_numpy_client()` 是 deprecated compat API；現行為 `ServerApp`/`ClientApp` + `flwr run`，以 **SuperLink + SuperNode（Deployment Engine）** 部署（節點是實體分散的 process，不是 Simulation Engine 的虛擬 client）。
+- `flwr` 以 vendor 方式放在 `inference/vendor/flwr/`（`pip install -e ./vendor`，剔除 `*_test.py`），動機是日後能直接改框架原始碼實作自訂聚合。`vendor/pyproject.toml` 依賴**必須用 `==` 鎖版本**（對齊官方 `uv.lock`）：寬鬆 range 會解析出彼此 protobuf gencode/runtime 不相容的組合（`gencode 7.35.0 runtime 6.33.6`），`flower-superlink` 啟動即 crash。
+- `flower-supernode` 預設 `--isolation subprocess`：`client_app.py` 的 `train()`/`evaluate()` 跑在與 `inference_server.py` **不同的 OS process**，無法共用記憶體中的 `DRLAgent`，模型交換一律透過共用 checkpoint 檔（`model_nodeN.pt`）與 mtime 熱重載。
+
+**踩坑（仍會再踩）**
+1. `_apply_weights_to_node()` 必須先 `agent.load()` 再套聚合後的 actor/critic 權重：用全新 `DRLAgent` 直接存檔會把 `train_steps` 歸零，`is_trained = train_steps > 0` 變 False，`InferenceServer` 熱重載後悄悄退回 BSR 啟發式（現行程式碼已遵守，勿改回）。
+2. FAB 目錄名稱只允許 `^[A-Za-z][A-Za-z0-9-]*$`（故為 `flower-app/`，不能用底線）。
+3. `ServerApp`/`ClientApp` 是 SuperLink/SuperNode **各自 spawn** 的子行程，環境變數必須設在這兩個長駐 process 的啟動環境，設在 `flwr run` 提交端會被忽略。
+4. `flwr` ≥1.26 第一次 `flwr run` 會自動把 `pyproject.toml` 的 `[tool.flwr.federations]` 改寫成註解並寫 `~/.flwr/config.toml`，會弄壞 git 裡的原始碼、且對全新的一次性容器無效；因此固定使用 `inference/flwr_config.toml`（Dockerfile COPY 到 `/root/.flwr/config.toml`）。
+5. 改了會被 Dockerfile COPY 進 image 或被腳本熱補的檔案，要同步更新複製清單／重新 build（曾因 `training_pipeline.py` 漏進熱補清單，5 個 `inference-nodeN` 進入 `ModuleNotFoundError` crash loop）。
+
+**方法選擇理由（論文方法論可引用）**
+- **排除完全異質模型 FL（HFL，知識蒸餾）**：HFL 的動機是客戶端因硬體限制或隱私各自設計不同架構；本專案所有節點同團隊、同程式碼、同環境，兩個動機都不成立。
+- **排除 Byzantine-robust 聚合（Krum／MultiKrum／Bulyan／FedTrimmedAvg，`vendor/flwr/serverapp/strategy/` 有現成實作）**：針對惡意/損毀客戶端的對抗性威脅模型，本專案節點皆自己控制，沒有這種威脅。
+- **採用 Clustered FL**（Sattler et al. 2020、IFCA 一系）：架構相同、依結構差異分群、群內標準加權聚合；後來在 Stage 3 進一步推廣成 soft／weighted（`role_ratio_i`，見 CLAUDE.md §3）。
+- **聚合演算法是獨立於分群的另一維度**：**FedOpt 家族**（FedAdam／FedYogi／FedAdagrad，把「聚合結果 − 舊全域權重」當偽梯度餵給 server-side 優化器，Flower 預設 `eta=0.1, eta_l=0.1, beta_1=0.9, beta_2=0.99, tau=1e-3`，`FedAdam→FedOpt→FedAvg` 內部仍先呼叫 `aggregate_arrayrecords()`）只改 server 端、成本低；**FedProx**（本地 loss 加近端項對抗 client drift）要動 `training_pipeline.py`／`drl_agent.py` 訓練迴圈、成本較高。兩者不互斥，建議分開驗證以便歸因；分群後若用 FedAdam，每個原型需各自獨立的 server 端動量狀態。這些是 Stage 4 自訂 FL 的候選材料（見 `inference/STAGE4_CUSTOM_FL_DESIGN.md`）。
+- **Local DRL 沿革**：獎勵函數為 Lagrangian 限制式 `R = R_tp + λ(JFI_raw − JFI_min)`（`JFI_min=0.8291` 為現場實測 PF 在 Scenario R 15 分鐘的 JFI，λ 依批次 JFI 自適應）；Actor/Critic 由 MLP 改 GRU（POMDP：單步 state 不足以區分 Scenario R 的閒置軌跡），訓練改抓時間上連續的序列（`TRAIN_SEQ_LEN=32`、`TRAIN_SEQ_COUNT=16`，連續性靠 `next_state_vec == state_vec` 位元組相等判斷），閒置轉換也寫入 MongoDB 並帶 `is_idle` 欄位供 λ 更新排除。GRU 與 MLP 的取捨曾評估 delta 特徵／frame stacking／GRU 三案（見 `DRL_DESIGN.md`）。
+
+## 2026-09-25（續四）— `measure_stage.py` 零吞吐量 regex 修復、兩份過時文件刪除
+
+**`iab/measure_stage.py`**：`_RATE_RE` 原為 `([\d.]+)\s+(Mbits|Kbits|Gbits)/sec`，iperf3 的零吞吐量行是 `0.00 bits/sec`（無 K/M/G 前綴）不匹配，於是該行被略過，函式往回找到更早的非零樣本，或整段都沒有時回傳 None（CSV 記成空白）。改為 `([\d.]+)\s+([KMG]?)bits/sec` 並處理無前綴（÷1e6）；以 5 種格式（M/K/G/無前綴/結尾摘要行）單元驗證通過。**影響**：此日期前的所有 CSV（Stage 1~3 全部量測）在有 UE 被餓死（吞吐量 0）時，平均吞吐量與 JFI 偏高（餓死的 UE 被漏算或以舊值取代），修復後的量測與先前數字不可直接比較；歷史 md 數字保留不改。
+
+**刪除** `inference/PHASE5_GLOBAL_DEV_LOG.md`、`inference/DRL_METHODOLOGY_PLAN.md`（經使用者授權），仍有效內容已併入上方「附錄」；`STAGE3`／`STAGE4`／`DRL_DESIGN.md` 中的引用已改指 `DRL_DESIGN.md`／`HISTORY.md` 附錄。
+
+## 2026-09-25（續五）— CLAUDE.md 關鍵路徑合併
+原第 5 節（目錄結構）與第 7 節開頭（xApp／共用底層檔案清單）合併為第 5 節「專案目錄結構與關鍵檔案路徑」，改為依部署／腳本／場景／推論與 FL／C 語言底層分表，新增 `iab/` 腳本分類與 backhaul 機制原始檔路徑；用途待定的四支腳本（`check_convergence.py`、`check_convergence_weights.py`、`calibrate_fl_rate.py`、`clean_lambda_contamination.py`）在該節逐一記錄用途與保留原因（未刪除）。

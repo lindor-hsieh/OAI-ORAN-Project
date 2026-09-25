@@ -20,6 +20,11 @@
 # 三台主機的 --epoch 必須是同一個值（由 coordinator 在啟動時 `date +%s` 抓一次，
 # 分別傳給 PC1/PC2/PC3 各自的呼叫，見 iab/training_watchdog.sh 的重啟邏輯）。
 #
+# --protocol {tcp,udp}（選填）：原樣傳給每個 traffic_scenario.py 呼叫，全部 slot 的
+# 全部 UE 統一用該協定（UDP 版訓練場景）。未指定時各場景維持原本行為（T/A/B/C=tcp、
+# R=TCP/UDP 混合）。三台主機必須一致；watchdog 用 --protocol 啟動時會在復原後
+# 用同樣的值重啟驅動器，不會悄悄變回 TCP。
+#
 # 安全性：全程只呼叫 scenarios/traffic_scenario.py 既有的公開 --scenario 介面，
 # 不直接碰 channelmod_ctrl.py，PATHLOSS_SAFE_MAX_DB=25.0 上限由該腳本的既有
 # 程式碼結構保證不會超過（Scenario A/B/C 的固定 CQI 對照表、D/R 的
@@ -35,17 +40,23 @@ err()  { echo -e "${RED}[driver $(date '+%H:%M:%S')] ✗${NC} $*" >&2; }
 
 HOST=""
 EPOCH=""
+PROTOCOL=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --host) HOST="$2"; shift 2 ;;
         --epoch) EPOCH="$2"; shift 2 ;;
+        --protocol) PROTOCOL="$2"; shift 2 ;;
         *) err "未知參數: $1"; exit 1 ;;
     esac
 done
 if [[ -z "$HOST" || -z "$EPOCH" ]]; then
-    err "用法: $0 --host {pc1,pc2,pc3} --epoch <unix_timestamp>"
+    err "用法: $0 --host {pc1,pc2,pc3} --epoch <unix_timestamp> [--protocol {tcp,udp}]"
     exit 1
 fi
+case "$PROTOCOL" in
+    ""|tcp|udp) ;;
+    *) err "--protocol 必須是 tcp 或 udp（收到: $PROTOCOL）"; exit 1 ;;
+esac
 case "$HOST" in
     pc1|pc2|pc3) ;;
     *) err "--host 必須是 pc1、pc2 或 pc3（收到: $HOST）"; exit 1 ;;
@@ -75,7 +86,7 @@ N_SLOTS=${#SLOT_SCENARIO[@]}
 CYCLE_LEN_S=0
 for d in "${SLOT_DURATION_S[@]}"; do CYCLE_LEN_S=$((CYCLE_LEN_S + d)); done
 
-log "啟動：host=$HOST epoch=$EPOCH cycle_len=${CYCLE_LEN_S}s (${N_SLOTS} slots)"
+log "啟動：host=$HOST epoch=$EPOCH protocol=${PROTOCOL:-預設} cycle_len=${CYCLE_LEN_S}s (${N_SLOTS} slots)"
 
 CHILD_PID=""
 cleanup() {
@@ -125,16 +136,19 @@ while true; do
         R)
             num_phases=$(( (remaining + 59) / 60 ))
             python3 scenarios/traffic_scenario.py --scenario R --seed "$seed" \
-                --host "$HOST" --phase-duration 60 --num-phases "$num_phases" &
+                --host "$HOST" --phase-duration 60 --num-phases "$num_phases" \
+                ${PROTOCOL:+--protocol "$PROTOCOL"} &
             ;;
         T)
             num_phases=$(( (remaining + 59) / 60 ))
             python3 scenarios/traffic_scenario.py --scenario T \
-                --host "$HOST" --phase-duration 60 --num-phases "$num_phases" &
+                --host "$HOST" --phase-duration 60 --num-phases "$num_phases" \
+                ${PROTOCOL:+--protocol "$PROTOCOL"} &
             ;;
         A|B|C)
             python3 scenarios/traffic_scenario.py --scenario "$scenario" \
-                --host "$HOST" --duration "$remaining" &
+                --host "$HOST" --duration "$remaining" \
+                ${PROTOCOL:+--protocol "$PROTOCOL"} &
             ;;
         *)
             err "未知的 slot scenario: $scenario"

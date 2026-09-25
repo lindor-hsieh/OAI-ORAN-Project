@@ -14,14 +14,10 @@ C 層機制依「節點自己 MT 的真實 backhaul 使用量」動態縮小該�
 本檔案完全不碰資源池大小，只提供一個**軟性 state 特徵**（fairness_bias）
 給 DRL 當額外輸入——兩者作用在不同層次，天生不會疊加節流。
 
-**跟舊版設計（已移除）的差異**：舊版 `global_xapp_bridge.py` 是 relay 節點
-（Node1/2）把自己的 PRB 分配透過 ZMQ PUB 廣播出去，由 bridge 算出配額後
-再 PUB 給 access 節點（Node3/4/5）「硬性裁切」自己的輸出。這個設計：
-  (a) 只是局部視角（relay 對自己直接子節點的猜測值），不是真正全域；
-  (b) 跟 C 層機制做的是同一件事（縮小可用資源），會雙重節流；
-  (c) 硬編碼在 2-relay/3-access 拓樸，無法套用到現在 4-relay/8-access。
-`compute_quotas()`／`global_xapp_bridge.py` 仍保留在磁碟供歷史參考，
-不再被任何 docker-compose 服務呼叫。
+**跟舊版設計（已移除）的差異**：舊版 5-node 設計由 relay 節點廣播 PRB 分配、
+再由橋接 process 算配額後「硬性裁切」access 節點輸出——那只是局部視角、
+跟 C 層機制做同一件事（雙重節流）、且寫死 2-relay/3-access 拓樸。
+該設計已整段移除（細節見 HISTORY.md），本檔案是唯一的 Global xApp 實作。
 
 **運作方式**：
   1. 每輪對 MongoDB 全部 `NUM_NODES` 個節點的 `node{i}_experiences`

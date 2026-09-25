@@ -19,6 +19,9 @@
 # 復原後用同一個值重新啟動驅動器，讓輪替表的位置照 wall clock 自我校正
 # （見 training_scenario_driver.sh 的說明）。
 #
+# --protocol {tcp,udp}（選填）：必須跟最初啟動驅動器時用的一致——復原重啟驅動器時
+# 會原樣帶上，否則 UDP 版訓練會在第一次崩潰復原後悄悄變回預設（TCP）場景。
+#
 # 絕對不會呼叫 run_stage2_fl.sh——那會清空 MongoDB 經驗與 checkpoint，等於
 # 銷毀已經訓練好的成果。只做「讓系統活過來」，不做「重新開始訓練」。
 
@@ -41,9 +44,11 @@ EPOCH=""
 REWARD_MODE_ARG="throughput_only"
 MODEL_ARCH_ARG="mlp"
 FL_MODE_ARG="avg"
+PROTOCOL_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --epoch) EPOCH="$2"; shift 2 ;;
+        --protocol) PROTOCOL_ARG="$2"; shift 2 ;;
         --reward-mode) REWARD_MODE_ARG="$2"; shift 2 ;;
         --model-arch) MODEL_ARCH_ARG="$2"; shift 2 ;;
         --fl-mode) FL_MODE_ARG="$2"; shift 2 ;;
@@ -51,9 +56,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 if [[ -z "$EPOCH" ]]; then
-    err "用法: $0 --epoch <unix_timestamp> [--reward-mode throughput_only] [--model-arch mlp] [--fl-mode avg]"
+    err "用法: $0 --epoch <unix_timestamp> [--reward-mode throughput_only] [--model-arch mlp] [--fl-mode avg] [--protocol {tcp,udp}]"
     exit 1
 fi
+case "$PROTOCOL_ARG" in
+    ""|tcp|udp) ;;
+    *) err "--protocol 必須是 tcp 或 udp（收到: $PROTOCOL_ARG）"; exit 1 ;;
+esac
 
 cd "$COMPOSE_DIR" || { err "cd 到 $COMPOSE_DIR 失敗"; exit 1; }
 
@@ -180,7 +189,7 @@ stop_scenario_driver() {
 
 start_scenario_driver() {
     log "重新啟動三主機的 training_scenario_driver.sh（epoch=$EPOCH，自動接續到 wall clock 當下位置）..."
-    nohup bash "$COMPOSE_DIR/iab/training_scenario_driver.sh" --host pc1 --epoch "$EPOCH" \
+    nohup bash "$COMPOSE_DIR/iab/training_scenario_driver.sh" --host pc1 --epoch "$EPOCH" ${PROTOCOL_ARG:+--protocol "$PROTOCOL_ARG"} \
         > /tmp/driver_stage_pc1.log 2>&1 < /dev/null &
     disown
     # 2026-09-18 現場踩過的坑：`ssh host "cmd &"` 這個寫法不可靠——遠端 shell
@@ -188,8 +197,8 @@ start_scenario_driver() {
     # 導致遠端行程從未真正啟動（第一次上線時 PC3 的驅動器就是這樣悄悄沒起來，
     # 直到下次健康檢查才發現）。改用 `ssh -f`（ssh 自己先 fork 到背景、確認
     # session 建立後才把控制權交還本地端，不依賴遠端 shell 的 `&` 語意）。
-    ssh -f pc2 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc2 --epoch $EPOCH > /tmp/driver_stage_pc2.log 2>&1 < /dev/null" 2>/dev/null
-    ssh -f pc3 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc3 --epoch $EPOCH > /tmp/driver_stage_pc3.log 2>&1 < /dev/null" 2>/dev/null
+    ssh -f pc2 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc2 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_pc2.log 2>&1 < /dev/null" 2>/dev/null
+    ssh -f pc3 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc3 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_pc3.log 2>&1 < /dev/null" 2>/dev/null
     sleep 3
     local missing=""
     pgrep -f "training_scenario_driver.sh --host pc1" >/dev/null || missing="$missing pc1"
@@ -199,11 +208,11 @@ start_scenario_driver() {
         err "場景驅動器沒有在這些主機上起來：$missing —— 重試一次"
         for h in $missing; do
             if [[ "$h" == "pc1" ]]; then
-                nohup bash "$COMPOSE_DIR/iab/training_scenario_driver.sh" --host pc1 --epoch "$EPOCH" \
+                nohup bash "$COMPOSE_DIR/iab/training_scenario_driver.sh" --host pc1 --epoch "$EPOCH" ${PROTOCOL_ARG:+--protocol "$PROTOCOL_ARG"} \
                     > /tmp/driver_stage_pc1.log 2>&1 < /dev/null &
                 disown
             else
-                ssh -f "$h" "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host $h --epoch $EPOCH > /tmp/driver_stage_${h}.log 2>&1 < /dev/null" 2>/dev/null
+                ssh -f "$h" "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host $h --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_${h}.log 2>&1 < /dev/null" 2>/dev/null
             fi
         done
         sleep 3

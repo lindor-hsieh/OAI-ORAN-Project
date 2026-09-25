@@ -442,27 +442,40 @@ def apply_scenario_phase(
 #             泛化到 12 節點，UE 清單長度隨 build_ue_list() 而定）
 # =============================================================================
 
-def scenario_a(ues: list[UEConfig], ctrls: dict[int, ChannelModController]) -> list[tuple[int, float]]:
-    """場景 A：CQI 差異化——同 Node 內兩 UE 對比 CQI 15 vs 5，流量相等。"""
+def scenario_a(
+    ues: list[UEConfig], ctrls: dict[int, ChannelModController], protocol: str = "tcp"
+) -> list[tuple[int, float, str]]:
+    """場景 A：CQI 差異化——同 Node 內兩 UE 對比 CQI 15 vs 5，流量相等。
+
+    A/B/C 的 protocol 參數（見 CLI `--protocol`）：全部 UE 統一用這個協定，通道/頻寬
+    設定完全不變，只換傳輸層，供 TCP/UDP 兩版本 1:1 對照。
+    """
     configs = []
     for i, _ in enumerate(ues):
-        configs.append((15, 30.0) if i % 2 == 0 else (5, 30.0))
+        cqi = 15 if i % 2 == 0 else 5
+        configs.append((cqi, 30.0, protocol))
     return configs
 
 
-def scenario_b(ues: list[UEConfig], ctrls: dict[int, ChannelModController]) -> list[tuple[int, float]]:
+def scenario_b(
+    ues: list[UEConfig], ctrls: dict[int, ChannelModController], protocol: str = "tcp"
+) -> list[tuple[int, float, str]]:
     """場景 B：流量不均（Jain's Fairness 壓測）——等 CQI，流量比例不對等。"""
     configs = []
     for i, _ in enumerate(ues):
-        configs.append((12, 45.0) if i % 2 == 0 else (12, 25.0))
+        bw = 45.0 if i % 2 == 0 else 25.0
+        configs.append((12, bw, protocol))
     return configs
 
 
-def scenario_c(ues: list[UEConfig], ctrls: dict[int, ChannelModController]) -> list[tuple[int, float]]:
+def scenario_c(
+    ues: list[UEConfig], ctrls: dict[int, ChannelModController], protocol: str = "tcp"
+) -> list[tuple[int, float, str]]:
     """場景 C：最惡公平性——差通道高需求 vs 好通道低需求。"""
     configs = []
     for i, _ in enumerate(ues):
-        configs.append((4, 50.0) if i % 2 == 0 else (14, 25.0))
+        cqi, bw = (4, 50.0) if i % 2 == 0 else (14, 25.0)
+        configs.append((cqi, bw, protocol))
     return configs
 
 
@@ -537,6 +550,7 @@ def scenario_r_realistic(
     ues: list[UEConfig],
     seed: int,
     phase_index: int,
+    protocol: Optional[str] = None,
 ) -> list[tuple[float, float, str]]:
     """
     場景 R：真實隨機相位——用有統計依據的分佈 + 持久化使用者 profile 取代 D 的均勻隨機。
@@ -562,6 +576,11 @@ def scenario_r_realistic(
 
     seed/phase_index：每個 UE 用 `_rng_for(seed, ue.global_id, phase_index)` 導出
     獨立 RNG，任一台主機都能只算自己負責的 UE、不需要知道其他 UE 被抽到什麼。
+
+    protocol：None（預設）維持上面的 TCP/UDP 混合；"tcp"/"udp" 則把所有非閒置 UE
+    的協定強制覆寫成該值。協定抽樣的 rng.random() 仍照常消耗，所以同一個 seed 下
+    路徑損耗/頻寬/閒置的抽樣序列跟混合版完全一致，只有傳輸層不同（供 UDP 版本跟
+    既有 seed 的資料 1:1 對照）。
     """
     configs: list[tuple[float, float, str]] = []
     for ue in ues:
@@ -578,6 +597,8 @@ def scenario_r_realistic(
             bw = prof["min_mbps"] + rng.lognormvariate(prof["lognorm_mu"], prof["lognorm_sigma"])
             bw = min(bw, prof["max_mbps"])
             proto = "udp" if rng.random() < P_UDP else "tcp"
+            if protocol is not None:
+                proto = protocol
 
         configs.append((path_loss, bw, proto))
     return configs
@@ -673,6 +694,7 @@ def run_fixed_scenario(
     ues: list[UEConfig],
     ctrls: dict[int, ChannelModController],
     duration: int,
+    protocol: str = "tcp",
 ) -> None:
     """執行固定場景，持續 duration 秒後結束。"""
     scenario_fn = {
@@ -681,8 +703,8 @@ def run_fixed_scenario(
         "C": scenario_c,
     }[scenario_name]
 
-    log.info("=== 場景 %s 開始，持續 %d 秒 ===", scenario_name, duration)
-    configs = scenario_fn(ues, ctrls)
+    log.info("=== 場景 %s 開始，持續 %d 秒，protocol=%s ===", scenario_name, duration, protocol)
+    configs = scenario_fn(ues, ctrls, protocol)
     apply_scenario_phase(ues, ctrls, configs)
 
     # 啟動所有 iperf3（apply_scenario_phase 已處理 BW 變更，這裡補起初次啟動）
@@ -766,7 +788,11 @@ def run_dynamic_scenario(
                         start_iperf_client(ue)
                         continue
                     # ── DL flow watchdog ──────────────────────────────────────
-                    if ue._iperf_proc is None:
+                    # UDP 不適用：UDP 沒有壅塞退讓，rx 長時間不增加代表排程器真的把這個
+                    # UE 餓住（正是要量測到的現象），重啟 iperf3 不會讓它分到資源，
+                    # 反而會覆寫 iperf3 log 檔（open "w"）、抹掉 measure_stage.py 正在讀的
+                    # 取樣資料，人為壓低覆蓋率（2026-09-22 UDP 量測 PC2 單台被強制重啟 17 次）。
+                    if ue._iperf_proc is None or ue.protocol == "udp":
                         continue
                     if now - ue._last_rx_check < FLOW_WATCHDOG_INTERVAL:
                         continue
@@ -932,10 +958,11 @@ def parse_args() -> argparse.Namespace:
         help="跳過等待 UE 介面就緒的步驟",
     )
     parser.add_argument(
-        "--protocol", choices=["tcp", "udp"], default="tcp",
-        help="場景 T 專用：全部 UE 統一用這個協定（預設 tcp）。UDP 沒有壅塞視窗，"
-             "量到的吞吐量更直接反映排程器實際分配的容量，適合當作判斷排程演算法"
-             "優劣的指標；TCP 的達成吞吐量會被視窗/RTT 乘積卡住，見 scenario_t_tiered() 說明",
+        "--protocol", choices=["tcp", "udp"], default=None,
+        help="全部 UE 統一用這個協定（適用 T/R/A/B/C）。未指定時各場景維持原本行為："
+             "T/A/B/C=tcp、R=TCP/UDP 混合（P_UDP）。UDP 沒有壅塞視窗，量到的吞吐量"
+             "直接反映排程器實際分配的容量；TCP 的達成吞吐量會被視窗/RTT 乘積卡住，"
+             "見 scenario_t_tiered() 說明。UDP 模式下 DL frozen watchdog 會略過該 UE。",
     )
     return parser.parse_args()
 
@@ -965,11 +992,12 @@ def main() -> None:
         run_dynamic_scenario(ues, ctrls, phase_duration=args.phase_duration)
     elif args.scenario == "T":
         FIXED_EPOCH = 1700000000.0  # 同 Scenario R 用的錨點，純粹是絕對時間基準，兩者不衝突
-        log.info("Scenario T protocol=%s", args.protocol)
+        t_protocol = args.protocol or "tcp"
+        log.info("Scenario T protocol=%s", t_protocol)
         run_dynamic_scenario(
             ues, ctrls,
             phase_duration=args.phase_duration,
-            phase_fn=lambda u, phase_index: scenario_t_tiered(u, phase_index, protocol=args.protocol),
+            phase_fn=lambda u, phase_index: scenario_t_tiered(u, phase_index, protocol=t_protocol),
             raw_path_loss=True,
             scenario_label="T",
             max_phases=args.num_phases,
@@ -978,7 +1006,8 @@ def main() -> None:
     elif args.scenario == "R":
         import secrets
         seed = args.seed if args.seed is not None else secrets.randbits(32)
-        log.info("Scenario R seed=%d（PC1/PC2/PC3 三邊用同一個 --seed %d 才會場景一致）", seed, seed)
+        log.info("Scenario R seed=%d（PC1/PC2/PC3 三邊用同一個 --seed %d 才會場景一致）protocol=%s",
+                 seed, seed, args.protocol or "mix")
         assign_ue_profiles(ues, seed)
         # 固定 epoch：兩台主機各自的 process 只要系統時鐘沒有嚴重飄移就會落在同一個
         # phase_index，不需要任何跨主機通訊或啟動時刻同步。
@@ -986,14 +1015,15 @@ def main() -> None:
         run_dynamic_scenario(
             ues, ctrls,
             phase_duration=args.phase_duration,
-            phase_fn=lambda u, phase_index: scenario_r_realistic(u, seed, phase_index),
+            phase_fn=lambda u, phase_index: scenario_r_realistic(u, seed, phase_index, protocol=args.protocol),
             raw_path_loss=True,
             scenario_label="R",
             max_phases=args.num_phases,
             epoch=FIXED_EPOCH,
         )
     else:
-        run_fixed_scenario(args.scenario, ues, ctrls, duration=args.duration)
+        run_fixed_scenario(args.scenario, ues, ctrls, duration=args.duration,
+                           protocol=args.protocol or "tcp")
 
 
 if __name__ == "__main__":

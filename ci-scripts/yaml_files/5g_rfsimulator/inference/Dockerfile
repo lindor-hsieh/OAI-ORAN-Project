@@ -37,9 +37,8 @@ COPY training_pipeline.py .
 COPY inference_server.py .
 COPY main.py .
 
-# Phase 5 Global xApp 回傳配額橋接（見 global_xapp_bridge.py 檔頭說明）
+# Global xApp（全域公平性軟性廣播，見 global_xapp.py 檔頭說明）
 COPY global_xapp.py .
-COPY global_xapp_bridge.py .
 
 # 複製 Phase 5 Flower App 套件（ServerApp/ClientApp + 排程 wrapper）
 # 目錄名不能有底線（flwr build/run 會驗證 FAB 根目錄名稱，只允許字母/數字/連字號）

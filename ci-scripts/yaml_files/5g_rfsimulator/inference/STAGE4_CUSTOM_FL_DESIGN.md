@@ -1,20 +1,37 @@
 # Stage 4 自訂聚合演算法設計書：Backhaul-Aware Fair Aggregation with Proximal Regularization（BAFA-Prox）
 
-> 狀態：**設計草案，尚未實作**。取代舊版「RDA-Agg」草案（單純 reward-deficit 加權）——
+> 狀態：**設計草案，尚未實作**（2026-09-25 核對：程式碼中無 `IABCustomFedAvg`／`backhaul_tightness`／FedProx 相關實作）。取代舊版「RDA-Agg」草案（單純 reward-deficit 加權）——
 > 這版整合三個機制：(1) q-FFL 式的 reward-deficit 公平性加權、(2) 本系統特有的
 > backhaul 緊繃度加權、(3) FedProx 式的本地訓練近端正則化。前二者疊加在 Global
 > 聚合權重上，第三者作用在 Local 端訓練 loss——**三者互相獨立、可分開消融
 > （ablation）驗證**，不是綁死在一起的單一黑盒機制。相關文件：
-> `DRL_METHODOLOGY_PLAN.md`（Local 端方法論回顧）、
+> `DRL_DESIGN.md`（Local 端 DRL 設計）、`HISTORY.md` 附錄（FL 方法選擇理由：為何排除 HFL／Byzantine-robust、FedOpt／FedProx 候選）、
 > `experiment_results/{PF,avgFL,clusterFL}.md`（Stage 1~3 實測數據，含 2026-09-21
 > 三方 Scenario T 乾淨比較）、`HISTORY.md`（2026-09-20~21 條目，iperf3 bug／收斂
 > 診斷／逐 UE 相對改善分析的完整過程）。
+
+> **⚠️ 2026-09-25 前提更新（閱讀本文件前必讀）**：本草案第 1 節的動機與數據來自 **2026-09-21 舊拓樸**
+> （UE5~8 與 Donor 同機）+ TCP + GRU 時期的量測。之後有兩個發現削弱了部分論證：
+> (1) 2026-09-22 拓樸遷移（全部 relay 移到 PC1、access 分到 PC2/PC3）已消除「同主機優勢」confound，PF 重測
+> JFI 由 0.2812 變 0.9812（`PF.md`）；(2) 2026-09-25 查出 PC3 網卡在 USB 2.0 埠，所有跨主機鏈路被拖慢，
+> 舊數據裡的「跨主機開銷」很可能大部分是這個硬體瑕疵，遷移後 0.98 的 JFI 也是「均貧」（見 `CLAUDE.md` §3 量測條件警語）。
+> 因此第 1.2 節的方向判斷（「該加權 backhaul 緊繃度而非角色」）**降級為待驗證假說**：需網卡修復（USB 3.x）、
+> 重跑 Stage 1~3 基準後，才能判斷這些效能落差是否仍存在。第 2~9 節的機制設計本身不受影響。
+>
+> **與既有 Global xApp 的重疊**：`global_xapp.py` 已算 `fairness_bias = clip(global_mean/(node_mean+eps), 0.5, 2.0)`
+> 並廣播給 Local DRL 當 state 特徵，公式與本文機制一的 `deficit_i = clip(R̄/(R_i+ε), 1, Q_max)` 幾乎同構——差別只在
+> 前者作用在 Local 推論的 state（軟性輸入）、後者作用在 Global 聚合權重。兩者同時上線有「同一個落後訊號被補償兩次」
+> 的風險（Local 已因 `fairness_bias` 更積極、Global 又再加權該節點的模型），實作前需決定：(a) 機制一改用與
+> `fairness_bias` 不同的訊號來源（例如 reward 而非吞吐量、或改看趨勢），或 (b) 消融表增加「只關 `fairness_bias`」的對照組
+> 以量化重複補償的影響。
 
 ---
 
 ## 1. 背景：這次設計要解決的三個已實測驗證的弱點
 
 ### 1.1 弱點一：`REWARD_MODE=throughput_only` 沒有公平性項，FedAvg／Cluster FedAvg 聚合權重也不補償
+
+> （舊拓樸、TCP、Stage 2/3 使用 GRU 架構時期的數據，僅供動機參考。）
 
 2026-09-21 的三方 Scenario T 乾淨比較（`PF.md`／`avgFL.md`／`clusterFL.md`）＋逐 UE
 相對改善分析（`HISTORY.md` 對應條目）發現：avg FL／cluster FL 對 PF 的「總平均」
@@ -26,19 +43,24 @@
 （分別是 `num_examples`、`num_examples × role_ratio`）也完全不看「這個節點目前
 相對表現如何」的必然結果。
 
-### 1.2 弱點二：既有的角色分群（relay/access）沒有捕捉到真正的效能落差來源
+### 1.2 弱點二（待驗證假說）：既有的角色分群（relay/access）可能沒有捕捉到效能落差來源
 
-三份量測表格比對後發現一個持續模式：**UE5~8（Node2→Node7,8，全部跑在 PC1，跟
-Donor CU/DU/FlexRIC 同一台主機）在三次量測裡全部都是吞吐量最高的一群，UE1~4
-（PC2）跟 UE9~16（PC3，且是雙重跨主機）全部是最低的一群**——這個分組跟
-`ROLE_RATIO`（relay vs access）完全無關，反而高度對應**實體主機位置**（同主機
-省去一段真實網路傳輸開銷，跨主機、尤其雙重跨主機的節點多一段實體延遲）。Stage 3
-的 `role_ratio_i` 分群假設「relay/access 結構角色」是效能差異的主因，這次資料
-顯示這個假設**方向錯了**——真正該加權的訊號不是「這個節點的下游是誰」，而是
-「這個節點的 backhaul 實際有多緊繃」，剛好呼應 CLAUDE.md 原本就提示的方向：
-「要不要把全網 JFI 或 backhaul 緊繃程度也當作聚合權重的輸入」。
+**舊拓樸觀察（2026-09-21，已被遷移消除）**：當時三份量測表格比對發現，**UE5~8（Node2→Node7,8，跑在 PC1、
+跟 Donor 同機）在三次量測裡全部是吞吐量最高的一群，UE1~4（PC2）跟 UE9~16（PC3）全部最低**——這個分組跟
+`ROLE_RATIO`（relay vs access）無關，反而對應**實體主機位置**。據此當時推論 `role_ratio_i` 分群「方向錯了」，
+真正該加權的是「backhaul 有多緊繃」。
+
+**2026-09-22 / 09-25 之後的狀態**：
+- 2026-09-22 遷移把全部 relay 集中 PC1、access 一律跨主機，四條分支路徑結構一致；遷移後 PF 在 Scenario T 的
+  UE5~8／其餘比值由約 9 倍降到 1.08 倍，「同主機優勢」現象消失（`PF.md` 2026-09-22）。
+- 2026-09-25 發現 PC3 USB 網卡在 USB 2.0 埠、跨主機 rfsimulator 鏈路變慢（機制見 `CLAUDE.md` §8、`HISTORY.md`）。
+  舊觀察裡「跨主機的 UE 較慢」的主因很可能就是這個硬體瑕疵，而不是排程或聚合本身。
+- 因此「backhaul 緊繃度應取代角色比例」**目前沒有被證實**。機制二（第 4 節）仍可作為候選機制實作與消融，但動機須
+  在網卡修復、Stage 1~3 重測後重新檢驗；若修復後逐 UE 落差消失，機制二的預期收益要下修。
 
 ### 1.3 弱點三：兩個 checkpoint 收斂診斷顯示訓練還在早期、不穩定階段
+
+> （同為舊訓練 checkpoint 的診斷結果；結論方向仍有效，數字須以新訓練重驗。）
 
 `iab/check_convergence_mongo.py` 對兩個 checkpoint 的診斷結果：avg FL 12 個節點裡
 只有 1 個「疑似收斂」，cluster FL **12 個節點全部「仍在變動」**，且多數節點的
@@ -158,20 +180,24 @@ $$
 
 ### 4.1 訊號來源與最小幅度的 Local 層改動
 
-`gNB_scheduler_dlsch.c` 的 backhaul-aware PRB 預算機制，每個排程週期已經在內部
-算出「這個節點的 DU 這次可用的 PRB 數量」（$<106$，隨 MT 忙碌程度動態縮小）。
-定義：
+`gNB_scheduler_dlsch.c` 的 backhaul-aware PRB 預算機制，每個排程週期直接讀取
+`mac->backhaul_prb_ratio`（由 `nr_mac_gNB_backhaul_poll.c` 依 MT 的 RB 使用量算出：
+`ratio = 1 − EWMA(busy)`，`busy = ΔRB(UL+DL) / max_rb_per_interval`），並以
+`n_rb_sched = (int)(bw * bh_ratio)` 縮小 DU 可用 PRB 池。**實際 C 程式沒有 `available_prb_du` 這個變數**，
+可直接以 `bh_ratio` 定義：
 
 $$
-\text{tightness}_{\text{raw}} = 1 - \frac{\text{available\_prb\_du}}{106}
+\text{tightness}_{\text{raw}} = 1 - \text{bh\_ratio}
 $$
 
-$\text{tightness}_{\text{raw}} \in [0,1]$，越接近 1 代表這個節點的 backhaul
-越緊繃、DU 能用的 PRB 池被壓縮得越厲害。
+$\text{tightness}_{\text{raw}}$ 越大代表這個節點的 backhaul 越緊繃、DU 能用的 PRB 池被壓縮得越厲害。
+**實際值域注意**：`busy` 的分母是 UL+DL 兩倍容量（`max_rb_per_interval`），而流量以 DL 為主，
+因此 `busy` 實務上大約落在 $[0, 0.5]$（DL 全滿時約 0.5），即 $\text{tightness}_{\text{raw}} \in [0, \sim0.5]$、
+`bh_ratio` 約 $\ge 0.5$（依程式碼推論，實作前應以 `bhload query` 實測值域確認）。
 
 **最小幅度改動**（三個檔案各一行等級的新增，不改變既有邏輯）：
 
-1. `gNB_scheduler_dlsch.c`：這個比例值已經在內部算出來（用於裁切 PRB 池），
+1. `gNB_scheduler_dlsch.c`／`nr_mac_gNB_backhaul_poll.c`：`bh_ratio` 已經在內部算出來（用於縮小 PRB 池），
    額外寫進 MAC layer 既有要送給 E2 Agent 的統計結構（沿用第 7 節「共用底層
    檔案」清單裡本來就會被 E2SM-MAC 讀取的資料結構，不新開一條資料管線）。
 2. `xapp_nodeN.c`（12 份都要加）：組裝送給 Local rApp 的 JSON state 時，多帶一個
@@ -216,8 +242,11 @@ B_i = \text{tightness}_i \qquad
 $$
 
 $\beta$（預設 `1.0`）控制 backhaul 緊繃度貢獻的強度，$T_{max}$（預設 `2.0`）
-是安全上限。$B_i=0$（完全不緊繃）時 `bh_weight=1.0`（不加成），$B_i=1$（完全
-緊繃、PRB 池被壓到 0）時在 $\beta=1$ 下 `bh_weight=2.0`（權重加倍）。
+是安全上限。$B_i=0$（完全不緊繃）時 `bh_weight=1.0`（不加成）。**原假設 $B_i=1$（PRB 池被壓到 0）時
+`bh_weight=2.0` 在實務上不會發生**：依上面的值域，$B_i$ 大約只會到 $\sim0.5$，$\beta=1$ 下 `bh_weight` 最大約
+1.5，$T_{max}=2.0$ 這個上限實際不會觸發。若要讓機制有足夠動態範圍，預設 $\beta$ 應相應放大（例如 $\beta\approx2$，
+使 $B_i=0.5$ 時 `bh_weight≈2`），或先把 $B_i$ 除以觀測到的上限正規化到 $[0,1]$——此為實作前待決定項，
+第 6.1 節超參數預設值（$\beta=1.0$、$T_{max}=2.0$）須跟著重新考量。
 
 ---
 
@@ -265,6 +294,9 @@ $\mu$（預設 `0.01`，需要實測校調——這是這次三個超參數裡�
 `train_on_batch_mlp()` 行為。
 
 ### 5.3 實作位置（`drl_agent.py::train_on_batch_mlp()`）
+
+> 本設計的 FedProx 近端項**僅適用 `MODEL_ARCH=mlp`**（Stage 4 的「最基礎 DRL」預設）；若改用 `gru`，需另在
+> `train_on_batch_gru()` 加同樣的近端項，設計書未涵蓋。
 
 ```python
 # 緊接在既有的 critic_loss = F.mse_loss(current_values, targets) 之後
@@ -330,8 +362,8 @@ $R_i$ 相同時，$\text{deficit}_i \equiv \text{bh\_weight}_i \equiv 1.0$，
 
 ### 7.1 C 語言側（`xapp_nodeN.c` ×12、`gNB_scheduler_dlsch.c`）
 
-- `gNB_scheduler_dlsch.c`：backhaul-aware PRB 預算機制既有的
-  `available_prb_du` 計算之後，寫進既有要送給 E2 Agent 的 MAC 統計結構一個
+- `gNB_scheduler_dlsch.c`／`nr_mac_gNB_backhaul_poll.c`：backhaul-aware PRB 預算機制既有的
+  `bh_ratio`（`mac->backhaul_prb_ratio`）取值之後，寫進既有要送給 E2 Agent 的 MAC 統計結構一個
   新欄位（沿用第 7 節「共用底層檔案」清單既有的資料流，不新開 IPC 通道）。
 - `xapp_nodeN.c`：組裝 ZMQ JSON payload 時多帶 `"backhaul_tightness"` 一個
   欄位，讀值＋序列化，不改變 Rate Limiter／控制迴圈。
@@ -430,9 +462,9 @@ $R_i$ 相同時，$\text{deficit}_i \equiv \text{bh\_weight}_i \equiv 1.0$，
 
 | 組合 | $Q_{max}$ | $\beta$ | $\mu$ | 等同於 |
 |---|---|---|---|---|
-| baseline | — | 0 | 0 | `IABClusterFedAvg`（Stage 3 原樣） |
+| baseline | 1.0（deficit 關閉） | 0 | 0 | `IABClusterFedAvg`（Stage 3 原樣） |
 | A：只加 reward-deficit | 3.0 | 0 | 0 | 舊版 RDA-Agg |
-| B：只加 backhaul 緊繃度 | 1.0（等同關閉deficit，因固定=1） | 1.0 | 0 | — |
+| B：只加 backhaul 緊繃度 | 1.0（等同關閉 deficit，因固定=1） | 1.0 | 0 | — |
 | C：只加 FedProx | 1.0 | 0 | 0.01 | — |
 | D：deficit + backhaul（不含 FedProx） | 3.0 | 1.0 | 0 | — |
 | **E：完整版（本設計推薦）** | 3.0 | 1.0 | 0.01 | — |
@@ -467,6 +499,9 @@ $R_i$ 相同時，$\text{deficit}_i \equiv \text{bh\_weight}_i \equiv 1.0$，
 
 ## 10. 現場量測計畫
 
+0. **前置（2026-09-25 新增）**：先完成 PC3 網卡移到 USB 3.x 埠，三台 `speed` 皆為 5000/10000、主機間 ping <1 ms
+   （`CLAUDE.md` §6「網路健檢」），並決定本輪用 TCP 還是 UDP（`--protocol`，見 `CLAUDE.md` §8）；Stage 1~3 舊數據
+   （TCP、舊拓樸／瑕疵網卡）**不可**與新條件下的 Stage 4 直接比較，需在同一條件下重跑 Stage 1~3 基準。
 1. 三主機基礎設施就緒、13/13 E2、12/12 xApp、17/17 UE 現場 ping 0% 封包遺失、
    `bash scenarios/setup_iperf_servers.sh` 確認 17 個埠監聽中（見 CLAUDE.md
    第 6 節的強制步驟，這次的教訓）。

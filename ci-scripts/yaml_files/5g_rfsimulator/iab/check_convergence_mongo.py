@@ -237,7 +237,7 @@ def main() -> None:
     if any_pending:
         print("[提示] 還有節點未達「疑似收斂」，建議之後再跑一次本腳本追蹤趨勢。")
     else:
-        print("[提示] 全部節點都已疑似收斂，可以考慮跑 iab/drl_report.py 做正式的 Scenario 對比量測。")
+        print("[提示] 全部節點都已疑似收斂，可以考慮跑 iab/measure_stage.py 做正式的 15 分鐘量測。")
 
 
 if __name__ == "__main__":

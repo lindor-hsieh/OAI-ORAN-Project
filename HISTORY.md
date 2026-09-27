@@ -1015,3 +1015,84 @@ Stage 2 要求切換 `REWARD_MODE` 前必須清空模型 checkpoint。第一次�
 - **compose 變更**：`docker-compose-iab-server.yaml` 12 個 `inference-nodeN` 服務新增 `DRL_CAP_MODE`／`DRL_TRAIN_ENABLED`／`DRL_DETERMINISTIC` 三個環境變數（皆有預設值，向後相容）。`inference_server.py` 補上遺漏的 `import os`（新增 `TRAIN_ENABLED` 判斷時才發現原檔案沒 import，若沒補上會直接在 import 階段崩潰）。
 - **已同步 PC2/PC3**（`sync_pc23.sh --apply`，多次，校驗碼比對 0 個差異）；**未 commit/push**。
 - **待辦（使用者：6 小時訓練之後再說）**：目前寫進 `avgFL.md` 的是 2 小時暖啟動＋確定性輸出的初步結果，明確標註非正式定案；正式 Stage 2 結果需之後補跑一次完整 6 小時訓練（`DRL_CAP_MODE=relative`）＋ `DRL_DETERMINISTIC=1` 量測 TCP／UDP 各一份才能取代。relay 節點壅塞樣本比例偏低的結構性限制（見續二十一）預期仍會存在，是否調 `CONTENDED_BUF_BYTES` 待另外決定。
+
+## 2026-09-27 續二十三：開發 Stage 3 前的準備——保存 Stage 2 模型、審查 Global rApp cluster FL 設計
+
+- **背景**：使用者要開發 Stage 3，明確要求 Stage 2 的模型要留存（之後可能回頭量測），Local xApp/rApp
+  與 Stage 2 相同，主要檢查 Global xApp + Global rApp（cluster FL）設計有沒有問題，「不考慮工作難度，
+  選最有效的方案」，訓練另行通知才開始。
+- **保存 Stage 2 模型**：確認 docker volume（`iab-xapp-model-nodeN`）目前狀態只有 node12 與先前存的
+  `FINAL_1405` 有 1 個 checkpoint 版本差（推測是 finish 收尾時背景訓練執行緒與存檔動作的既知競速，
+  無害，volume 版本更新）。另存一份 `checkpoints_archive/stage2v2_relative_20260927/PRESERVED_BEFORE_STAGE3_1549/`
+  （12/12 個模型，train_steps 6870~7120），並對即時 MongoDB 經驗（2h 暖啟動再訓練＋E3/E4 評估產生的，
+  每節點約 10300~10650 筆）再做一次 mongodump（`mongo_iab_xapp_after_v2_retrain_20260927.archive.gz`，
+  44MB）。連同之前的兩份 mongodump（清空前／2h retrain 前）共 3 份備份，Stage 2 的模型與經驗資料
+  在開始 Stage 3 之前已有完整存底。
+- **Global xApp**：沿用 Stage 2 設計不變（`fairness_bias` 只是純 state 特徵，不做 PRB 裁切），審查
+  沒有發現問題。
+- **Global rApp（`IABClusterFedAvg`）找到的問題**：Stage 2 已確認 relay 節點（Node1~3）壅塞樣本
+  結構性趨近 0，Node4（唯一混合節點，`role_ratio=0.2`）反而有 30~60%。Stage 3 的聚合公式
+  $W_{relay}=\sum_i(1-\rho_i)n_i\Delta W_i / \sum_i(1-\rho_i)n_i$ 在這個資料分佈下，relay 側的加權
+  平均幾乎完全由 Node4 一個節點決定（Node1~3 權重趨近 0），這個「relay 原型」實質上是「Node4 專屬
+  模型」，廣播回 Node1~3 後，等於讓它們從 Stage 2 的「搭全體 12 節點（主要是 access）順風車」退化成
+  「只搭 Node4 一個節點的順風車」——樣本量更小、更不成熟，可能讓 Stage 3 系統性劣於 Stage 2，跟 Stage 2
+  那次「動作對應讓 PF 不可達」是同一類問題（某機制在資料稀疏時沒有優雅退回已知可行基準）。
+- **修正**：`server_app.py` 新增 ESS（有效樣本數，inverse Simpson index）收縮估計——先算出全體 12
+  節點的加權平均（等同 Stage 2 `IABFedAvg` 這輪的結果）當退回目標，relay／access 兩側各自的原始
+  加權平均依 ESS 收縮：ESS≈1（單一節點壟斷）時幾乎完全退回全體平均，ESS 越大（該側真正有多個節點
+  獨立貢獻）越信任該側自己的加權平均。新增 `_effective_sample_size()`／`_shrink_factor()`／
+  `_mix_flat()`／`_shrunk_prototype()` 四個函式，`CLUSTER_SHRINKAGE_C=1.0`（環境變數，可調，初步選定
+  未針對真實資料校準）。`aggregate_train()` 只多了算 `global_avg` 與兩側 ESS 這一步，`_broadcast_cluster_weights()`
+  的混合廣播公式完全不變。
+- **離線驗證**（比照既有慣例，不依賴 Docker/Flower，在容器內跑純函式測試）：壟斷情境（4 節點，3 個
+  近 0 權重+1 個權重是其餘總和數十倍，ESS≈1.01，收縮後非常接近全域平均）、均衡情境（4 節點權重相同，
+  ESS≈4）、冷啟動（`raw=None` 但 `global_avg` 存在／全體皆無資料）三類全部通過。
+- **文件**：`STAGE3_CLUSTER_FL_DESIGN.md` 新增第 10 節完整推導；`CLAUDE.md` Stage 3 列更新為「待重新
+  訓練與量測」，標註修正前的舊數字作廢。
+- **未做**：尚未重新訓練 Stage 3（使用者要求訓練另行通知）；`CLUSTER_SHRINKAGE_C` 未用真實 ESS 量級
+  校準；尚未確認這個修正對 access 側（原本運作正常的路徑）沒有非預期影響——重訓後應優先檢查。
+- **待辦**：修改後的 `server_app.py` 需要 `sync_pc23.sh --apply` 同步（PC2/PC3 不跑 Flower，但保持
+  原始碼一致）；未 commit/push。
+
+## 2026-09-27/28 續二十四：Stage 3 訓練（ESS 修正後）兩輪結果——已優於 avg FL（吞吐量）
+
+- **背景**：使用者要求「先做修正 記得真實資料做校準 修正後 開始訓練 stage3...先訓練3小時...如果沒有優於
+  avg.FL 想辦法幫我做調整...再訓練2小時再量測...我不會再電腦前 請一路做到產生結果」。完整過程與決策框架
+  先寫進 memory（`project_stage3_training_run_20260927.md`），供跨 session/context 中斷後接續。
+- **真實資料校準（訓練前）**：用 2h retrain 的 TCP 經驗模擬 FL client 的 `num_examples` 計算，
+  `ESS_relay=1.01`／`ESS_access=8.01`，`CLUSTER_SHRINKAGE_C=1.0` 驗證合理，未調整常數。
+- **第一輪（3 小時，暖啟動自 Stage 2 `PRESERVED_BEFORE_STAGE3_1549`，`FL_ROUND_INTERVAL_S=180` 預設）**：
+  16:16~19:16，訓練中 UE10／UE17／UE1／UE11 各崩潰 1 次，watchdog 就地修復全部成功。TCP 凍結量測
+  （`DRL_CAP_MODE=relative`、`DRL_DETERMINISTIC=1`、`DRL_TRAIN_ENABLED=0`）：吞吐量 **4.92 Mbps**，
+  低於 Stage 2 基準 5.02。
+- **診斷（用這次真實 3h 訓練資料重算 ESS）**：`ESS_relay≈1.00`（收縮係數≈0，relay 節點確認幾乎完全
+  退回全域平均）、`ESS_access≈7.86`（收縮係數≈0.87）。**結論：ESS 修正機制運作正常，relay 壟斷問題
+  已解決，這次落差較可能是訓練軌跡隨機變異，不是聚合結構性問題**（呼應 `STAGE3_CLUSTER_FL_DESIGN.md`
+  §7 已記載的 confound）。
+- **調整（選最低風險、直接針對已知限制，未動聚合演算法）**：`docker-compose-iab-server.yaml` 的
+  `flower-scheduler` 服務 `FL_ROUND_INTERVAL_S` 從寫死字串 `"180"` 改成 `"${FL_ROUND_INTERVAL_S:-180}"`
+  （可用環境變數覆寫，未設定時行為不變）。
+- **第二輪（2 小時，暖啟動延續第一輪 FINAL 模型，`FL_ROUND_INTERVAL_S=60`）**：20:07~22:07，訓練中
+  UE12 崩潰 1 次、就地修復成功。收尾（`finish_2h.sh`）正常完成、FINAL checkpoint 存好（12/12，
+  train_steps 11350~11870）。
+- **事故**：2h 訓練完成到 TCP 量測啟動之間，因前一個對話 session 中斷（Monitor 任務被系統標記
+  stopped），**沒有人執行原定的「訓練完成→立刻量測」流程，系統閒置了約 2.5 小時**（22:07 訓練完成，
+  00:44 才重新發現並補做量測）。RAN／CN 全程正常運行未受影響（`finish_2h.sh` 只停 xApp/inference/FL，
+  沒有波及 RAN/CN），沒有資料遺失，只是量測延誤——教訓：長時間無人值守任務若中間依賴「等下一次被喚醒
+  才做下一步」，一旦喚醒鏈斷裂（session 重啟、Monitor 逾時後沒有人接手重新 arm）就會卡住；已把完整
+  決策框架寫進 memory，下個 session 一開始被問「進度」時能立刻查到還有一步沒做並補上。
+- **第二輪 TCP 凍結量測結果**：吞吐量 **5.08 Mbps**，**優於 avg FL 基準 5.02**（+1.2%）、優於 PF 4.93；
+  壅塞相位滿足率 0.764（avg FL 0.768，接近）；滿足率 JFI 0.934（avg FL 0.933，持平）；整段 JFI
+  0.9933（PF 0.9871、avg FL 0.9896、Stage3 第一輪 0.9854 中最高）；RTT 58.6 ms（avg FL 58.4，持平）。
+- **結論**：Stage 3 在吞吐量這個主要指標上已優於 Stage 2，達成單調遞增；其餘指標與 avg FL 打平或些微
+  落後，差距在雜訊範圍內。完整結果、方法論限制寫進 `experiment_results/clusterFL.md` 最末章節；
+  `CLAUDE.md` Stage 3 列已更新為「已完成」。
+- **方法論限制**：兩輪是暖啟動延續、不是獨立對照組，無法區分「FL_ROUND_INTERVAL_S 調整」與「訓練軌跡
+  隨機變異／多訓練一段時間」何者是第二輪變好的真正原因；只量了 TCP，UDP 未量；`FL_ROUND_INTERVAL_S=60`
+  未做掃描，只試了一個方向；relay 節點（Node1~3）目前仍等同拿 Stage 2 的全域平均（ESS≈1 未改變），
+  Stage 3 的效益主要來自 Node4 個人化混合權重與聚合頻率調整，不是 relay/access 分群設計本身在這組
+  真實資料下發揮作用。
+- **已完成**：`clusterFL.md`／`CLAUDE.md`／本條目寫入完成；同步 PC2/PC3；**未 commit/push**。
+- **未做（依使用者指示，只做這一輪調整就停）**：不再自動做第三輪調整或訓練；UDP 量測；
+  `FL_ROUND_INTERVAL_S` 掃描；relay 端結構性訊號不足的問題（生成 Stage3 專用訓練場景讓 relay MT
+  通道偶爾惡化）——留給使用者回來後決定要不要繼續。

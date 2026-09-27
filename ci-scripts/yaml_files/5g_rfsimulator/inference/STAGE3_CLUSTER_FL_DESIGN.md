@@ -1,6 +1,6 @@
 # Stage 3 設計書：Soft/Weighted Clustered FedAvg（連續角色比例加權聚合）
 
-> 狀態：**已實作、已完成量測**（2026-09-13 設計定案，2026-09-14 量測）。本文件補完
+> 狀態：**已實作，2026-09-27 修正一個結構性設計問題（見第 10 節），待重新訓練與量測**。下方第 7 節的量測結果是修正前、舊拓樸、GRU 架構下量的，已作廢，僅供歷史對照。本文件補完
 > CLAUDE.md 第 3 節 Stage 3 段落的完整設計脈絡與公式推導，程式碼位置：
 > `inference/flower-app/iab_fl/server_app.py`（`IABClusterFedAvg`）、`client_app.py`
 > （`train()` 的 `node_id` 欄位）。量測數據見 `experiment_results/clusterFL.md`；
@@ -335,3 +335,78 @@ python3 iab/calibrate_fl_rate.py --duration 600 --interval 30 --out /tmp/fl_cali
   `STAGE4_CUSTOM_FL_DESIGN.md` 第 2 節設計邊界第 2 點。
 - **Stage 5**：只換 `REWARD_MODE=lagrangian`（Local 層），Global 聚合方式沿用
   Stage 4（因此間接沿用本文件的角色加權結構），不在本階段變動。
+
+---
+
+## 10. 設計審查修正（2026-09-27）：relay 原型被單一節點壟斷的風險
+
+**背景**：使用者要求在開發 Stage 3 前先審查 Global xApp／Global rApp（Global xApp 不涉及聚合，
+沿用 Stage 2 設計不變，見 `STAGE2_DESIGN.md` 第 3 節；本節只檢查 Global rApp）。查出一個結構性
+問題並修正，尚未重新訓練驗證。
+
+### 10.1 問題：relay 側加權平均在現行拓樸下幾乎只由 Node4 一個節點決定
+
+Stage 2 已確認（`avgFL.md`「動作對應設計問題的診斷與修正」）：`DRL_CAP_MODE=relative` 設計下，
+relay 節點（Node1~3）的 MT 通道結構性不被場景惡化，壅塞樣本比例長期只有 2~7%（穩態），Actor 更新
+機會極少；Node4（唯一混合節點，`role_ratio=0.2`）因為直連 UE17 又中繼 Node11/12，壅塞樣本比例
+反而有 30~60%。
+
+第 3 節的聚合公式 $W_{relay} = \sum_i (1-\rho_i)\cdot n_i \cdot \Delta W_i \,/\, \sum_i (1-\rho_i)\cdot n_i$
+裡，Node1~3 的權重 $(1-\rho_i)\cdot n_i \approx n_i \approx 0$（$\rho_i=0$，$n_i$ 趨近 0），Node4
+的權重 $(1-\rho_4)\cdot n_4 = 0.8\,n_4$ 遠大於前三者之和——這代表 **relay 原型幾乎完全由 Node4 一個
+節點的經驗決定**，不是 Node1~4 的群體共識。而這個原型會依 $(1-\rho_i)$ 廣播回 Node1~3（$\rho_i=0$
+時原型全額廣播），也就是說 Node1~3 拿到的其實是「Node4 專屬模型」。
+
+**與 Stage 2 對照**：Stage 2 的 `IABFedAvg` 是全體 12 節點一起做加權平均，Node1~3 雖然自己貢獻
+的權重趨近 0，但廣播回去的是「全體 12 節點（主要是 8 個 access 節點）的加權平均」——樣本池遠大於
+單一節點 Node4。Stage 3 的硬性依角色分桶聚合，反而讓 Node1~3 從「搭 access 節點的順風車」變成
+「只搭 Node4 一個節點的順風車」，樣本量更小、更不成熟、更容易帶有 Node4 特有的雜訊（例如 UE17
+三重負載這種邊界案例）——**這是一個可能讓 Stage 3 系統性劣於 Stage 2 的設計缺陷，跟 Stage 2 那次
+「動作對應讓 PF 不可達」是同一類問題：某個機制在資料稀疏/退化的情況下，沒有優雅退回到已知可行的
+基準（Stage 2 的結果），而是退化成一個更差的東西。**
+
+### 10.2 修正：有效樣本數（ESS）收縮估計
+
+不改變 §3 的核心加權平均公式，改在「多信任這一側自己的加權平均、多退回全體平均」之間，依這一側
+實際被多少個節點真正撐起來動態調整：
+
+$$ESS(\text{side}) = \frac{\big(\sum_i w_i\big)^2}{\sum_i w_i^2},\qquad w_i = (1-\rho_i)n_i\ \text{（relay 側）或}\ \rho_i n_i\ \text{（access 側）}$$
+
+$ESS$ 是統計上常見的「有效樣本數」（inverse Simpson index）：全部集中在一個節點時 $ESS\to1$；
+$k$ 個節點權重均等時 $ESS=k$。收縮係數：
+
+$$\alpha(\text{side}) = \frac{\max(0,\ ESS-1)}{\max(0,\ ESS-1) + C},\qquad C=1.0\ (\text{`CLUSTER\_SHRINKAGE\_C`，可調})$$
+
+$ESS=1$（單一節點壟斷）$\Rightarrow \alpha=0$；$ESS=2$（兩個節點真正各自有份量）$\Rightarrow \alpha=0.5$；
+$ESS\to\infty \Rightarrow \alpha\to1$。最終原型：
+
+$$W_{\text{side}}^{\text{final}} = \alpha(\text{side})\cdot W_{\text{side}}^{\text{raw}} + \big(1-\alpha(\text{side})\big)\cdot W_{\text{global}}$$
+
+$W_{\text{global}}$ 是**全體 12 節點**依 $n_i$ 加權的平均（等同 Stage 2 `IABFedAvg` 這一輪會算出的結果）。
+$W_{\text{side}}^{\text{raw}}$ 為 `None`（該側這輪權重總和為 0）時直接退回 $W_{\text{global}}$；
+$W_{\text{global}}$ 也為 `None`（全體節點這輪都沒有訊號，冷啟動）時直接用 $W_{\text{side}}^{\text{raw}}$
+（沒有可退回的對象），跟 §3.3 的冷啟動防呆語意一致。
+
+**效果**：relay 原型結構性被 Node4 壟斷（$ESS\approx1$）時，$\alpha\approx0$，relay 側幾乎完全退回
+$W_{\text{global}}$——Node1~3 拿到的實質上等同 Stage 2 的結果，不會因為 Stage 3 的分群機制而系統性
+變差。access 側因為有 8 個節點、樣本量與多元性都足夠，$ESS$ 通常明顯大於 1，$\alpha$ 接近 1，
+access 節點的行為預期與 Stage 2 相近（因為 access 側加權平均本來就約等於 Stage 2 全體平均，
+relay 節點權重趨近 0 對 Stage 2 全體平均的貢獻本來就可忽略）。若之後真的觀察到 Node1~4 累積出
+更多元、更平衡的壅塞樣本（$ESS$ 上升），$\alpha$ 會自動提高、讓 relay 原型逐漸反映真正的群體共識，
+不需要手動切換。
+
+**實作**：`server_app.py`，新增 `_effective_sample_size()`／`_shrink_factor()`／`_mix_flat()`／
+`_shrunk_prototype()` 四個函式，`IABClusterFedAvg.aggregate_train()` 在算出 `w_relay_raw`／
+`w_access_raw` 之後，先額外算 `global_avg`（全體 12 節點加權平均）與兩側的 $ESS$，再各自收縮
+成最終的 `w_relay`／`w_access`。`_broadcast_cluster_weights()`（§4 的混合廣播公式）完全不變，
+吃到的就是收縮後的兩個原型。
+
+**離線驗證**（比照 §6 既有慣例）：涵蓋壟斷情境（4 個節點、3 個近乎 0 權重＋1 個權重是其餘總和
+數十倍，$ESS\approx1.01$，收縮後結果非常接近全域平均）、均衡情境（4 個節點權重相同，$ESS\approx4$）、
+冷啟動（全體皆無資料、`raw=None` 但 `global_avg` 存在）三類，全部通過。
+
+**真實資料驗證（2026-09-27，用 2h retrain 的 TCP 經驗模擬 FL client 端 `num_examples` 計算）**：
+$ESS_{relay}=1.01$（幾乎完全是 Node4 一個節點，證實 §10.1 的診斷）、$ESS_{access}=8.01$（8 個 access
+節點權重相當均勻）。$C=1.0$ 下：relay 側 $\alpha\approx0.012$（幾乎完全退回全域平均，符合設計意圖）、
+access 側 $\alpha\approx0.875$（仍主要信任自己的加權平均，行為預期與 Stage 2 相近，沒有被過度收縮）。
+$C\in[0.5,3.0]$ 範圍內 access 側 $\alpha$ 都 $\ge0.7$，$C=1.0$ 維持預設值，不需調整。

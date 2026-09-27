@@ -56,6 +56,15 @@ MONGO_DB: str = os.getenv("MONGO_DB", "iab_xapp")
 # Clustered FL——兩種聚合邏輯並存，用這個環境變數切換，比照 REWARD_MODE 的既有模式。
 FL_MODE: str = os.getenv("FL_MODE", "avg")
 
+# 2026-09-27（Stage 3 設計審查修正）：relay/access 兩個「原型」的加權平均若被單一節點壟斷
+# （現行拓樸下最常見的情況：Node1~3 結構性幾乎沒有壅塞樣本、num-examples≈0，relay 側加權平均
+# 幾乎完全由 Node4 一個節點決定），該原型會退化成「Node4 專屬模型」而非真正的 relay 群體共識，
+# 廣播回 Node1~3 後可能系統性劣於 Stage 2（Node1~3 在 avg FedAvg 下是拿到全體 12 節點的加權平均、
+# 樣本池遠大於單一節點）。用「有效樣本數」(ESS, effective sample size) 收縮：某一側的原型若只有
+# ~1 個有效貢獻者，就大幅退回全體 12 節點的加權平均（等同 Stage 2 IABFedAvg 的結果）；貢獻者
+# 越多元、越不被單一節點壟斷，才越信任該側自己的加權平均。見 STAGE3_CLUSTER_FL_DESIGN.md 第 10 節。
+CLUSTER_SHRINKAGE_C: float = float(os.getenv("CLUSTER_SHRINKAGE_C", "1.0"))
+
 # role_ratio_i = 直連 UE 數量 / (直連 UE 數量 + 透過下游 DU 節點間接服務的 UE 數量)。
 # 結構性常數，依現行 12-node 拓樸算出，不需即時量測：Node1~3 純 relay（下游都是
 # 其他有 DU 的節點）；Node4 混合（直連 UE17 + 經 Node11/12 服務的 UE13~16）；
@@ -129,6 +138,40 @@ def _attach_global_jfi(db: pymongo.database.Database | None, metrics: MetricReco
         except Exception:
             jfi = 0.0
     metrics["global_jfi"] = jfi
+
+
+def _effective_sample_size(weights: list[float]) -> float:
+    """有效樣本數（inverse Simpson index）：Σw)²/Σw²。全部為 0 時回傳 0；單一節點壟斷時 ≈1；
+    n 個節點權重均等時 = n。用來偵測「這一側的加權平均是不是幾乎只由一個節點決定」。"""
+    positive = [w for w in weights if w > 0]
+    total = sum(positive)
+    if total <= 0:
+        return 0.0
+    return (total * total) / sum(w * w for w in positive)
+
+
+def _shrink_factor(ess: float, c: float = CLUSTER_SHRINKAGE_C) -> float:
+    """ESS → 收縮係數 α ∈ [0,1)。ESS≤1（無資料或被單一節點壟斷）→ α=0，完全退回全域加權平均；
+    ESS 越大（越多節點真正、獨立貢獻）→ α 越趨近 1，越信任這一側自己的加權平均。"""
+    extra = max(0.0, ess - 1.0)
+    return extra / (extra + c)
+
+
+def _mix_flat(primary: dict, fallback: dict, alpha: float) -> dict:
+    """逐 key 線性混合：alpha·primary + (1-alpha)·fallback。"""
+    return {k: alpha * primary[k] + (1.0 - alpha) * fallback[k] for k in primary}
+
+
+def _shrunk_prototype(raw: dict | None, ess: float, global_avg: dict | None) -> dict | None:
+    """把某一側的原始加權平均（raw）依 ESS 收縮回全域加權平均（global_avg），見模組上方常數說明。
+    raw 為 None（該側這輪權重總和為 0）時直接回傳 global_avg（可能也是 None）；global_avg 為
+    None（全體都沒有訊號，極端冷啟動）時直接回傳 raw，不做收縮（沒有可退回的對象）。"""
+    if raw is None:
+        return global_avg
+    if global_avg is None:
+        return raw
+    alpha = _shrink_factor(ess)
+    return _mix_flat(raw, global_avg, alpha)
 
 
 def _weighted_average_flat(items: list[tuple[dict, float]]) -> dict | None:
@@ -226,6 +269,7 @@ class IABClusterFedAvg(IABFedAvg):
 
         relay_items: list[tuple[dict, float]] = []
         access_items: list[tuple[dict, float]] = []
+        all_items: list[tuple[dict, float]] = []
         total_num_examples = 0
 
         for msg in replies:
@@ -237,9 +281,23 @@ class IABClusterFedAvg(IABFedAvg):
             flat = msg.content["arrays"].to_torch_state_dict()
             relay_items.append((flat, (1.0 - role) * num_examples))
             access_items.append((flat, role * num_examples))
+            all_items.append((flat, num_examples))
 
-        w_relay = _weighted_average_flat(relay_items) if relay_items else None
-        w_access = _weighted_average_flat(access_items) if access_items else None
+        # 2026-09-27：先算全體 12 節點的加權平均（等同 Stage 2 IABFedAvg 的結果）當收縮目標，
+        # 再用 ESS 決定 relay/access 兩側各自的原始加權平均要收縮多少回這個全域平均，見模組
+        # 上方常數區塊的說明與 STAGE3_CLUSTER_FL_DESIGN.md 第 10 節。
+        global_avg = _weighted_average_flat(all_items) if all_items else None
+        w_relay_raw = _weighted_average_flat(relay_items) if relay_items else None
+        w_access_raw = _weighted_average_flat(access_items) if access_items else None
+        relay_ess = _effective_sample_size([w for _, w in relay_items])
+        access_ess = _effective_sample_size([w for _, w in access_items])
+        w_relay = _shrunk_prototype(w_relay_raw, relay_ess, global_avg)
+        w_access = _shrunk_prototype(w_access_raw, access_ess, global_avg)
+        print(
+            f"[server_app] Round {server_round}: relay ESS={relay_ess:.2f} shrink_alpha="
+            f"{_shrink_factor(relay_ess):.2f}  access ESS={access_ess:.2f} shrink_alpha="
+            f"{_shrink_factor(access_ess):.2f}"
+        )
 
         if w_relay is not None:
             self._last_w_relay = w_relay

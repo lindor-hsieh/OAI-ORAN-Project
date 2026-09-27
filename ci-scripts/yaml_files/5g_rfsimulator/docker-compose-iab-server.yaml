@@ -1037,7 +1037,7 @@ services:
                 condition: service_started
         environment:
             FL_FEDERATION: "local-deployment"
-            FL_ROUND_INTERVAL_S: "180"
+            FL_ROUND_INTERVAL_S: "${FL_ROUND_INTERVAL_S:-180}"
             FL_APP_PATH: "/app/flower-app"
         command: ["bash", "/app/flower-app/run_hourly.sh"]
         restart: on-failure

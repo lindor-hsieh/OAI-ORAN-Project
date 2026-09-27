@@ -1,0 +1,13 @@
+== FINAL_1917 2026-09-27 19:17:09
+node1  train_steps=9470   reward_std=0.10611 arch=mlp lambda=0.0 size=497765B
+node2  train_steps=9510   reward_std=0.09814 arch=mlp lambda=0.0 size=497765B
+node3  train_steps=9490   reward_std=0.0959 arch=mlp lambda=0.0 size=497765B
+node4  train_steps=9380   reward_std=0.07896 arch=mlp lambda=0.0 size=497765B
+node5  train_steps=9320   reward_std=0.05919 arch=mlp lambda=0.0 size=497765B
+node6  train_steps=9400   reward_std=0.06825 arch=mlp lambda=0.0 size=497765B
+node7  train_steps=9370   reward_std=0.06879 arch=mlp lambda=0.0 size=497765B
+node8  train_steps=9340   reward_std=0.06098 arch=mlp lambda=0.0 size=497765B
+node9  train_steps=9340   reward_std=0.0601 arch=mlp lambda=0.0 size=497765B
+node10 train_steps=9290   reward_std=0.06517 arch=mlp lambda=0.0 size=497819B
+node11 train_steps=9190   reward_std=0.06786 arch=mlp lambda=0.0 size=497819B
+node12 train_steps=9300   reward_std=0.0554 arch=mlp lambda=0.0 size=497819B

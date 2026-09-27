@@ -1,0 +1,13 @@
+== ckpt_02_1656 2026-09-27 16:56:40
+node1  train_steps=7600   reward_std=0.10429 arch=mlp lambda=0.0 size=497765B
+node2  train_steps=7640   reward_std=0.10578 arch=mlp lambda=0.0 size=497765B
+node3  train_steps=7620   reward_std=0.10832 arch=mlp lambda=0.0 size=497765B
+node4  train_steps=7520   reward_std=0.07317 arch=mlp lambda=0.0 size=497765B
+node5  train_steps=7460   reward_std=0.06187 arch=mlp lambda=0.0 size=497765B
+node6  train_steps=7550   reward_std=0.06758 arch=mlp lambda=0.0 size=497765B
+node7  train_steps=7520   reward_std=0.05749 arch=mlp lambda=0.0 size=497765B
+node8  train_steps=7490   reward_std=0.05818 arch=mlp lambda=0.0 size=497765B
+node9  train_steps=7500   reward_std=0.06584 arch=mlp lambda=0.0 size=497765B
+node10 train_steps=7430   reward_std=0.07219 arch=mlp lambda=0.0 size=497819B
+node11 train_steps=7380   reward_std=0.07038 arch=mlp lambda=0.0 size=497819B
+node12 train_steps=7450   reward_std=0.05192 arch=mlp lambda=0.0 size=497819B

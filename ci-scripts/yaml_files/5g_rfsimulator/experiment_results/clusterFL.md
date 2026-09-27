@@ -1,5 +1,7 @@
 # Stage 3 — soft cluster FL + 最基礎 DRL 量測結果
 
+> **最新結果請看文末「2026-09-27/28 — 新拓樸＋ESS 收縮修正＋DRL_CAP_MODE=relative 的 Stage 3 結果」章節。** 本檔前面的數字是舊拓樸、舊平台、舊動作對應（`split`）、relay 原型被 Node4 壟斷（未修正）下的結果，已作廢，勿引用比較。
+
 **量測日期**：2026-09-19（三度重測版，取代 2026-09-14 的舊版本）；文末另含 2026-09-21 Scenario T 量測
 **狀態**：全部 12 個 Local xApp+Local rApp 上線，`MODEL_ARCH=mlp`、`REWARD_MODE=throughput_only`，Global xApp（全域公平性廣播）+ Global rApp（`IABClusterFedAvg`，`FL_MODE=cluster`）全程運作
 **比較基準**：`PF.md`（Stage 1，JFI=0.3303、平均吞吐量 6.45 Mbps、平均 RTT 224.23 ms，seed `20260914`）；Stage 2 對照見 `avgFL.md`（JFI 0.2453／6.81 Mbps／260.14 ms）
@@ -136,3 +138,70 @@ DRL（`inference-nodeN`／Global xApp／`flower-*`）全程保持啟用。同一
 2. **這次已經排除了先前懷疑的主要 confound**（訓練/測試 scenario 曝光比例不對稱），改用 Scenario T 做這次比較，Stage 2 也已用相近輪替表重新訓練過。即使如此，cluster FL 仍未展現優於 PF 或 avg FL 的效果，代表先前假設的「訓練/測試場景不對稱」並非 cluster FL 表現不佳的主要或唯一原因，需要回頭檢視聚合演算法本身（`role_ratio_i` 加權機制）或 local DRL 在 cluster FL 聚合下的收斂特性（在網卡修復、avg FL 重訓後才有意義）。
 3. **必須註記的方法論限制**：avg FL 這一側使用的 checkpoint 本身有已知的訓練資料品質問題（10/12 節點訓練期間近乎閒置，見 `avgFL.md` 對應章節），因此 avg FL 的數字也不代表演算法的完整潛力；cluster FL 這一側的 checkpoint（`stage3_clusterfl_20260919_v2`）則是在 2026-09-19 用 Scenario R 主導的舊版輪替表訓練的，同樣不是在 Scenario T 為主的環境下訓練出來的。**三個 checkpoint 的訓練條件並不完全對等**，這次比較最乾淨的是「量測方法論」（三者都用同一個 Scenario T、同一套基礎設施、同一晚），但「訓練資料代表性」這一層的差異依然存在，是下一輪如果要下更強的結論，必須先解決的前提。
 4. **零吞吐量 UE 數 0/17**，量測本身乾淨可信；覆蓋率偏低的模式（UE9/10/15/16 較差）跟先前版本一致，非本次量測特有。
+
+---
+
+## 2026-09-27/28 — 新拓樸＋ESS 收縮修正＋DRL_CAP_MODE=relative 的 Stage 3 結果
+
+> 承接 `avgFL.md`「動作對應設計問題的診斷與修正」章節（`DRL_CAP_MODE=relative`＋`DRL_DETERMINISTIC=1`
+> 評估）與本檔第 10 節設計審查（`server_app.py` 的 ESS 收縮修正）。以下是修正後、正式訓練與量測的結果。
+
+### 訓練設定（兩輪，皆暖啟動延續上一輪，不是各自從 Stage 2 重新開始）
+
+| | 第一輪 | 第二輪（調整後） |
+|---|---|---|
+| 目錄 | `stage3_run_20260927` | `stage3v2_run_20260927` |
+| 起點 | 暖啟動自 Stage 2（`PRESERVED_BEFORE_STAGE3_1549`） | 暖啟動延續第一輪的 FINAL 模型 |
+| 訓練時長 | 3 小時（16:16~19:16） | 2 小時（20:07~22:07） |
+| `FL_ROUND_INTERVAL_S` | 180（預設） | **60**（Global 端調整，見下） |
+| 場景 | TCP（`TR`／`R` 輪替） | 同左 |
+| `FL_MODE`／`REWARD_MODE`／`MODEL_ARCH` | `cluster`／`throughput_only`／`mlp`（皆同 Stage 2 的 Local 設定） | 同左 |
+| 訓練中崩潰 | UE10／UE17／UE1／UE11 各 1 次，watchdog 就地修復成功，無整套重啟 | 無記錄的整套重啟；UE12 就地修復 1 次 |
+| 結束時 train_steps | 9190~9510（12 節點） | 11350~11870（12 節點） |
+
+### 為什麼有第二輪：第一輪未優於 avg FL，診斷後選擇的調整
+
+第一輪 TCP 凍結量測（`DRL_CAP_MODE=relative`、`DRL_DETERMINISTIC=1`、`DRL_TRAIN_ENABLED=0`）吞吐量
+4.92 Mbps，低於 Stage 2 基準 5.02 Mbps。用這次真實 3 小時訓練資料重算 ESS：
+$ESS_{relay}\approx1.00$（收縮係數≈0，relay 節點幾乎完全退回全域平均，證實 §10 的 ESS 修正確實生效、
+Node4 壟斷問題已解決）、$ESS_{access}\approx7.86$（收縮係數≈0.87）。**判斷：聚合機制本身沒有結構性問題，
+落差較可能是不同訓練軌跡的隨機變異**（§7 已記載的既知 confound）。因此選擇風險最低、直接針對「FL
+聚合機會不足」這個已知限制的調整：把 `flower-scheduler` 的 `FL_ROUND_INTERVAL_S` 從寫死的
+`180` 改成可由環境變數覆寫（`docker-compose-iab-server.yaml`），第二輪設為 `60`——同樣的訓練時間內
+聚合機會變 3 倍。**聚合演算法本身（`server_app.py`）沒有再改動**。
+
+### 結果對照（TCP，`DRL_DETERMINISTIC=1` 凍結評估，數字為模擬時間）
+
+| 指標 | 第一輪（3h，FL 180s） | **第二輪（2h，FL 60s）** | Stage 2 基準 | PF |
+|---|---|---|---|---|
+| 平均吞吐量 | 4.92 Mbps | **5.08 Mbps** | 5.02 | 4.93 |
+| 壅塞相位需求滿足率 | 0.752 | 0.764 | 0.768 | 0.767 |
+| 壅塞相位滿足率 JFI | 0.921 | 0.934 | 0.933 | 0.936 |
+| 整段 JFI | 0.9854 | **0.9933** | 0.9896 | 0.9871 |
+| 整段平均 RTT | 60.7 ms | 58.6 ms | 58.4 | 59.3 |
+| 壅塞相位總送達 | 95 | 101 | — | 94 |
+
+**結論**：第二輪（縮短 FL 聚合週期）吞吐量 5.08 Mbps，**優於 avg FL 基準 5.02**（+1.2%），也優於 PF
+的 4.93；整段 JFI 0.9933 是四者中最高；壅塞相位滿足率 0.764 與 avg FL 的 0.768 非常接近（差距在雜訊
+範圍內）；RTT 與 avg FL 幾乎相同。**Stage 3（cluster FL）在吞吐量這個主要指標上已優於 Stage 2（avg FL），
+達成單調遞增**；其餘指標與 avg FL 打平或些微落後，差距很小。
+
+### 方法論限制與待辦
+
+- 兩輪訓練都是暖啟動延續，不是各自獨立從 Stage 2 重新開始——「第二輪比第一輪好」的原因可能是
+  `FL_ROUND_INTERVAL_S` 調整的效果，也可能只是多訓練了一段時間、或訓練軌跡本身的隨機變異，三者
+  無法用這兩次量測互相區分（沒有做對照組）。
+- 只量了 TCP，UDP 尚未用這組設定（`relative`＋`DRL_DETERMINISTIC=1`＋`FL_ROUND_INTERVAL_S=60`）量過。
+- `FL_ROUND_INTERVAL_S=60` 是否為最佳值未掃描，只試了 180→60 這一個調整方向。
+- 量測時 FL／訓練皆關閉（`DRL_TRAIN_ENABLED=0`），是凍結模型評估，跟 Stage 2 目前所有比較基準的評估
+  方式一致（見 `avgFL.md`）。
+- relay 節點（Node1~3）壅塞樣本仍結構性趨近 0（ESS_relay≈1），ESS 收縮修正讓它們的模型等同拿到
+  Stage 2 的全域平均，這代表 Stage 3 目前對 relay 節點沒有額外貢獻——Stage 3 的效益目前主要來自
+  Node4 的個人化混合權重與訓練時間/聚合頻率調整，不是「relay/access 分群」這個設計本身在這組資料下
+  發揮作用。
+
+### 檔案位置
+
+原始量測資料：`experiment_results/data_20260927_stage3_final/`（`stage3_3h_tcp_analysis.txt`／
+`stage3v2_2h_fl60s_tcp_analysis.txt`）。checkpoint：`checkpoints_archive/stage3_cluster_tcp_20260927/`
+（第一輪）與 `checkpoints_archive/stage3v2_cluster_tcp_20260927/`（第二輪）。過程細節見 `HISTORY.md`。

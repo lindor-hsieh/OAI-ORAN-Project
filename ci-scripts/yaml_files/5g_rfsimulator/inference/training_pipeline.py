@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -34,7 +35,11 @@ import pymongo
 
 from drl_agent import DRLAgent, MIN_TRAIN_EXPERIENCES, TRAIN_BATCH_SIZE, TRAIN_SEQ_LEN, TRAIN_SEQ_COUNT
 
-TRAIN_FETCH_LIMIT: int = 2000
+# 回放緩衝區大小：每輪訓練讀取「最新」的這麼多筆經驗。每節點 ~1 筆/秒（控制週期 1 秒），5000 筆 ≈ 83 分鐘 ≈ 45 個
+# 110 秒相位，足以涵蓋多輪正常/壅塞交替（舊註解的「~10 筆/秒」是錯的）。2026-09-26 修正：舊版是 2000 筆且取的是「最舊的」2000 筆
+# （見 fetch_experiences()），資料一超過 2000 筆就永遠在重複訓練最早那批啟發式階段的資料。
+# 可用環境變數 TRAIN_FETCH_LIMIT 覆寫（inference_server.py 與 FL client_app.py 共用這個值）。
+TRAIN_FETCH_LIMIT: int = int(os.getenv("TRAIN_FETCH_LIMIT", "5000"))
 TRAIN_EPOCHS_PER_ROUND: int = 10
 
 # jfi_raw／r_throughput：Lagrangian 乘子 λ 更新用（DRLAgent.train_on_batch()，
@@ -43,6 +48,7 @@ _PROJECTION = {
     "state_vec": 1, "mask_vec": 1, "action_ratios": 1,
     "reward": 1, "next_state_vec": 1, "next_mask_vec": 1,
     "jfi_raw": 1, "r_throughput": 1, "is_idle": 1,
+    "behavior_logp": 1,   # PPO 比例裁剪用的行為策略 log π(a|s)，見 drl_agent.py（缺欄位者只訓練 Critic）
     "_id": 0,
 }
 
@@ -66,7 +72,7 @@ def fetch_experiences(
     log: Optional[logging.Logger] = None,
 ) -> list[dict]:
     """
-    從 MongoDB 讀取最近 fetch_limit 筆經驗（打散抽樣用，MODEL_ARCH=mlp 專用）。
+    從 MongoDB 讀取「最新」的 fetch_limit 筆經驗（打散抽樣用，MODEL_ARCH=mlp 專用）。
 
     跟 fetch_sequences() 不同，這裡不要求時間連續性、不切窗——MLP 是無記憶的
     單步模型，訓練時每筆經驗獨立看待即可，門檻只看原始經驗數
@@ -82,17 +88,20 @@ def fetch_experiences(
                 {"reward": {"$exists": True}, "next_state_vec": {"$exists": True}},
                 projection=_PROJECTION,
             )
-            .sort("timestamp", pymongo.ASCENDING)
+            # 必須 DESCENDING 才是「最新」的 N 筆；舊版 ASCENDING+limit 取到的是最早的 N 筆，
+            # 集合超過 fetch_limit 之後永遠讀同一批舊資料（2026-09-26 修正）。
+            .sort("timestamp", pymongo.DESCENDING)
             .limit(fetch_limit)
         )
         experiences = list(cursor)
+        experiences.reverse()   # 還原成時間升序（MLP 不依賴順序，但維持函式對外承諾一致）
     except pymongo.errors.PyMongoError as exc:
         if log:
             log.warning("讀取訓練資料失敗: %s", exc)
         return []
 
     if log:
-        log.info("讀取到 %d 筆原始經驗（打散抽樣，MLP）", len(experiences))
+        log.info("讀取到 %d 筆原始經驗（最新 %d 筆內，打散抽樣，MLP）", len(experiences), fetch_limit)
     return experiences
 
 
@@ -103,7 +112,7 @@ def fetch_sequences(
     log: Optional[logging.Logger] = None,
 ) -> tuple[list[list[dict]], int]:
     """
-    MODEL_ARCH=gru 專用。從 MongoDB 讀取最近 fetch_limit 筆經驗（按時間升序），
+    MODEL_ARCH=gru 專用。從 MongoDB 讀取「最新」的 fetch_limit 筆經驗（回傳前還原成時間升序），
     切成一段一段時間上連續的「運行」（run），每段運行再切成長度 seq_len、
     彼此不重疊的定長序列。
 
@@ -123,10 +132,11 @@ def fetch_sequences(
                 {"reward": {"$exists": True}, "next_state_vec": {"$exists": True}},
                 projection=_PROJECTION,
             )
-            .sort("timestamp", pymongo.ASCENDING)
+            .sort("timestamp", pymongo.DESCENDING)   # 最新的 N 筆（舊版 ASCENDING 取到最早的 N 筆）
             .limit(fetch_limit)
         )
         experiences = list(cursor)
+        experiences.reverse()   # 還原成時間升序，下面依序判斷連續性
     except pymongo.errors.PyMongoError as exc:
         if log:
             log.warning("讀取訓練資料失敗: %s", exc)
@@ -233,6 +243,9 @@ def _run_training_round_mlp(
     result.update(test_metrics)
     result["n_train_exp"] = len(train_exp)
     result["n_test_exp"] = len(test_exp)
+    # 可更新 Actor 的壅塞樣本數：FL 客戶端拿它當 FedAvg 權重（見 client_app.py）
+    with (lock if lock is not None else contextlib.nullcontext()):
+        result["n_contended_train"] = agent.count_contended(train_exp)
     return result
 
 

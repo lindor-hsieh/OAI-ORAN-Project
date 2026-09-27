@@ -78,11 +78,13 @@ W_THROUGHPUT: float = 1.0
 W_FAIRNESS:   float = 0.0
 W_DELAY:      float = 0.0
 
-# delta_tbs 正規化參考值 (bytes/100ms)
-# C xApp rate limiter 每 10 個 MAC callback 才送一次 ZMQ，測量窗口為 100ms。
-# 實測 106 PRB 高負載下 delta_tbs 可達 1~2.5M bytes/100ms（80~200 Mbps），
-# 設為 2,000,000 確保 r_throughput 在實際範圍內有完整梯度，不被截斷。
-MAX_BSR: float = 2_000_000.0
+# delta_tbs 正規化參考值 (bytes/「一個控制視窗」，牆鐘)。**視窗是 1 秒，不是 100ms**：xApp 向 E2 訂閱的 MAC 回報週期是
+# 100ms（xapp_nodeN.c 的 "100_ms"），Rate Limiter 每 10 次回報才向 Python 查詢一次 → 每筆狀態的 delta_tbs 累積 ~1 秒
+# （實測 MongoDB 文件間隔 1.00 秒）。S=0.4 下單 UE 峰值約 40 模擬 Mbps ≈ 16 牆鐘 Mbps ≈ 2,000,000 bytes/視窗；一般 UE
+# （2~10 模擬 Mbps）約 100k~500k。2026-09-26 一度誤以為視窗是 100ms 而改成 250,000，結果 r_throughput 的 p90 就頂到 1.0
+# （高負載時獎勵被夾死、失去鑑別力），已改回 2,000,000。可用環境變數 REWARD_MAX_BSR 覆寫；若改 S（速度調節器）或
+# 控制週期，這個值要同步調整。
+MAX_BSR: float = float(os.getenv("REWARD_MAX_BSR", "2000000"))
 
 
 # =============================================================================

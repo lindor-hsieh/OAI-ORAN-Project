@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -43,7 +44,7 @@ import zmq
 
 from drl_agent import DRLAgent, MAX_UE_COUNT
 from reward_calculator import REWARD_MODE, compute_lagrangian_reward, compute_reward_breakdown
-from training_pipeline import run_training_round
+from training_pipeline import TRAIN_FETCH_LIMIT, run_training_round
 
 # =============================================================================
 # 全域常數
@@ -55,7 +56,8 @@ ZMQ_POLL_MS: int = 100              # ZMQ poller 超時，允許優雅退出
 MONGO_FLUSH_INTERVAL: float = 1.0   # 批次寫入 MongoDB 的間隔（秒）
 INFERENCE_WARN_MS: float = 4.0      # 推論延遲警告閾值（ms）
 TRAIN_INTERVAL_S: float = 60.0      # DRL 背景訓練間隔（秒）
-TRAIN_FETCH_LIMIT: int = 2000       # 每次從 MongoDB 讀取的最多筆數
+# 2026-09-27：DRL_TRAIN_ENABLED=0 → 不啟動背景訓練（凍結模型做量測；FL 服務也不要帶起）。預設 1。
+TRAIN_ENABLED: bool = os.getenv("DRL_TRAIN_ENABLED", "1").strip() not in ("0", "false", "False")
 TRAIN_EPOCHS_PER_ROUND: int = 10    # 每輪訓練的梯度更新次數
 EXPLORE_PROB: float = 0.30          # 啟發式階段 Dirichlet 隨機探索的比例
 RELOAD_POLL_INTERVAL_S: float = 30.0  # 檢查磁碟 checkpoint 是否被 FL ClientApp 更新的輪詢間隔
@@ -70,7 +72,7 @@ RELOAD_POLL_INTERVAL_S: float = 30.0  # 檢查磁碟 checkpoint 是否被 FL Cli
 # 搭配崩潰後完全不相關的一組新 UE 計算 reward，reward_calculator.py 的
 # alloc_map.get(rnti, 1) 找不到匹配的舊 RNTI 時會悄悄假設 PRB=1，產生一筆嫁接
 # 兩個不相關時間點的假經驗，混進訓練資料。
-STALE_PREV_UES_THRESHOLD_S: float = 2.0
+STALE_PREV_UES_THRESHOLD_S: float = 5.0   # 控制週期是 ~1 秒（不是 100ms），2.0 只有 2 倍餘裕、會誤丟偶發的 >2 秒間隔；改 5.0
 
 
 # =============================================================================
@@ -140,6 +142,8 @@ class InferenceServer:
         # 遠超 ZMQ 的 5ms 回應預算（詳見 training_pipeline.py 的說明）。
         self._model_lock = threading.Lock()
         self._last_ckpt_mtime: float = 0.0
+        self._prev_behavior_logp: Optional[float] = None   # 上一步動作的行為策略 logπ（DRL 推論才有）
+        self._bh_ratio: float = 1.0   # 最近一次 E2 回報的可用 PRB 比例，見 run() 的 payload 解析
 
         # RL 狀態轉移暫存（用於計算 R(S_{t-1}, A_{t-1}, S_t)）
         self._prev_ues: Optional[list[dict]] = None
@@ -299,8 +303,12 @@ class InferenceServer:
         只讀取含有完整 RL 欄位（reward, next_state_vec）的文件，
         跳過早期只有 state/action 的 Phase 3 文件。
         """
-        # 等待一個完整訓練間隔後才開始，讓系統先累積足夠經驗
-        time.sleep(TRAIN_INTERVAL_S)
+        # 等待一個完整訓練間隔後才開始，讓系統先累積足夠經驗。再依 node_id 錯開（12 個節點均分一個間隔，
+        # 每個節點差 ~5 秒），避免 12 個 process 同一秒開始訓練、搶同一組 4 個核心而拉長推論延遲。
+        if not TRAIN_ENABLED:
+            self._log.info("DRL_TRAIN_ENABLED=0：背景訓練停用（模型凍結，只做推論）")
+            return
+        time.sleep(TRAIN_INTERVAL_S + ((self.node_id - 1) % 12) * (TRAIN_INTERVAL_S / 12.0))
 
         while self._running:
             try:
@@ -317,6 +325,10 @@ class InferenceServer:
 
         # 先強制寫入緩衝區，確保最新資料可被讀到
         self._flush_to_mongo()
+
+        # 訓練前先套用 FL 可能剛寫入的聚合權重（不等 _reload_worker 的 30 秒輪詢），
+        # 讓這一輪的微調從最新的全域權重出發，而不是從過期的記憶體權重出發。
+        self._maybe_reload_checkpoint()
 
         # 若 MongoDB 筆數與上一輪相同（ZMQ 停擺，無新資料），跳過訓練
         # 防止在 stale 資料上反覆訓練導致 entropy collapse
@@ -342,9 +354,7 @@ class InferenceServer:
         if not metrics:
             return
 
-        with self._model_lock:
-            self._agent.save()
-        self._touch_ckpt_mtime()
+        self._save_unless_superseded()
 
         # overfitting 指標：test_actor_loss 比 train_actor_loss 高超過 0.3 時警告
         t_aloss = metrics.get("test_actor_loss", 0.0)
@@ -401,6 +411,36 @@ class InferenceServer:
         while self._running:
             time.sleep(RELOAD_POLL_INTERVAL_S)
             self._maybe_reload_checkpoint()
+
+    def _save_unless_superseded(self) -> bool:
+        """
+        存檔前先確認磁碟 checkpoint 沒有被外部（FL 伺服器／ClientApp）更新過。
+
+        修正寫入競態（2026-09-26）：舊版每輪訓練後無條件把記憶體權重存回檔案，而 FL 寫入聚合權重後
+        要等 _reload_worker（30 秒輪詢）才會被載入；若本地訓練（每 60 秒一次）剛好在這個空窗存檔，
+        FL 的全域權重就被過期的記憶體權重覆蓋，而且 mtime 被刷新後 reload 永遠不會再載入——聚合
+        效果被悄悄吃掉。現在存檔與檢查在同一個鎖內：磁碟檔比我們最後一次存/載的 mtime 新，代表
+        FL 已更新，改成「採用磁碟上的 FL 權重、放棄覆寫」；否則才存檔。
+
+        Returns: True=已存檔；False=偵測到外部更新、改為載入磁碟權重（本輪本地訓練結果被 FL 權重取代）。
+        """
+        with self._model_lock:
+            try:
+                disk_mtime = self._ckpt_path().stat().st_mtime
+            except FileNotFoundError:
+                disk_mtime = 0.0
+            if disk_mtime > self._last_ckpt_mtime:
+                old_mtime = self._last_ckpt_mtime
+                if self._agent.load():
+                    self._last_ckpt_mtime = disk_mtime
+                self._log.warning(
+                    "存檔前偵測到磁碟 checkpoint 已被外部（FL）更新 (mtime=%.0f > %.0f)，"
+                    "改為載入 FL 權重、不覆寫", disk_mtime, old_mtime,
+                )
+                return False
+            self._agent.save()
+        self._touch_ckpt_mtime()
+        return True
 
     def _maybe_reload_checkpoint(self) -> None:
         try:
@@ -483,9 +523,9 @@ class InferenceServer:
 
         return allocations, action_ratios
 
-    def _infer(self, ues: list[dict]) -> tuple[list[dict], np.ndarray]:
+    def _infer(self, ues: list[dict]) -> tuple[list[dict], np.ndarray, Optional[float]]:
         """
-        執行推論並回傳 (allocations, action_ratios)。
+        執行推論並回傳 (allocations, action_ratios, behavior_logp)。behavior_logp 只有 DRL 推論才有（啟發式為 None）。
 
         策略：
           - DRL 訓練完成 → 使用 DRL Actor Network
@@ -497,9 +537,10 @@ class InferenceServer:
             try:
                 fairness_bias = self._current_fairness_bias()
                 with self._model_lock:
-                    allocations, action_ratios = self._agent.infer(ues, fairness_bias=fairness_bias)
+                    allocations, action_ratios, behavior_logp = self._agent.infer(
+                        ues, fairness_bias=fairness_bias, bh_ratio=self._bh_ratio)
                 self._drl_inferences += 1
-                return allocations, action_ratios
+                return allocations, action_ratios, behavior_logp
             except Exception as exc:
                 self._log.warning("DRL 推論失敗: %s，退回啟發式", exc)
 
@@ -507,7 +548,7 @@ class InferenceServer:
         explore = (not use_drl) and (np.random.rand() < EXPLORE_PROB)
         allocations, action_ratios = self._infer_heuristic(ues, explore=explore)
         self._heuristic_inferences += 1
-        return allocations, action_ratios
+        return allocations, action_ratios, None
 
     def _build_rl_experience(
         self,
@@ -517,6 +558,7 @@ class InferenceServer:
         prev_mask_vec: np.ndarray,
         prev_action_ratios: np.ndarray,
         curr_ues: list[dict],
+        prev_behavior_logp: Optional[float] = None,
     ) -> dict[str, Any]:
         """
         建構一筆完整的 RL 經驗文件 (S, A, R, S')。
@@ -547,7 +589,7 @@ class InferenceServer:
 
         # 編碼當前狀態 S_t（作為 S' ）
         next_state_vec, next_mask_vec = self._agent.encode_state(
-            curr_ues, fairness_bias=self._current_fairness_bias()
+            curr_ues, fairness_bias=self._current_fairness_bias(), bh_ratio=self._bh_ratio
         )
 
         doc: dict[str, Any] = {
@@ -582,6 +624,9 @@ class InferenceServer:
         # 預設值進去，只在 result 裡真的有這個 key 時才寫入文件。
         if "lambda_applied" in result:
             doc["lambda_applied"] = result["lambda_applied"]
+        # 行為策略 log π(a|s)：只有 DRL 推論產生的動作才有（啟發式階段沒有 → 不寫，訓練時該筆只用於 Critic）
+        if prev_behavior_logp is not None:
+            doc["behavior_logp"] = float(prev_behavior_logp)
         return doc
 
     # -------------------------------------------------------------------------
@@ -655,6 +700,12 @@ class InferenceServer:
                 try:
                     payload: dict[str, Any] = json.loads(raw)
                     ues: list[dict[str, Any]] = payload.get("ues", [])
+                    # Backhaul-aware 可用 PRB 比例（E2 回報，xApp 帶入 JSON 的 bh_ratio）；缺欄位/非法值→1.0（池子全開）
+                    try:
+                        bh = float(payload.get("bh_ratio", 1.0))
+                        self._bh_ratio = min(1.0, max(0.0, bh)) if bh == bh else 1.0   # bh==bh 排除 NaN
+                    except (TypeError, ValueError):
+                        self._bh_ratio = 1.0
 
                     # ── 狀態 debug log（每 500 次）────────────────────────
                     if self._total_inferences % 500 == 0 and ues:
@@ -662,7 +713,7 @@ class InferenceServer:
                             f"rnti={u.get('rnti',0)} delta_tbs={u.get('bsr',0)} mcs={u.get('wb_cqi',0)}"
                             for u in ues
                         )
-                        self._log.info("STATE[%d] %s", self._total_inferences, ue_summary)
+                        self._log.info("STATE[%d] bh_ratio=%.3f %s", self._total_inferences, self._bh_ratio, ue_summary)
 
                     # ── 計算上一步的獎勵並寫入 MongoDB ────────────────────
                     # 閒置轉換（delta_tbs 全為 0，例如 P_IDLE 造成的無流量
@@ -702,11 +753,12 @@ class InferenceServer:
                             prev_mask_vec=self._prev_mask_vec,
                             prev_action_ratios=self._prev_action_ratios,
                             curr_ues=ues,
+                            prev_behavior_logp=self._prev_behavior_logp,
                         )
                         self._queue_experience(exp_doc)
 
                     # ── 執行推論 ──────────────────────────────────────────
-                    allocations, action_ratios = self._infer(ues)
+                    allocations, action_ratios, behavior_logp = self._infer(ues)
                     self._total_inferences += 1
 
                     # ── 暫存本步狀態（下一步計算獎勵用）─────────────────
@@ -715,10 +767,11 @@ class InferenceServer:
                         self._prev_allocations = allocations
                         self._prev_state_vec, self._prev_mask_vec = (
                             self._agent.encode_state(
-                                ues, fairness_bias=self._current_fairness_bias()
+                                ues, fairness_bias=self._current_fairness_bias(), bh_ratio=self._bh_ratio
                             )
                         )
                         self._prev_action_ratios = action_ratios
+                        self._prev_behavior_logp = behavior_logp
                         self._prev_ts = t_recv
                     else:
                         # 無活躍 UE 時清除暫存，避免跨不同 UE 組合計算獎勵。

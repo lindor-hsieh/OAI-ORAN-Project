@@ -666,6 +666,45 @@ def scenario_t_tiered(
     return configs
 
 
+# ── Scenario TR（隨機化的兩狀態 T，訓練專用，2026-09-26）──────────────────────────────
+# 與量測基準用的固定 Scenario T 結構、量級完全相同（同樣的正常/壅塞兩組流量與通道檔位、同樣的 45% 時間壅塞），
+# 但**壅塞相位的排列與每個 UE 的（流量×通道）組合都由 seed 隨機打散**，訓練資料因此跟測試場景不同分佈
+# （驅動器的原則：訓練場景不可等於測試場景）。跨主機一致性：全部隨機值只由 (seed, phase_index) 導出，
+# PC2/PC3 各自算出相同結果，不需要通訊。
+T_RANDOM_CONGESTED_P: float = 5.0 / 11.0     # 每個相位為壅塞相位的機率（期望 45.5% 的時間壅塞，同 T）
+T_RANDOM_NUM_UES: int = 17                   # 全系統 UE 數（global_id 1~17）
+
+
+def t_random_phase_congested(seed: int, phase_index: int) -> bool:
+    """Scenario TR：這個相位是否為壅塞相位（由 (seed, phase_index) 決定，兩台主機一致）。"""
+    return _rng_for(seed, -1, phase_index).random() < T_RANDOM_CONGESTED_P
+
+
+def scenario_t_random(
+    ues: list[UEConfig], seed: int, phase_index: int, protocol: str = "tcp"
+) -> list[tuple[float, float, str]]:
+    """
+    場景 TR：隨機化的兩狀態 T（訓練用）。狀態（正常/壅塞）隨機，檔位表與 Scenario T 相同。
+
+    每個相位把 9 種（流量×通道）組合各重複到 18 份、依 (seed, phase_index) 洗牌，再依 UE 的 global_id 分配
+    （17 個 UE 各拿一份）：組合分佈與 T 一樣均衡（不會因為獨立抽樣而偶爾全部 UE 同時抽到高流量、壓垮平台的 CPU
+    上限），但誰拿哪個組合每個相位都不同。
+    """
+    congested = t_random_phase_congested(seed, phase_index)
+    traffic_tiers = CONGESTED_TRAFFIC_TIERS if congested else NORMAL_TRAFFIC_TIERS
+    ploss_tiers = CONGESTED_PLOSS_TIERS if congested else NORMAL_PLOSS_TIERS
+    n_combos = len(TIER_COMBOS)
+    perm = [k % n_combos for k in range(T_RANDOM_NUM_UES + 1)]
+    _rng_for(seed, -2, phase_index).shuffle(perm)
+    log.info("Scenario TR 相位狀態：%s（seed=%d phase_index=%d）",
+             "壅塞" if congested else "正常", seed, phase_index)
+    configs: list[tuple[float, float, str]] = []
+    for ue in ues:
+        traffic_name, ploss_name = TIER_COMBOS[perm[(ue.global_id - 1) % len(perm)]]
+        configs.append((ploss_tiers[ploss_name], traffic_tiers[traffic_name], protocol))
+    return configs
+
+
 def _rng_for(seed: int, global_id: int, phase_index: int) -> random.Random:
     """
     決定式導出 (seed, global_id, phase_index) 專屬的 RNG 實例。
@@ -1165,11 +1204,12 @@ def parse_args() -> argparse.Namespace:
              "未指定時嘗試從 hostname 猜測，猜不出來則控制全部 17 個 UE（單機測試用）。",
     )
     parser.add_argument(
-        "--scenario", choices=["A", "B", "C", "D", "R", "T"], default="R",
+        "--scenario", choices=["A", "B", "C", "D", "R", "T", "TR"], default="R",
         help="場景選擇：A=CQI差異, B=流量不均, C=最差公平性, D=均勻隨機（已被R取代）, "
              "R=真實隨機（預設，area-uniform path_loss + 持久化 profile + 協定混合）, "
              "T=分層交叉（低/中/高流量 × 低/中/高路徑損耗 3x3，2026-09-18 新增，"
-             "見 scenario_t_tiered() 說明）",
+             "見 scenario_t_tiered() 說明）, "
+             "TR=隨機化的兩狀態 T（訓練專用：同 T 的檔位與 45%% 壅塞比例，但相位排列與每 UE 組合由 --seed 隨機打散）",
     )
     parser.add_argument(
         "--duration", type=int, default=1800,
@@ -1254,7 +1294,7 @@ def main() -> None:
         wait_for_ue_interfaces(ues)
 
     finite = args.scenario in ("A", "B", "C") or (
-        args.scenario in ("T", "R") and args.num_phases is not None)
+        args.scenario in ("T", "TR", "R") and args.num_phases is not None)
     on_crash = args.on_crash or ("abort" if finite else "warn")
     guard = CrashGuard(abort=(on_crash == "abort"))
     guard.arm()
@@ -1281,6 +1321,22 @@ def _run_selected(args: argparse.Namespace, ues: list[UEConfig],
             scenario_label="T",
             max_phases=args.num_phases,
             epoch=(args.phase_origin if args.phase_origin else FIXED_EPOCH),
+            guard=guard,
+            grid_align=bool(args.phase_origin),
+        )
+    elif args.scenario == "TR":
+        import secrets
+        seed = args.seed if args.seed is not None else secrets.randbits(32)
+        t_protocol = args.protocol or "tcp"
+        log.info("Scenario TR seed=%d protocol=%s（兩台主機必須用同一個 --seed；建議同時給 --phase-origin）", seed, t_protocol)
+        run_dynamic_scenario(
+            ues, ctrls,
+            phase_duration=args.phase_duration,
+            phase_fn=lambda u, phase_index: scenario_t_random(u, seed, phase_index, protocol=t_protocol),
+            raw_path_loss=True,
+            scenario_label="TR",
+            max_phases=args.num_phases,
+            epoch=(args.phase_origin if args.phase_origin else 1700000000.0),
             guard=guard,
             grid_align=bool(args.phase_origin),
         )

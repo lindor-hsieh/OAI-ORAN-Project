@@ -91,7 +91,8 @@ CRITICAL_CONTAINERS=(rfsim5g-donor-cu rfsim5g-donor-du flexric)
 # PC3 Node9~12 案例）。修法很單純（重啟該 DU 容器即可，5~10 秒恢復），不需要
 # 驚動三主機完整重啟，獨立於 detect_crash_signal()/full_recovery() 之外，
 # 每個主迴圈週期都輕量檢查一次。
-declare -A DU_HOST=( [1]=pc2 [2]=pc1 [3]=pc2 [4]=pc2 [5]=pc2 [6]=pc2 [7]=pc1 [8]=pc1 [9]=pc3 [10]=pc3 [11]=pc3 [12]=pc3 )
+# 2026-09-22 拓樸：relay Node1~4 全在 PC1、access Node5~8 在 PC2、Node9~12 在 PC3
+declare -A DU_HOST=( [1]=pc1 [2]=pc1 [3]=pc1 [4]=pc1 [5]=pc2 [6]=pc2 [7]=pc2 [8]=pc2 [9]=pc3 [10]=pc3 [11]=pc3 [12]=pc3 )
 declare -A RA_HEAL_LAST_TS
 RA_HEAL_COOLDOWN_S=300
 
@@ -147,8 +148,134 @@ for c in "${CRITICAL_CONTAINERS[@]}"; do
 done
 log "初始 RestartCount 基準：$(for c in "${CRITICAL_CONTAINERS[@]}"; do echo -n "$c=${BASELINE_RESTARTS[$c]} "; done)"
 
+# [2026-09-26] RAN 容器（UE／MT／DU，PC1 的 relay + PC2/PC3 的 access 與 UE）崩潰重啟偵測：曾發生 nr-uesoftmodem 在
+# init_RA segfault → docker 自動重啟 → UE IP 改變、舊 F1-U 位址失效 → GTP-U 封包迴圈、整台主機掉包，而
+# CU/DU/FlexRIC 的 RestartCount 完全不變，原本的偵測抓不到。這裡加總三台主機所有 RAN 容器的 RestartCount。
+ran_restart_total() {
+    local total=0 h n
+    n=$(docker ps -a --format '{{.Names}}' | grep -E '^rfsim5g-(iab-mt|iab-du)-' | xargs -r docker inspect --format '{{.RestartCount}}' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+    total=$((total + ${n:-0}))
+    for h in pc2 pc3; do
+        n=$(ssh -o ConnectTimeout=5 "$h" 'names=$(docker ps -a --format "{{.Names}}" | grep -E "^rfsim5g-(iab-mt|iab-du)-"); [ -n "$names" ] && docker inspect --format "{{.RestartCount}}" $names | awk "{s+=\$1} END{print s+0}" || echo 0' 2>/dev/null)
+        total=$((total + ${n:-0}))
+    done
+    echo "$total"
+}
+BASELINE_RAN_RESTARTS=$(ran_restart_total)
+log "RAN 基礎設施容器（MT/DU，不含終端 UE）RestartCount 基準總和：$BASELINE_RAN_RESTARTS"
 LAST_RECOVERY_TS=0
 CRASH_COUNT=0
+
+# 偵測用「RestartCount/StartedAt」組合當指紋：實測 UE12 崩潰重啟後 RestartCount 仍是 0（只看次數會漏掉），StartedAt 一定會變。
+# [2026-09-26] 終端 UE 容器崩潰改為「就地修復」，不做整套重啟（使用者決定）。
+# 現場：UE 常因 OAI UE 端 assertion（RRCReject 後 "RA trigger not implemented"、MAC PDU 長度異常）退出，
+# docker 自動重啟後 tunnel 預設路由消失、資料面不通；整套重啟一次約 10 分鐘，UE 崩潰約每 10 分鐘一次會讓訓練被切碎。
+# MT/DU/CU/FlexRIC 崩潰仍走完整重啟（下面 detect_crash_signal 只算 MT/DU）。
+# 就地修復失敗（一顆 UE 8 次嘗試仍不通、或修完後同主機 ≥3 個其他 UE 也不通＝系統性劣化）才升級為完整重啟。
+EXT_DN_IP="192.168.72.135"
+UE_HEAL_FAIL_DETAIL=""
+declare -A UE_BASELINE
+
+ue_restart_counts() {
+    local h
+    for h in pc2 pc3; do
+        ssh -o ConnectTimeout=5 "$h" 'for c in $(docker ps -a --format "{{.Names}}" | grep -E "^rfsim5g-end-ue-[0-9]+$"); do echo "${c##*-} $(docker inspect --format "{{.RestartCount}}/{{.State.StartedAt}}" $c)"; done' 2>/dev/null
+    done
+}
+
+reset_ue_baseline() {
+    UE_BASELINE=()
+    local u n
+    while read -r u n; do
+        [[ -n "$u" && -n "$n" ]] && UE_BASELINE[$u]=$n
+    done < <(ue_restart_counts)
+}
+reset_ue_baseline
+log "UE 容器 RestartCount 基準：$(for u in $(seq 1 17); do echo -n "UE$u=${UE_BASELINE[$u]:-?} "; done)"
+
+ue_host() { if [[ $1 -gt 8 ]]; then echo pc3; else echo pc2; fi; }
+
+heal_one_ue() {
+    local u="$1" host c attempt bind_ip n
+    host=$(ue_host "$u"); c="rfsim5g-end-ue-$u"
+    for attempt in 1 2 3 4 5 6 7 8; do
+        sleep 15
+        # 第 5 次仍不通：手動重啟該 UE 容器一次
+        if [[ $attempt -eq 5 ]]; then
+            warn "UE${u} 第 4 次修復仍不通，重啟該 UE 容器一次..."
+            ssh "$host" "docker restart $c" >/dev/null 2>&1
+            sleep 30
+        fi
+        # tunnel 介面還沒建立（UE 還在接入）就再等
+        ssh "$host" "docker exec $c ip link show oaitun_ue1" >/dev/null 2>&1 || continue
+        if [[ $u -eq 17 ]]; then
+            bind_ip=$(grep -oP '(?<=local_n_address = ")[0-9.]+' "$COMPOSE_DIR/conf/iab_du_node4.conf" 2>/dev/null)
+            [[ -n "$bind_ip" ]] && docker exec -u 0 rfsim5g-iab-mt-4 ip addr add "${bind_ip}/32" dev oaitun_ue1 2>/dev/null
+        fi
+        ssh "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
+        if ssh "$host" "docker exec $c ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss"; then
+            # UE 崩潰時 ext-dn 上該 UE 的 iperf3 server（-s -1）常卡在「舊連線還在」狀態，新 client 會 rc=1
+            # "server is busy running a test"、該 UE 沒流量。只殺 iperf3 行程本體（^ 錨定，不會比對到外層
+            # while-loop 的 sh -c；殺到 loop 就不會自動重啟了），loop 1 秒後自動拉起乾淨的新 server。
+            docker exec rfsim5g-oai-ext-dn pkill -f "^iperf3 -s -1 -p $((5200 + u)) " 2>/dev/null
+            n=$(ssh "$host" "docker inspect --format '{{.RestartCount}}/{{.State.StartedAt}}' $c" 2>/dev/null)
+            [[ -n "$n" ]] && UE_BASELINE[$u]=$n
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 回傳 0＝沒事或全部修好；1＝修不好（UE_HEAL_FAIL_DETAIL 說明），由主迴圈升級為完整重啟
+heal_restarted_ues() {
+    local changed="" u n
+    while read -r u n; do
+        [[ -z "$u" || -z "$n" ]] && continue
+        if [[ -z "${UE_BASELINE[$u]:-}" ]]; then UE_BASELINE[$u]=$n; continue; fi
+        [[ "$n" != "${UE_BASELINE[$u]}" ]] && changed="$changed $u"
+    done < <(ue_restart_counts)
+    [[ -z "$changed" ]] && return 0
+
+    warn "偵測到 UE 容器重啟：${changed} —— 就地修復（重新斷言預設路由＋驗證連通），不做整套重啟"
+    UE_HEAL_FAIL_DETAIL=""
+    for u in $changed; do
+        if heal_one_ue "$u"; then
+            ok "UE${u} 就地修復完成（ping ext-dn 0% 遺失）"
+        else
+            err "UE${u} 8 次嘗試仍無法修復"
+            UE_HEAL_FAIL_DETAIL="$UE_HEAL_FAIL_DETAIL UE${u}"
+        fi
+    done
+    [[ -n "$UE_HEAL_FAIL_DETAIL" ]] && return 1
+
+    # 修完後檢查同主機其他 UE：舊 UE 重啟後留下失效 F1-U 位址會讓整台主機掉包（見 HISTORY 2026-09-26 續八），
+    # ≥3 個 UE 同時不通視為系統性劣化 → 升級為完整重啟
+    local hosts="" h bad
+    for u in $changed; do hosts="$hosts $(ue_host "$u")"; done
+    for h in $(echo $hosts | tr ' ' '\n' | sort -u); do
+        local lo=1 hi=8; [[ "$h" == "pc3" ]] && { lo=9; hi=17; }
+        bad=""
+        for v in $(seq $lo $hi); do
+            ssh "$h" "docker exec rfsim5g-end-ue-$v ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss" || bad="$bad $v"
+        done
+        if [[ -n "$bad" ]]; then
+            sleep 10
+            local bad2=""
+            for v in $bad; do
+                ssh "$h" "docker exec rfsim5g-end-ue-$v ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss" || bad2="$bad2 $v"
+            done
+            bad="$bad2"
+        fi
+        if [[ $(echo $bad | wc -w) -ge 3 ]]; then
+            err "$h 上修復後仍有 ≥3 個 UE 不通（UE:${bad}），判定為系統性劣化"
+            UE_HEAL_FAIL_DETAIL="$UE_HEAL_FAIL_DETAIL ${h}_multi_ue_down(${bad})"
+            return 1
+        elif [[ -n "$bad" ]]; then
+            warn "$h 上有 UE 暫時不通（UE:${bad}），少於 3 個，不升級（下一輪由 watchdog 視需要處理）"
+        fi
+    done
+    return 0
+}
 
 detect_crash_signal() {
     # 訊號 1：FlexRIC log 出現 pending event timeout
@@ -176,11 +303,17 @@ detect_crash_signal() {
             return 0
         fi
     done
+    local ran_now
+    ran_now=$(ran_restart_total)
+    if [[ "$ran_now" != "$BASELINE_RAN_RESTARTS" ]]; then
+        echo "ran_container_restarted(${BASELINE_RAN_RESTARTS}->${ran_now})"
+        return 0
+    fi
     return 1
 }
 
 stop_scenario_driver() {
-    log "停止三主機的 training_scenario_driver.sh..."
+    log "停止 PC2/PC3（及 PC1 殘留）的 training_scenario_driver.sh..."
     pkill -f training_scenario_driver.sh 2>/dev/null
     ssh pc2 "pkill -f training_scenario_driver.sh" 2>/dev/null
     ssh pc3 "pkill -f training_scenario_driver.sh" 2>/dev/null
@@ -188,36 +321,24 @@ stop_scenario_driver() {
 }
 
 start_scenario_driver() {
-    log "重新啟動三主機的 training_scenario_driver.sh（epoch=$EPOCH，自動接續到 wall clock 當下位置）..."
-    nohup bash "$COMPOSE_DIR/iab/training_scenario_driver.sh" --host pc1 --epoch "$EPOCH" ${PROTOCOL_ARG:+--protocol "$PROTOCOL_ARG"} \
-        > /tmp/driver_stage_pc1.log 2>&1 < /dev/null &
-    disown
-    # 2026-09-18 現場踩過的坑：`ssh host "cmd &"` 這個寫法不可靠——遠端 shell
-    # 把指令丟進背景後，SSH session 有時會在背景行程真的 fork 完成前就先關閉，
-    # 導致遠端行程從未真正啟動（第一次上線時 PC3 的驅動器就是這樣悄悄沒起來，
-    # 直到下次健康檢查才發現）。改用 `ssh -f`（ssh 自己先 fork 到背景、確認
-    # session 建立後才把控制權交還本地端，不依賴遠端 shell 的 `&` 語意）。
+    # 只在 PC2/PC3 啟動（PC1 沒有任何 UE 容器，2026-09-22 起；在 PC1 啟動場景行程會立刻因「沒有 UE」退出、驅動器空轉）
+    log "重新啟動 PC2/PC3 的 training_scenario_driver.sh（epoch=$EPOCH，自動接續到 wall clock 當下位置）..."
+    # 2026-09-18 現場踩過的坑：`ssh host "cmd &"` 不可靠（SSH session 可能在背景行程 fork 完成前就關閉）；
+    # 改用 `ssh -f`。
     ssh -f pc2 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc2 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_pc2.log 2>&1 < /dev/null" 2>/dev/null
     ssh -f pc3 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc3 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_pc3.log 2>&1 < /dev/null" 2>/dev/null
     sleep 3
     local missing=""
-    pgrep -f "training_scenario_driver.sh --host pc1" >/dev/null || missing="$missing pc1"
     ssh pc2 "pgrep -f training_scenario_driver.sh" >/dev/null 2>&1 || missing="$missing pc2"
     ssh pc3 "pgrep -f training_scenario_driver.sh" >/dev/null 2>&1 || missing="$missing pc3"
     if [[ -n "$missing" ]]; then
         err "場景驅動器沒有在這些主機上起來：$missing —— 重試一次"
         for h in $missing; do
-            if [[ "$h" == "pc1" ]]; then
-                nohup bash "$COMPOSE_DIR/iab/training_scenario_driver.sh" --host pc1 --epoch "$EPOCH" ${PROTOCOL_ARG:+--protocol "$PROTOCOL_ARG"} \
-                    > /tmp/driver_stage_pc1.log 2>&1 < /dev/null &
-                disown
-            else
-                ssh -f "$h" "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host $h --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_${h}.log 2>&1 < /dev/null" 2>/dev/null
-            fi
+            ssh -f "$h" "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host $h --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_${h}.log 2>&1 < /dev/null" 2>/dev/null
         done
         sleep 3
     fi
-    ok "場景驅動器已在三主機重新啟動"
+    ok "場景驅動器已在 PC2/PC3 重新啟動"
 }
 
 full_recovery() {
@@ -226,6 +347,15 @@ full_recovery() {
     log "===== 開始完整系統重啟（記錄於 $ts_dir） ====="
 
     stop_scenario_driver
+
+    # [2026-09-26] 每次整套重啟前先清理環境並驗證乾淨（使用者規則）：殘留容器／遺留 iperf3／舊場景行程都清掉。
+    # CLEAN_ENV_KEEP_WATCHDOG=1：不殺 watchdog 自己。docker volume（MongoDB 經驗、模型 checkpoint）不動。
+    log "[0/4] 清理環境（iab/clean_env.sh，重啟前先清乾淨）..."
+    if ! CLEAN_ENV_KEEP_WATCHDOG=1 bash iab/clean_env.sh > "$ts_dir/clean_env.log" 2>&1; then
+        err "環境清理後仍有殘留，不在不乾淨的環境上重啟，見 $ts_dir/clean_env.log"
+        return 1
+    fi
+    ok "環境已清乾淨"
 
     # [2026-09-19 新增] DEGRADED 累計「軟性」失敗（UE heal 重試 5 次仍有連不通、
     # E2 連線數不足 13），跟「腳本本身跑不完／SSH 不通」這種硬性失敗分開處理。
@@ -300,88 +430,55 @@ full_recovery() {
         warn "本次復原完成，但有降級項目：$DEGRADED_DETAIL——建議之後找時間人工複查這些主機/節點的連通性"
     fi
 
-    # 2026-09-18 現場踩過的坑（見 HISTORY.md 同日條目「訂正」）：PC1 本機
-    # Node7/8（UE5~8）的健康檢查只在 start_iab_server.sh 自己執行過程中跑
-    # 一次，時間點在整個依序流程的最前面；PC2/PC3 接下來要跑數分鐘，這段
-    # 期間如果 MT7/8 的 tunnel 自發性重建（已知現象），PC1 端完全沒有東西
-    # 會重新檢查或補上 DNAT，直到最後才被發現斷線。這裡在全部四步跑完後，
-    # 對 PC1 本機的 UE5~8 做最後一次獨立驗證＋必要時重新斷言 DNAT／路由，
-    # 補上這段時機缺口，不再只依賴 start_iab_server.sh 內部那次過早的檢查。
-    verify_and_fix_local_ue5to8() {
-        local ext_dn_ip="192.168.72.135"
-        for attempt in 1 2 3; do
-            local all_ok=true
-            for i in 5 6 7 8; do
-                docker exec "rfsim5g-end-ue-${i}" ping -c 1 -W 2 "$ext_dn_ip" >/dev/null 2>&1 || all_ok=false
+    # [2026-09-26 重寫] 舊版的「PC1 本機 UE5~8」與「PC2 的 UE17」驗證是 2026-09-22 拓樸搬遷前的位置，修復動作會做在
+    # 錯的主機上。改成對全部 17 個 UE 逐一驗證（UE1~8 在 PC2、UE9~17 在 PC3），失敗時依序：(1) 重新斷言預設路由
+    # （UE17 另補 DU4 F1-U 別名位址，MT4/DU4 在 PC1）；(2) 只重啟該 UE 容器再補路由（對付「附著後上行同步不良」，
+    # 2026-09-26 UE16 兩次出現，單獨重啟即恢復但預設路由會被清掉）。
+    verify_and_heal_all_ues() {
+        local ext_dn_ip="192.168.72.135" bad_final=""
+        for u in $(seq 1 17); do
+            local host=pc2; [[ $u -gt 8 ]] && host=pc3
+            local c="rfsim5g-end-ue-$u" good=0
+            for attempt in 1 2 3; do
+                if ssh "$host" "docker exec $c ping -c 2 -W 3 $ext_dn_ip" 2>/dev/null | grep -q " 0% packet loss"; then
+                    good=1; break
+                fi
+                if [[ $attempt -eq 1 ]]; then
+                    warn "UE${u} 第 1 次驗證失敗，重新斷言預設路由..."
+                    if [[ $u -eq 17 ]]; then
+                        local bind_ip
+                        bind_ip=$(grep -oP '(?<=local_n_address = ")[0-9.]+' "$COMPOSE_DIR/conf/iab_du_node4.conf" 2>/dev/null)
+                        [[ -n "$bind_ip" ]] && docker exec -u 0 rfsim5g-iab-mt-4 ip addr add "${bind_ip}/32" dev oaitun_ue1 2>/dev/null
+                    fi
+                    ssh "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
+                elif [[ $attempt -eq 2 ]]; then
+                    warn "UE${u} 第 2 次驗證仍失敗，重啟該 UE 容器並補預設路由..."
+                    ssh "$host" "docker restart $c" >/dev/null 2>&1
+                    sleep 45
+                    ssh "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
+                fi
+                sleep 8
             done
-            [[ "$all_ok" == true ]] && { ok "PC1 本機 UE5~8 最終驗證通過（第 ${attempt} 次）"; return 0; }
-
-            warn "PC1 本機 UE5~8 最終驗證第 ${attempt} 次發現異常，重新斷言 Node7/8 的 DNAT／路由..."
-            declare -A du_ip=( [7]="192.168.76.12" [8]="192.168.76.13" )
-            declare -A mt_name=( [7]="rfsim5g-iab-mt-7" [8]="rfsim5g-iab-mt-8" )
-            for n in 7 8; do
-                local mt_ip
-                mt_ip=$(docker exec "${mt_name[$n]}" ip -f inet addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-                [[ -z "$mt_ip" ]] && continue
-                docker exec -u 0 rfsim5g-donor-cu iptables -t nat -I OUTPUT 1 -d "${du_ip[$n]}" -p udp --dport 2152 -j DNAT --to-destination "$mt_ip"
-                docker exec -u 0 "${mt_name[$n]}" ip route del default 2>/dev/null
-                docker exec -u 0 "${mt_name[$n]}" ip route add default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
-            done
-            for i in 5 6 7 8; do
-                docker exec -u 0 "rfsim5g-end-ue-${i}" ip route replace default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
-            done
-            sleep 10
+            [[ $good -eq 1 ]] || bad_final="$bad_final UE$u"
         done
-        err "PC1 本機 UE5~8 最終驗證重試 3 次後仍有異常，需要人工檢查"
+        if [[ -z "$bad_final" ]]; then ok "17/17 UE 最終驗證通過"; return 0; fi
+        err "最終驗證仍失敗的 UE:$bad_final"
         return 1
     }
-    if ! verify_and_fix_local_ue5to8; then
-        # [2026-09-19 新增] 同上方理由：這只是 PC1 本機 UE5~8 的最後一道保險，
-        # 此時 xApp／E2 已經在 [4/4] 啟動過了，不應該因為這裡沒過就整個
-        # return 1（會連帶跳過下面「確認 Stage 2+ 服務」與重啟場景驅動器，
-        # 讓已經恢復的訓練迴圈又被晾著）。降級記錄、繼續往下走。
-        warn "PC1 本機 UE5~8 最終驗證未通過（軟性失敗，繼續往下走，訓練/FL 服務不受影響）"
-        DEGRADED=$((DEGRADED + 1)); DEGRADED_DETAIL="$DEGRADED_DETAIL pc1-ue5to8"
+    if ! verify_and_heal_all_ues; then
+        warn "部分 UE 最終驗證未通過（軟性失敗，繼續往下走，訓練/FL 服務不受影響）"
+        DEGRADED=$((DEGRADED + 1)); DEGRADED_DETAIL="$DEGRADED_DETAIL ue-verify"
     fi
 
-    # [2026-09-20 新增] UE17（直連 Node4 relay，機制跟 access 節點不同，見
-    # CLAUDE.md 第 1 節）不在 start_iab_pc2.sh 的 verify_and_heal_ues() 範圍內
-    # （該腳本自己的註解明講：「UE17 不在 verify_and_heal_ues() 的 ping 重試
-    # 範圍內」），現場觀察到連續 4 次 full_recovery() 之後 UE17 100% 會斷線，
-    # 原因有二，每次都復發：(1) DU4 的 F1-U 本地綁定位址（conf 檔
-    # local_n_address）在 DU4 啟動當下寫入，但 MT4 的 oaitun_ue1 tunnel IP
-    # 之後常會自發性重建换掉，DU4 綁定的舊位址就從介面上消失，需要在 MT4
-    # netns 補回一個該舊位址的別名（不需重啟 DU4 本身）；(2) UE17 自己的
-    # default route 在容器重建後有時會停留在 eth0（macvlan，只用來連
-    # rfsimulator RF 控制通道），沒有正確指向 oaitun_ue1（PDU session
-    # tunnel），需要重新斷言。兩者都在 PC2，透過 ssh 執行。
-    verify_and_fix_ue17() {
-        local ext_dn_ip="192.168.72.135"
-        for attempt in 1 2 3; do
-            if ssh pc2 "docker exec rfsim5g-end-ue-17 ping -c 1 -W 2 $ext_dn_ip" >/dev/null 2>&1; then
-                ok "UE17 最終驗證通過（第 ${attempt} 次）"
-                return 0
-            fi
-            warn "UE17 最終驗證第 ${attempt} 次發現異常，重新斷言 DU4 F1-U 別名位址／UE17 預設路由..."
-            local bind_ip
-            bind_ip=$(ssh pc2 "grep -oP '(?<=local_n_address = \")[0-9.]+' $COMPOSE_DIR/conf/iab_du_node4.conf" 2>/dev/null)
-            if [[ -n "$bind_ip" ]]; then
-                ssh pc2 "docker exec -u 0 rfsim5g-iab-mt-4 ip addr add ${bind_ip}/32 dev oaitun_ue1" 2>/dev/null
-            fi
-            ssh pc2 "docker exec -u 0 rfsim5g-end-ue-17 ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
-            sleep 10
-        done
-        err "UE17 最終驗證重試 3 次後仍有異常，需要人工檢查"
-        return 1
-    }
-    if ! verify_and_fix_ue17; then
-        warn "UE17 最終驗證未通過（軟性失敗，繼續往下走，訓練/FL 服務不受影響）"
-        DEGRADED=$((DEGRADED + 1)); DEGRADED_DETAIL="$DEGRADED_DETAIL ue17"
-    fi
+    # 17 個 iperf3 server（每次乾淨重啟後必須重建；這是先前 full_recovery() 的已知缺口，見 CLAUDE.md 第 6 節）
+    log "重建 ext-dn 的 17 個 iperf3 server（scenarios/setup_iperf_servers.sh）..."
+    bash scenarios/setup_iperf_servers.sh > "$ts_dir/iperf_servers.log" 2>&1 \
+        || { warn "setup_iperf_servers.sh 失敗（見 $ts_dir/iperf_servers.log）"; DEGRADED=$((DEGRADED + 1)); DEGRADED_DETAIL="$DEGRADED_DETAIL iperf-servers"; }
 
     log "確認 Stage 2+ 服務（inference-nodeN／global-xapp／flower-*）仍在跑..."
     $DC up -d inference-node{1..12} >> "$ts_dir/stage2_services.log" 2>&1
-    if $DC ps global-xapp 2>/dev/null | grep -q "global-xapp"; then
+    # clean_env.sh 會移除 FL 容器，所以不能再用「global-xapp 還在不在」判斷要不要帶起 FL 層；FL_MODE=none 才跳過。
+    if [[ "$FL_MODE_ARG" != "none" ]]; then
         # [2026-09-19 修復] 同 run_stage2_fl.sh 的同款修法：這裡原本沒帶
         # REWARD_MODE，只帶 FL_MODE/MODEL_ARCH，導致 flower-supernode-nodeN
         # 每次經過這裡都悄悄吃到 compose 檔預設值 lagrangian（現場實測發現：
@@ -420,6 +517,8 @@ full_recovery() {
     for c in "${CRITICAL_CONTAINERS[@]}"; do
         BASELINE_RESTARTS[$c]=$(restart_count "$c")
     done
+    BASELINE_RAN_RESTARTS=$(ran_restart_total)
+    reset_ue_baseline
     LAST_RECOVERY_TS=$(date +%s)
     CRASH_COUNT=$((CRASH_COUNT + 1))
     ok "===== 完整重啟成功（累計第 ${CRASH_COUNT} 次），基準已重設 ====="
@@ -437,18 +536,22 @@ while true; do
     # 獨立——每個週期都跑，發現就直接修，不需要二次確認也不影響冷卻窗判斷。
     check_and_heal_ra_all
 
-    signal=$(detect_crash_signal) || signal=""
-    if [[ -z "$signal" ]]; then
-        continue
-    fi
+    # 終端 UE 容器重啟：就地修復，不整套重啟；修不好才升級（跳過二次確認，修復本身已重試過）
+    if heal_restarted_ues; then
+        signal=$(detect_crash_signal) || signal=""
+        if [[ -z "$signal" ]]; then
+            continue
+        fi
+        warn "疑似崩潰訊號：$signal，等待 ${CRASH_CONFIRM_WAIT_S}s 二次確認..."
+        sleep "$CRASH_CONFIRM_WAIT_S"
 
-    warn "疑似崩潰訊號：$signal，等待 ${CRASH_CONFIRM_WAIT_S}s 二次確認..."
-    sleep "$CRASH_CONFIRM_WAIT_S"
-
-    signal2=$(detect_crash_signal) || signal2=""
-    if [[ -z "$signal2" ]]; then
-        log "二次確認未再觀察到崩潰訊號，判斷為瞬斷雜訊，繼續監控"
-        continue
+        signal2=$(detect_crash_signal) || signal2=""
+        if [[ -z "$signal2" ]]; then
+            log "二次確認未再觀察到崩潰訊號，判斷為瞬斷雜訊，繼續監控"
+            continue
+        fi
+    else
+        signal2="ue_heal_failed(${UE_HEAL_FAIL_DETAIL# })"
     fi
 
     now=$(date +%s)

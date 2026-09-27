@@ -13,11 +13,19 @@
 set -u
 
 CONTAINER_RE='^(rfsim5g-|xapp-node|inference-node|flower-|global-xapp|flexric|mongodb)'
-PROC_RE='[t]raffic_scenario.py|[m]easure_stage.py|[t]raining_scenario_driver|[t]raining_watchdog|[n]r-softmodem|[n]r-uesoftmodem|[i]perf3'
+# CLEAN_ENV_KEEP_WATCHDOG=1：由 training_watchdog.sh 的崩潰復原呼叫時，不能把 watchdog 自己殺掉
+KEEP_WD=${CLEAN_ENV_KEEP_WATCHDOG:-0}
+if [ "$KEEP_WD" = 1 ]; then
+    KILL_RE='[t]raffic_scenario.py|[m]easure_stage.py|[t]raining_scenario_driver'
+    PROC_RE='[t]raffic_scenario.py|[m]easure_stage.py|[t]raining_scenario_driver|[n]r-softmodem|[n]r-uesoftmodem|[i]perf3'
+else
+    KILL_RE='[t]raffic_scenario.py|[m]easure_stage.py|[t]raining_scenario_driver|[t]raining_watchdog'
+    PROC_RE='[t]raffic_scenario.py|[m]easure_stage.py|[t]raining_scenario_driver|[t]raining_watchdog|[n]r-softmodem|[n]r-uesoftmodem|[i]perf3'
+fi
 
 clean_local() {
     # 先殺行程再刪容器，避免場景 supervisor 把 iperf3 又拉起來
-    ps -eo pid,args | grep -E "[t]raffic_scenario.py|[m]easure_stage.py|[t]raining_scenario_driver|[t]raining_watchdog" \
+    ps -eo pid,args | grep -E "$KILL_RE" \
         | grep -v clean_env | awk '{print $1}' | xargs -r kill 2>/dev/null
     sleep 1
     local names
@@ -38,7 +46,7 @@ verify_local() {
     return $bad
 }
 
-FUNCS="$(declare -f clean_local verify_local); CONTAINER_RE='$CONTAINER_RE'; PROC_RE='$PROC_RE'"
+FUNCS="$(declare -f clean_local verify_local); CONTAINER_RE='$CONTAINER_RE'; PROC_RE='$PROC_RE'; KILL_RE='$KILL_RE'"
 rc=0
 for h in local pc2 pc3; do
     echo "[clean_env] === $h ==="

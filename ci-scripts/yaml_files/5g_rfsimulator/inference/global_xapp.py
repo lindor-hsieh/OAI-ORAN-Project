@@ -24,11 +24,14 @@ C 層機制依「節點自己 MT 的真實 backhaul 使用量」動態縮小該�
      collection 各自查詢最近 `GLOBAL_XAPP_LOOKBACK` 筆、排除
      `is_idle=True` 的文件，取 `r_throughput` 欄位算平均吞吐量。
      沒有資料的節點記為 None（不計入全域平均）。
-  2. `global_mean` = 有資料節點的平均吞吐量之平均值。
-  3. `fairness_bias_i = clip(global_mean / (mean_i + eps), BIAS_MIN, BIAS_MAX)`
-     ——吞吐量低於全域平均 → bias > 1（代表被犧牲，可以更積極）；
+  2. **同角色內比較（2026-09-26 起）**：`role_mean[role]` = 同一角色（relay=Node1~4、access=Node5~12）
+     有資料節點的平均吞吐量之平均值。relay 的「UE」是 access 節點的 MT，承載匯聚流量，吞吐量結構上高於 access
+     節點；舊版把 relay 與 access 混在一起算全域平均，relay 的 bias 恆 <1、access 恆 >1，只是「節點身分」而
+     不是公平性訊號。統計視窗也從最近 50 筆（~5 秒，只反映當下流量相位）拉長到 300 筆（~30 秒）。
+  3. `fairness_bias_i = clip(role_mean[role_i] / (mean_i + eps), BIAS_MIN, BIAS_MAX)`
+     ——吞吐量低於同角色平均 → bias > 1（代表被犧牲，可以更積極）；
      高於平均 → bias < 1。沒有資料的節點給中性值 1.0。
-  4. 額外算一個 `global_jfi`（Jain's Fairness Index，同一組平均吞吐量）
+  4. 額外算一個 `global_jfi`（Jain's Fairness Index，作用在「節點吞吐量 ÷ 同角色平均」這組角色正規化數值上）
      僅供人工觀察列印，不寫回 MongoDB——避免跟 `server_app.py` 每輪
      FedAvg 各自算的 JFI 混淆成兩個不同時間粒度的「權威值」。
   5. 透過 ZMQ PUB（bind `tcp://127.0.0.1:5560`）對每個節點送
@@ -60,7 +63,7 @@ MONGO_DB: str = os.getenv("MONGO_DB", "iab_xapp")
 
 NUM_NODES: int = int(os.getenv("GLOBAL_XAPP_NUM_NODES", "12"))
 INTERVAL_S: float = float(os.getenv("GLOBAL_XAPP_INTERVAL_S", "2.0"))
-LOOKBACK: int = int(os.getenv("GLOBAL_XAPP_LOOKBACK", "50"))
+LOOKBACK: int = int(os.getenv("GLOBAL_XAPP_LOOKBACK", "300"))   # ~30 秒（每節點 ~10 筆/秒）；舊值 50 只有 ~5 秒
 
 # 必須跟 drl_agent.py 的 FAIRNESS_BIAS_MIN/MAX 一致，否則 Actor 收到的
 # state 特徵正規化區間會跟這裡廣播的原始值域對不上。
@@ -127,6 +130,15 @@ def mean_recent_throughput(
 # 全域公平性偏差計算
 # =============================================================================
 
+# 節點角色（見 CLAUDE.md 第 1 節）：Node1~4 是 relay（DU 服務 access 節點的 MT，承載匯聚流量），Node5~12 是 access。
+RELAY_NODE_IDS = frozenset({1, 2, 3, 4})
+
+
+def role_of_node(node_id: int) -> str:
+    """節點角色：'relay'（Node1~4）或 'access'（Node5~12）。公平性偏差只在同角色內比較。"""
+    return "relay" if node_id in RELAY_NODE_IDS else "access"
+
+
 def compute_fairness_biases(
     db: pymongo.database.Database,
     num_nodes: int,
@@ -150,18 +162,27 @@ def compute_fairness_biases(
         biases = {nid: NEUTRAL_BIAS for nid in mean_throughputs}
         return biases, mean_throughputs, 0.0
 
-    global_mean = float(np.mean(valid_values))
+    # 同角色內比較：各角色的平均吞吐量（只算有資料的節點）
+    role_values: dict[str, list[float]] = {}
+    for nid, v in mean_throughputs.items():
+        if v is not None:
+            role_values.setdefault(role_of_node(nid), []).append(v)
+    role_mean = {r: float(np.mean(vs)) for r, vs in role_values.items()}
 
     biases: dict[int, float] = {}
+    normalized: list[float] = []
     eps = 1e-6
     for node_id, mean_tp in mean_throughputs.items():
         if mean_tp is None:
             biases[node_id] = NEUTRAL_BIAS
         else:
-            raw_bias = global_mean / (mean_tp + eps)
+            ref = role_mean[role_of_node(node_id)]
+            raw_bias = ref / (mean_tp + eps)
             biases[node_id] = float(np.clip(raw_bias, BIAS_MIN, BIAS_MAX))
+            normalized.append(mean_tp / (ref + eps))
 
-    x = np.array(valid_values)
+    # 監控用 JFI：作用在角色正規化後的數值（節點吞吐量 ÷ 同角色平均），消除 relay/access 的結構性差距
+    x = np.array(normalized)
     global_jfi = float(x.sum() ** 2 / (len(x) * (x ** 2).sum() + 1e-9))
 
     return biases, mean_throughputs, global_jfi

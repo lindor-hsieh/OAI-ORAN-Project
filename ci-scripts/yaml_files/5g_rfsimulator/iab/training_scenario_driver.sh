@@ -64,24 +64,23 @@ esac
 
 cd "$COMPOSE_DIR" || { err "cd 到 $COMPOSE_DIR 失敗"; exit 1; }
 
-# ── 輪替表（刻意排除 seed=20260914，那是固定測試場景保留的） ───────────
-# scenario / seed（0=不適用）/ 這個 slot 的秒數。總長 18000 秒 = 5 小時一輪，
-# 無限循環。
-#
-# [2026-09-18 重新設計] 原本 R 佔多數（65%），但現場發現 R 的 profile 設計
-# （heavy/light/bursty，light/bursty 佔比高、閒置機率不低）長時間訓練下
-# reward 訊號量級普遍偏小、對雜訊敏感（見 HISTORY.md 同日條目）——沒有任何
-# 既有場景真正把頻寬塞滿到「需求超過供給」的壅塞狀態，A/B/C 之間的對比也都
-# 在溫和範圍內。改成以新的 Scenario T（低/中/高流量 × 低/中/高路徑損耗 3x3
-# 交叉設計，見 scenarios/traffic_scenario.py::scenario_t_tiered()）為主力
-# （53%），確保系統性覆蓋整個負載/通道品質空間、包含真正的高負載壅塞狀態；
-# R 降到 20% 保留其真實隨機分佈的多樣性；A/B/C 各自保留其特定邊界案例
-# 價值（CQI 極端對比／流量嚴重不均／最差公平性）；D 移除（已被 T 的系統性
-# 覆蓋取代，D 本來就標記「無統計依據，已被 R 取代」，這次直接一併移除）。
-SLOT_SCENARIO=(T R T A T B T C R)
-SLOT_SEED=(0 130001 0 0 0 0 0 0 130002)
-SLOT_DURATION_S=(2400 1800 2400 1500 2400 1500 2400 1800 1800)
-
+# ── 輪替表（2026-09-26 重寫）─────────────────────────────────────────────────────
+# 只用兩種場景，且都已對齊新平台的流量量級（模擬時間 Mbps，S=0.4，見 CLAUDE.md 第 8 節）：
+#   TR：隨機化的兩狀態 T——同量測用 Scenario T 的檔位與 ~45% 壅塞比例，但壅塞相位排列與每 UE 的組合由 seed
+#       打散，訓練分佈與固定的測試場景 T 不同（「訓練場景不可等於測試場景」的原則）。
+#   R ：新版真實隨機（idle:burst:traffic = 1:2.5:6.5，TCP/UDP 混合），保留另一種隨機結構的多樣性。
+# 舊表的 A/B/C 已移除：它們的流量（每 UE 25~50 Mbps 模擬時間）是重設平台前的舊量級，17 個 UE 加總 400~850，
+# 遠超 CPU 平台（~100~108），會讓平台飽和、RTT 秒級、UE 崩潰。固定的 Scenario T（測試基準）也不進訓練。
+# 協定：TCP／UDP 在不同 slot 混合訓練（最後量測兩種都要量）；R 的協定維持其內建 TCP/UDP 混合（75/25）。
+# 每個 slot 的 seed = 基底 + 週期編號×10 + slot 序號，每一輪循環都是全新的隨機排列。
+# scenario / 協定（tcp|udp|mix，mix=用場景內建）/ 這個 slot 的秒數。總長 13200 秒 ≈ 3.7 小時一輪，無限循環。
+SLOT_SCENARIO=(TR  TR  R   TR  TR  R)
+SLOT_PROTOCOL=(tcp udp mix udp tcp mix)
+SLOT_DURATION_S=(2400 2400 1800 2400 2400 1800)
+TR_SEED_BASE=140000
+R_SEED_BASE=150000     # 刻意避開固定測試 seed 20260914
+TR_PHASE_S=110         # 與量測用的 Scenario T 相同的相位長度
+R_PHASE_S=60
 N_SLOTS=${#SLOT_SCENARIO[@]}
 CYCLE_LEN_S=0
 for d in "${SLOT_DURATION_S[@]}"; do CYCLE_LEN_S=$((CYCLE_LEN_S + d)); done
@@ -101,6 +100,7 @@ trap cleanup SIGTERM SIGINT
 
 while true; do
     now=$(date +%s)
+    cycle_no=$(( (now - EPOCH) / CYCLE_LEN_S ))
     elapsed=$(( (now - EPOCH) % CYCLE_LEN_S ))
     # 找出目前落在哪個 slot、這個 slot 還剩幾秒
     cursor=0
@@ -128,27 +128,33 @@ while true; do
     fi
 
     scenario=${SLOT_SCENARIO[$slot_idx]}
-    seed=${SLOT_SEED[$slot_idx]}
+    # 這個 slot 的起點與相位原點：三台主機用同一個 EPOCH 算，天然一致，--phase-origin 讓相位邊界固定、編號連號
+    slot_start=$(( now - (elapsed - cursor) ))
+    # 協定：--protocol 明確指定則全部 slot 覆寫（相容舊用法）；否則用該 slot 的設定（mix = 場景內建）
+    proto=${PROTOCOL:-${SLOT_PROTOCOL[$slot_idx]}}
+    proto_arg=()
+    [[ "$proto" != "mix" ]] && proto_arg=(--protocol "$proto")
 
-    log "slot=$slot_idx scenario=$scenario remaining=${remaining}s"
+    # 這個 slot 還要跑幾個相位：第一個相位可能是「進行到一半」（watchdog 重啟後接續），只算剩餘的部分
+    phase_len=$TR_PHASE_S; [[ "$scenario" == "R" ]] && phase_len=$R_PHASE_S
+    first_left=$(( phase_len - (now - slot_start) % phase_len ))
+    num_phases=$(( 1 + ( (remaining > first_left ? remaining - first_left : 0) + phase_len - 1 ) / phase_len ))
 
+    log "slot=$slot_idx scenario=$scenario proto=$proto cycle=$cycle_no remaining=${remaining}s phases=$num_phases"
+
+    # 訓練期間 CrashGuard 只警告（--on-crash warn）：崩潰復原由 training_watchdog.sh 負責，不要讓場景行程自己退出
     case "$scenario" in
+        TR)
+            seed=$(( TR_SEED_BASE + cycle_no * 10 + slot_idx ))
+            python3 scenarios/traffic_scenario.py --scenario TR --seed "$seed" \
+                --host "$HOST" --phase-duration "$TR_PHASE_S" --num-phases "$num_phases" \
+                --phase-origin "$slot_start" --on-crash warn "${proto_arg[@]}" &
+            ;;
         R)
-            num_phases=$(( (remaining + 59) / 60 ))
+            seed=$(( R_SEED_BASE + cycle_no * 10 + slot_idx ))
             python3 scenarios/traffic_scenario.py --scenario R --seed "$seed" \
-                --host "$HOST" --phase-duration 60 --num-phases "$num_phases" \
-                ${PROTOCOL:+--protocol "$PROTOCOL"} &
-            ;;
-        T)
-            num_phases=$(( (remaining + 59) / 60 ))
-            python3 scenarios/traffic_scenario.py --scenario T \
-                --host "$HOST" --phase-duration 60 --num-phases "$num_phases" \
-                ${PROTOCOL:+--protocol "$PROTOCOL"} &
-            ;;
-        A|B|C)
-            python3 scenarios/traffic_scenario.py --scenario "$scenario" \
-                --host "$HOST" --duration "$remaining" \
-                ${PROTOCOL:+--protocol "$PROTOCOL"} &
+                --host "$HOST" --phase-duration "$R_PHASE_S" --num-phases "$num_phases" \
+                --phase-origin "$slot_start" --on-crash warn "${proto_arg[@]}" &
             ;;
         *)
             err "未知的 slot scenario: $scenario"

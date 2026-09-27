@@ -929,3 +929,89 @@ Stage 2 要求切換 `REWARD_MODE` 前必須清空模型 checkpoint。第一次�
 - 尚未實測 R 的平台穩定度（總 offered 的尾端 p95 略高於 CPU 平台 ~105）；正式用 R 量測前先跑一次短測。
 
 - 2026-09-26（使用者決定）：目前實驗以 Scenario T 為主，Scenario R 暫不納入 Stage 比較。
+
+## 2026-09-26 續十三：Stage 2 程式審查——修正回放緩衝區排序與 FL 寫入競態
+
+- **清理**：`inference-node1~12`／`mongodb` 容器與 13 個具名 volume（`iab-xapp-model-node1~12`、`iab-xapp-mongo-data`）已移除（使用者要求重頭訓練）。`experiment_results/checkpoints_archive/`（5 組封存，git HEAD 內有備份）的刪除被內建安全檢查擋下（`cd` 後用萬用字元），留給使用者自己執行。
+- **Bug 1（嚴重）**：`training_pipeline.py::fetch_experiences()`／`fetch_sequences()` 用 `sort(timestamp, ASCENDING).limit(2000)`，取到的是最早的 2000 筆而非最新；集合超過 2000 筆後每輪訓練都在讀同一批最早（BSR 啟發式階段）的資料，policy 永遠看不到自己的資料與後來的場景——與 Stage 2/3「一直無法收斂」一致。已改成 DESCENDING 取最新再還原升序；回放緩衝區 2000 → 10000（環境變數 `TRAIN_FETCH_LIMIT`，訓練、FL 客戶端訓練與評估共用）。
+- **Bug 2**：`inference_server.py` 每輪訓練後無條件把記憶體權重存回檔案，FL 寫入聚合權重後要等 30 秒輪詢才被載入，空窗內的本地存檔會覆蓋 FL 權重且 mtime 被刷新、之後永遠不會載入。已改：訓練前先 `_maybe_reload_checkpoint()`；存檔改為 `_save_unless_superseded()`（鎖內檢查磁碟 mtime，較新則載入 FL 權重、放棄覆寫）。
+- 驗證：以假的 collection 單元測試排序（25000 筆取到 15000~24999、升序）與競態防護（無外部更新→存檔；FL 剛更新→不覆蓋並改採 FL 權重），皆符合預期；`local-xapp-inference:latest` 已重建並確認映像內是修正後的程式。
+- **尚未決定**：獎勵／優勢重設計（獎勵外生、優勢 z-score 放大雜訊、γ=0.95 不必要）——待使用者選方向，見對話提案。
+
+## 2026-09-26 續十四：Stage 2 獎勵／優勢重設計（方案 A，使用者選定）
+
+- 改動（`drl_agent.py` MLP 分支、`reward_calculator.py`）：① γ=0；② advantage=clip((r−V(s))/running_std(r), ±3)，取代每批 z-score，`reward_std` 存進 checkpoint；③ 只用壅塞樣本更新 Actor（RLC 佇列 ≥50000 bytes，s_t 或 s_{t+1}，`CONTENDED_BUF_BYTES`），批次內壅塞樣本<8 筆跳過；④ 獎勵正規化 `MAX_BSR` 2,000,000→250,000（`REWARD_MAX_BSR`）。GRU 分支不變。
+- 合成環境驗證（2 UE，壅塞時報酬=Σ 比例×通道速率，不壅塞時報酬與動作無關，45% 壅塞、需求隨機變動，隨機 Dirichlet 行為策略）：純不壅塞批次 Actor 權重完全不變（Critic 有更新）；新版用全不壅塞資料再訓練 100 步，P(高 MCS UE) 0.596→0.596，舊版 0.625→0.669（隨機漂移）。壅塞資料上 LR_ACTOR=1e-4 約 1200 步收斂（0.994）、3e-4 約 300~600 步、1e-3 約 100~300 步；學習率未動，建議首次真實訓練後視收斂速度再調（建議 3e-4）。
+- 待校準：`CONTENDED_BUF_BYTES`（50000）需用真實訓練日誌的 `contended=xx%` 檢查；`MAX_BSR` 在 S 改變時須同步。
+
+## 2026-09-26 續十五：Stage 2 高優先項（執行緒、DRL 切換門檻、FedAvg 權重）
+
+- 審查（讀 xapp_node1.c、gNB_scheduler_dlsch.c、global_xapp.py、server_app.py 等）確認：xApp 動作語意是「每 UE PRB 上限」（PF 內截斷 max_rbSize），只在資源不夠分時才有差別；12 個 inference 容器共用 4 核心、torch 預設 8 執行緒（約 96 執行緒搶 4 核心），單步訓練 37 ms 持有模型鎖，超過 xApp 5ms 逾時 → 退回 PF；FedAvg 以 n_train_exp 加權（緩衝區滿後各節點皆 ~8000，實為均等），與新的「只用壅塞樣本更新 Actor」交互作用會把有學到的節點稀釋。
+- 修正：① `torch.set_num_threads(1)`（`TORCH_NUM_THREADS`）＋映像 `ENV OMP_NUM_THREADS=1`；`_train_worker` 起始依 node_id 錯開（60~115 s）。單步訓練 37→30 ms。② `MIN_DRL_TRAIN_STEPS`=100（`DRL_MIN_TRAIN_STEPS`）才由啟發式切 DRL（原本第一輪 10 步就切）。③ `DRLAgent.count_contended()`；`run_training_round` 回報 `n_contended_train`；`client_app.py` 的 num-examples 改為壅塞樣本數；`_contended_mask` 加上「≥2 個活躍 UE」（單 UE 時 Dirichlet 一維、梯度 0，無決策可學）。測試：單 UE 樣本不計入（30/120）、run_training_round 回報 376/1200。映像已重建並在映像內驗證。
+- **尚未處理（待使用者決定或另案）**：xApp 每 10ms 重送快取控制（12 個 xApp 最多 ~1200 CONTROL-REQ/s，疑為 FlexRIC 崩潰來源，未驗證）；Global xApp 的 fairness_bias 在 Stage 2 是惰性且 relay/access 直接比較不合理；把可用 PRB 比例（backhaul_prb_ratio）放進 state（需改 C 端 E2）；離策略偏差（無重要性取樣）。
+
+## 2026-09-26 續十六：xApp 移除冗餘控制重送＋fallback 解除上限（12 份 xapp_nodeN.c）
+
+- 起因：審查發現 `sm_cb_mac()` 在每個非 ZMQ 的 10ms callback 也會把快取分配再送一次 `control_sm_xapp_api()`，實際控制請求率是 ~100/s/xApp（12 個 ~1200/s），比上方「FlexRIC pending event」章節分析時假設的 ~10/s/節點（只算 ZMQ 週期）大 10 倍——該章節提出的「放寬 rate limiter」對錯了因子。確認 OAI MAC（`ran_func_mac.c::write_ctrl_mac_sm`）把控制存進 `nrmac->xapp_2d_ctrl` 且全專案無任何清除／過期，重送完全冗餘。
+- 修改：① 刪除重送區塊（其餘 callback 直接 return）；② `apply_fallback()` 不再是空函式：若 MAC 端有我們下發的上限（`s_caps_active`），只送一次 `prb_quota=1.0` 的解除控制、清快取；成功下發時 `s_caps_active=true`。12 份用同一套精確替換，`ninja` 編譯 12 個 xapp_nodeN 全數成功（無新警告）；容器直接 bind-mount build 目錄，不需 `ninja install`，下次啟動 xApp 即生效。原檔備份於暫存目錄。
+- **尚未實測**：預期 `docker logs xapp-nodeN | grep -c "CONTROL-REQUEST tx"` 約 600/分鐘（10/秒）而非 ~6000/分鐘；FlexRIC 的 `Pending event timeout` 頻率下降；模擬 Python 掛掉（停 inference 容器）時，DU 端上限應被解除、排程回到 PF。首次訓練時要檢查這三項。
+
+## 2026-09-26 續十七：Stage 2 剩餘三項（Global xApp 同角色、E2 可用 PRB 比例、PPO 比例裁剪）——使用者要求「不考慮難度，選最好的」
+
+- **P2：可用 PRB 比例走 E2（最重的一項）**：`mac_ind_msg_t` 加 `float backhaul_prb_ratio`（`mac_data_ie.h/.c`、`mac_enc_plain.c`、`mac_dec_plain.c`；線上格式在 tstamp 後多 4 bytes），`ran_func_mac.c::read_mac_sm()` 讀 `nrmac->backhaul_prb_ratio` 填入（沒有 UE 時也填）；12 個 xApp 在 JSON 加 `bh_ratio`；Python 端 `STATE_DIM` 50→51（`state_vec[50]`）。**三台主機各自**重編 FlexRIC＋`sudo ninja install`＋`nr-softmodem`（PC2 用 gcc-13，checksum 與 PC1/PC3 不同屬預期），時間戳皆新於原始碼；編解碼往返測試（`ratio=0.7325`、2 UE、400 bytes）在三台的編譯器都通過。**尚未驗證的是活系統上實際收到非零比例**——下次啟動 xApp 後檢查 `xapp-nodeN` 送出的 JSON 或 inference 日誌中的 bh_ratio。
+- **離策略（PPO 式裁剪）**：`DRLAgent.infer()` 回傳第三個值 `behavior_logp`（與訓練端相同的夾值＋重新正規化後的 Dirichlet log_prob），`inference_server` 存進經驗；訓練用 `min(ρA, clip(ρ,1±0.2)A)`；缺欄位的經驗只訓練 Critic。合成環境（策略自產資料＋滾動緩衝區）驗證：無 behavior_logp 時 Actor 不動；800 步後 P(高 MCS UE) 0.515→0.98，PPO 裁剪比例 2%~31%。
+- **G1（Global xApp）**：公平性偏差改為同角色（relay=Node1~4、access=Node5~12）內比較，視窗 50→300 筆（~30 秒）；監控 JFI 改為角色正規化數值。假資料測試：各角色平均 bias≈1，同角色落後節點 >1、領先節點 <1。
+- 舊資料與 checkpoint 已清空，STATE_DIM 改變不影響遷移。
+
+## 2026-09-26 續十八：PC1→PC2/PC3 同步稽核（使用者提醒）
+
+- 以校驗碼比對整個 repo 原始碼：PC2/PC3 落後的只有文件、腳本、`inference/`（PC2/PC3 不執行）與 4 個 bhload 檔案（`telnetsrv_bhload.{c,h}`、`nr_mac_gNB_backhaul_poll.{c,h}`，PC2/PC3 停在 09-12 的舊版）。逐行比對確認 bhload 四檔的差異**只有註解**（`bhload get`→`query`），程式碼一致；二進位字串檢查也確認 PC1/PC2/PC3 的 `nr-softmodem`／`nr-uesoftmodem` 都使用 `query`，因此先前的 Stage 1 量測不受影響。
+- 已全部同步（校驗碼差異 0）；rebase 重寫了 `simulator.c`/`apply_channelmod.c` 的時間戳，依規則三台都重編 `nr-softmodem nr-uesoftmodem rfsimulator telnetsrv`，產物時間戳皆不比對應原始碼舊；PC2 重編後的執行檔仍可啟動（libssl1.1 在）。
+- 新增 `iab/sync_pc23.sh`（dry-run／`--apply`）把「比對、同步、產物時間戳檢查」固定成一個指令。
+
+## 2026-09-26 續十九：訓練驅動器與 watchdog 改寫（使用者：照建議全部改）
+
+- **驅動器阻塞問題**：舊 `training_scenario_driver.sh` 輪替 `T R T A T B T C R`，A/B/C 流量仍是舊量級（每 UE 25~50 sim Mbps，17 UE 加總 400~850，遠超 ~100~108 的 CPU 平台），且固定 T 是測試場景。改寫為：`TR`（新增的隨機化兩狀態 T；同 T 檔位、5/11 壅塞機率、每相位把 9 種組合各重複到 18 份洗牌後依 global_id 分配）＋新版 R；TR 的 slot 交替 tcp/udp，R 用內建混合；13200 秒一輪、seed 依輪次與 slot 變動；`--phase-origin` 讓相位邊界對齊（起點＝slot 起點，三台以同一 `--epoch` 算出）；只在 PC2/PC3 啟動。以假 python3 驗證槽位、seed、相位數（22，與手算一致）、`--protocol` 覆寫、剩餘<30 秒跳過。TR 模擬：壅塞比例 44.8%、兩台各自計算與單機一致、三台（Python 3.8/3.12）決定性雜湊相同（含 R）。
+- **watchdog 過時項目**（拓樸 2026-09-22 搬遷前的位置）已修：`DU_HOST` 對照表；PC1 不再起驅動器（會因無 UE 空轉）；「PC1 本機 UE5~8」「PC2 的 UE17」驗證改為 17 UE 逐一驗證＋修復（路由 → 只重啟該 UE 容器；UE17 補 DU4 F1-U 別名在 PC1）；復原前先 `clean_env.sh`（新增 `CLEAN_ENV_KEEP_WATCHDOG=1` 避免殺掉 watchdog 自己）；復原後重跑 `setup_iperf_servers.sh`（原有已知缺口）；FL 層改為無條件帶起（clean_env 會移除 FL 容器）；新增三台 RAN 容器（UE/MT/DU）RestartCount 偵測。
+- **尚未在活系統驗證**：整個 watchdog 復原流程（只做了語法檢查與 `ran_restart_total()` 單元測試）、驅動器接真實 traffic_scenario.py 的整合；建議訓練前先以 `--epoch` 短跑驅動器觀察一個 slot 的行為。`iab/training_healthcheck.sh` 未檢視、可能也有舊拓樸假設。
+
+## 2026-09-26 續二十：Stage 2 訓練啟動與「真實控制視窗是 1 秒」的更正
+
+- **啟動**：清理環境 → 三台依序重啟 → xApp → `run_stage2_fl.sh`（REWARD_MODE=throughput_only、MODEL_ARCH=mlp、FL_MODE=avg）→ iperf3 server → 預檢查（13/13 E2、RestartCount 0、17/17 UE、17 個 iperf3 server、S=0.4）；訓練場景協定依使用者「流量場景tcp」固定 TCP（`--protocol tcp`，覆寫驅動器各 slot 的協定）。第一次嘗試 21:25 起，5 分鐘內發現問題，21:37 只重啟 Stage 2 層（RAN 不動）後於 **21:39:25** 正式起算，預計 03:39:25 結束。
+- **重大更正**：xApp 的 E2SM-MAC 訂閱週期是 `"100_ms"`（`xapp_nodeN.c:563`），再乘上 Rate Limiter 的每 10 次才問 Python → **控制/觀測視窗 1 秒**（MongoDB 文件間隔 1.00 秒、xApp 控制請求 60 筆/分鐘），不是文件一直寫的 100ms。連帶：(1) 我 09-26 把 `MAX_BSR` 由 2,000,000 改成 250,000 是錯的，`r_throughput` 的 p90 已頂到 1.0（獎勵飽和），改回 2,000,000（drl_agent 的 state 編碼常數也改 2,000,000）；(2) 先前「xApp 每秒 ~1200 個控制請求」高估 10 倍（真實舊速率 ~120/s、現在 ~12/s，減 10 倍的結論不變）；(3) `STALE_PREV_UES_THRESHOLD_S` 2.0 → 5.0（週期 1 秒，2 秒餘裕太小）；(4) 每節點每小時只有 ~3600 筆經驗，`TRAIN_FETCH_LIMIT` 10000（≈2.8 小時）→ 5000（≈83 分鐘），`DRL_LR_ACTOR` 1e-4 → 3e-4（6 小時只有 ~3600 步）；(5) `GLOBAL_XAPP_LOOKBACK`=300 實為 ≈5 分鐘而非 30 秒。
+- **門檻校準**（真實資料，TR seed=140000，跳過啟動暫態與每相位前 20 秒）：正常相位「最大 UE 佇列」p50/p90/p95=2.5k/165k/336k bytes、壅塞相位 240k/953k/1.17M；`CONTENDED_BUF_BYTES` 50k→誤判 23.9%/命中 74.1%、100k→13.7%/65.1%、200k→8.7%/53.7%、500k→3.0%/26.3%；選 100,000。
+- **E2 `bh_ratio` 活系統驗證通過**：12 個節點的推論端都收到非 1.0 的值（0.963~0.993，三台主機的 DU 皆有）；但目前負載下資源池只縮小 ~1~4%，該特徵變動很小。
+- 先前「xApp 移除冗餘重送」的未驗證項：控制請求率已驗證為 60/分鐘/xApp（1/秒）。fallback 解除上限、PPO/壅塞篩選/FL 加權在真實資料上的行為仍待觀察。
+
+## 2026-09-27 續二十一：Stage 2 正式訓練（6 小時）與 TCP／UDP 量測結果
+
+- **訓練**：2026-09-26 21:39:25 ~ 2026-09-27 03:39:25，MLP＋`throughput_only`＋avg FL＋TCP 訓練場景；各節點 4300~4450 步、每節點約 2 萬筆經驗。Stage 2 結果（未優於 PF）與比較表見 `experiment_results/avgFL.md` 最末章節；原始資料在 `experiment_results/data_20260927_stage2_twostate/`。
+- **訓練期間的事件與處置**：
+  - 21:55 起 UE 容器反覆崩潰，都是 OAI UE 端 assertion 退出：RRCReject 後「RA trigger not implemented」（`rrc_UE.c:1110`，UE13）、MAC PDU 長度異常（`nr_ue_process_mac_pdu`，`nr_ue_procedures.c:3844`，UE14／UE15）、`n_dmrs_cdm_groups 3 is illegal`（`nr_dlsch_extract_rbs`，UE8）；docker 自動重啟後 tunnel 預設路由消失，資料面不通。
+  - **watchdog 改為 UE 崩潰就地修復**（使用者決定）：每輪比對 17 個 UE 的 RestartCount（後由使用者加上 StartedAt 指紋），重啟就重新斷言預設路由並 ping 驗證，每顆最多 8 次、第 5 次起重啟該 UE 容器，並重啟該 UE 的 ext-dn iperf3 server（崩潰後舊 server 常卡在「server is busy」使新 client rc=1，沒流量）；修不好、或同主機 ≥3 個其他 UE 不通才升級整套重啟。MT/DU/CU/FlexRIC 崩潰仍整套重啟。真實崩潰上 3 次就地修復（UE8/UE10/UE15）皆成功。
+  - **教訓（我的失誤）**：用 `pkill -f "iperf3 -s -1 -p 5208"` 會連外層 while-loop 的 `sh -c` 一起殺（cmdline 含同樣字串），該埠 server 就不再自動重啟；改用錨定 `^iperf3 -s -1 -p N ` 只殺 iperf3 本體。
+  - **UE12「UE 沒重啟但 UPF 找不到該 UE IP」**（UPF log `UE IP c010119 not found`，AMF 仍顯示 REGISTERED）：`docker restart` 無效，`docker stop`→等 20 秒→`start` 才重新建立 PDU session 並恢復。watchdog 目前偵測不到這類（只看 UE 容器重啟）。
+  - **FlexRIC segfault**（01:37:08，`nearRT-RIC ... segfault at 18`，用本機編譯版反查指向 `assoc_rb_tree.c:385 minimum`，但容器用的是 `oaisoftwarealliance/oai-flexric:develop`，未確認同一份程式）：整套重啟約 9 分鐘；原因未查出。每個 xApp 幾乎每秒有一則 `Timeout waiting for CONTROL_ACK`（RAN 端不回 ACK，3 秒計時器逾時），是否相關未驗證。
+  - 22:13 watchdog 遇冷卻窗內第二次崩潰而停手（設計行為），人工修好 UE13 路由後重啟驅動器與 watchdog。
+- **relay 節點壅塞樣本結構性偏少的分析**（MongoDB 逐筆統計）：node1／node2 穩態壅塞比例 2~6%（早期含啟發式階段 13~19%，滾動視窗把那段擠出去後掉到穩態），node4 30~80%、node5 15~55%。原因是 relay 的下游 MT 通道不被場景惡化（MCS 一直高），壅塞只出現在 access 與 UE17；DRL 動作份額約 0.6/0.4 逐漸趨近平均。是否要降低 `CONTENDED_BUF_BYTES` 讓 relay 有訊號，使用者決定量測完再說（會作廢這次訓練）。
+- **訓練後流程（`/home/lindor/stage2_run_20260926/post_training.sh`）**：等訓練結束 → 檢視資料 → 封存（mongodump＋庫內複製，不用會 rename 原 collection 的 `archive_stage_data.sh`）→ 每種協定量測前都「清理環境→三台依序重啟→預檢查」→ TCP／UDP 各量一份 → 存 POSTMEASURE checkpoint 並停 xApp/inference/FL。
+  - **量測時訓練與 FL 都開著**（使用者交我決定：與實際部署一致、無人值守不改程式；代價是量測期間模型持續學習約 280 步/次，且 UDP 起點模型比 TCP 起點多約 350 步）。
+  - TCP 第一次嘗試在第 17 分鐘 UE2 崩潰（`TASK_RRC_NRUE` general protection fault）而無效，第二次有效；UDP 第一次即有效。
+  - 「FINAL 與 volume 不一致（node3、node12）」警告是誤報：FINAL 03:39:58 存下、容器 03:40:10 才停，這 12 秒內兩個節點多做一輪（+10 步）；量測前另存 `PREMEASURE_0340`。`start_iab_server.sh` 會提前啟動 inference 容器，重啟過程中訓練線程已多跑 3~4 輪（約 +30~40 步）。
+- **結果（事實）**：Stage 2 在壅塞相位滿足率、滿足率 JFI、整段 JFI、吞吐量上 TCP／UDP 都低於 PF，UDP RTT 明顯較高；UE17 比 PF 更差；正常相位與 PF 相近。**原因未驗證**（DRL 政策、線上學習、推論逾時退回 PF、relay 學習不足、UDP 沒訓練都只是待檢驗方向）。
+- **未處理**：`training_watchdog.sh` 的修改需 `sync_pc23.sh --apply`（另行執行）；未 commit／push；Stage 3 等使用者指示。
+
+## 2026-09-27 續二十二：查明 Stage 2 劣於 PF 的原因並修正（動作對應設計、採樣雜訊）
+
+- **背景**：使用者要求「反正幫我解決stage 2比PF差這件事」「不考慮工作難度及複雜性 選擇最好的選項就好」。
+- **第一輪分析（觀察性）**：比對 PF/Stage2 各分支壅塞相位吞吐量，差距只出現在壅塞相位（正常相位差 1%）、各節點都有、UE17 最差；政策的上限份額幾乎不隨需求比例調整（需求差 1.5x 與 >100x 時，需求大 UE 拿到的上限份額都約 0.51~0.58）；控制需求量分層後「份額越高送越多」的關係大部分消失。這輪沒有定案原因，列了 5 個待驗證方向。
+- **找到根因一**：讀 `gNB_scheduler_dlsch.c` 的 2D 控制攔截點與 `drl_agent.py::infer()` 才發現，舊版 `DRL_CAP_MODE`（當時還沒有這個開關，行為即後來的 `split`）把 Dirichlet 採樣值直接乘 106 當上限——兩個 UE 均分時各被截斷在約 53 PRB，PF（不截斷）不是動作空間裡能表達的點。**修正**：新增 `DRL_CAP_MODE=relative`（預設），上限 = `min(1, n·s)`，均分 = 不截斷 = PF，只改 `drl_agent.py::infer()`，C 端不用改（xApp 本來就逐 UE 獨立換算比例、夾到 [0,1]，不檢查總和）。單元測試（n=1/2/3 個 UE）與線上驗證（`docker exec` 讀最新 action，其中一個 UE 上限直接是 106）確認生效。
+- **只換對應、不訓練的驗證（E3）**：拿舊 6h checkpoint、`DRL_TRAIN_ENABLED=0`（新開關，背景訓練執行緒直接 return，同時記錄開關以供之後凍結量測用）、`FL_ON=0`，TCP 量測：壅塞相位總送達 92（PF 94、舊版 76），吞吐量 4.82（PF 4.93、舊版 4.40）。單這個修正就挽回大部分缺口。
+- **診斷用暖啟動再訓練（2 小時）**：新目錄 `/home/lindor/stage2v2_run_20260927/`（複製自 `stage2_run_20260926/` 的腳本框架，`TRAIN_HOURS=2`），`run_stage2_fl.sh` 新增 `STAGE2_KEEP_MODELS=1`（保留 checkpoint、只清空 MongoDB 經驗，因為換了動作語意，舊經驗不能混用但權重可當起點），訓練場景改 TCP/UDP 混合（拿掉 `--protocol tcp`）。訓練前先對即時 MongoDB 做一次額外 mongodump 備份（`archive/mongo_iab_xapp_before_v2_20260927.archive.gz`，69MB）。訓練中 UE4/UE13(×2)/UE15 各崩潰一次，watchdog 就地修復全部成功、無整套重啟。
+- **找到根因二**：使用者質疑「跑完 6 小時也不會比 PF 好」——把 2 小時訓練期間的 reward 按 15 分鐘分段檢視，12 節點平均在 0.14~0.18 間震盪、無上升趨勢（第 0~15 分鐘 0.173、第 105~120 分鐘 0.160），代表訓練很快到平衡點，延長時間效益有限。同意這個判斷後往下查結構性原因：`relative` 上限的 `min(1, n·s)` 對稱雜訊會造成非對稱損耗——採樣偏高被夾在 1.0（浪費）、採樣偏低直接扣吞吐量，雜訊本身、與策略收斂與否無關，會系統性拉低平均送達量。**修正**：新增 `DRL_DETERMINISTIC` 開關，開啟時 `infer()` 直接用 Actor 機率當份額（Dirichlet 期望值），不採樣；只用於凍結評估，訓練邏輯（隨機採樣、`behavior_logp`、PPO 裁剪）完全不動，是標準的「訓練隨機、評估用均值」做法。
+- **驗證（E4）**：用 2 小時暖啟動出的 checkpoint、`DRL_TRAIN_ENABLED=0 DRL_DETERMINISTIC=1`，TCP 量測：吞吐量 5.02 Mbps（**首次超過 PF 4.93**，+1.8%），壅塞相位滿足率 0.768（PF 0.767，追平），滿足率 JFI 0.933（PF 0.936，接近）。
+- **腳本沿革**：`post_training.sh`（訓練後自動化：檢視／封存／清理重啟／TCP+UDP 量測／凍結）之後又衍生出通用的 `/home/lindor/stage2_run_20260926/eval_run.sh <TAG> "<協定…>"`（環境變數 `CAP_MODE`／`TRAIN_ENABLED`／`FL_ON`／`DETERMINISTIC`，每種協定量測前都「清理環境→三台依序重啟→預檢查」），E3／E4／v2_2h 的量測都是靠這支腳本跑的。
+- **使用者中途要求跳過 UDP**（「我覺得先不用量udp了 結果應該差不多」）：v2_2h 的 UDP 量測在 PC3 啟動階段被手動停止（`kill` 該 eval_run.sh 行程，非 `pkill -f` 避免自我比對；讓 PC3 啟動腳本自然跑完再收手，沒有做破壞性中斷），改跑 E4（TCP-only，確定性輸出診斷）。
+- **compose 變更**：`docker-compose-iab-server.yaml` 12 個 `inference-nodeN` 服務新增 `DRL_CAP_MODE`／`DRL_TRAIN_ENABLED`／`DRL_DETERMINISTIC` 三個環境變數（皆有預設值，向後相容）。`inference_server.py` 補上遺漏的 `import os`（新增 `TRAIN_ENABLED` 判斷時才發現原檔案沒 import，若沒補上會直接在 import 階段崩潰）。
+- **已同步 PC2/PC3**（`sync_pc23.sh --apply`，多次，校驗碼比對 0 個差異）；**未 commit/push**。
+- **待辦（使用者：6 小時訓練之後再說）**：目前寫進 `avgFL.md` 的是 2 小時暖啟動＋確定性輸出的初步結果，明確標註非正式定案；正式 Stage 2 結果需之後補跑一次完整 6 小時訓練（`DRL_CAP_MODE=relative`）＋ `DRL_DETERMINISTIC=1` 量測 TCP／UDP 各一份才能取代。relay 節點壅塞樣本比例偏低的結構性限制（見續二十一）預期仍會存在，是否調 `CONTENDED_BUF_BYTES` 待另外決定。

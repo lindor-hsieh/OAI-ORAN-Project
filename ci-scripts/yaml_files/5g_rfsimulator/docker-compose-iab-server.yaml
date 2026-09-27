@@ -103,6 +103,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node1:/app/models
@@ -145,6 +148,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node2:/app/models
@@ -187,6 +193,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node3:/app/models
@@ -229,6 +238,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node4:/app/models
@@ -271,6 +283,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node5:/app/models
@@ -313,6 +328,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node6:/app/models
@@ -355,6 +373,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node7:/app/models
@@ -397,6 +418,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node8:/app/models
@@ -439,6 +463,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node9:/app/models
@@ -481,6 +508,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node10:/app/models
@@ -523,6 +553,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node11:/app/models
@@ -565,6 +598,9 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
+            DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
         volumes:
             - /tmp:/tmp
             - inference_models_node12:/app/models
@@ -611,7 +647,7 @@ services:
             MONGO_DB: "iab_xapp"
             GLOBAL_XAPP_NUM_NODES: "12"
             GLOBAL_XAPP_INTERVAL_S: "2"
-            GLOBAL_XAPP_LOOKBACK: "50"
+            GLOBAL_XAPP_LOOKBACK: "300"
         volumes:
             - /tmp:/tmp
         command: ["python3", "global_xapp.py"]

@@ -30,6 +30,9 @@ RUN pip install --no-cache-dir \
 COPY vendor/ vendor/
 RUN pip install --no-cache-dir -e ./vendor
 
+# BLAS/OpenMP 只用 1 個執行緒（12 個推論容器 + 12 個 FL ClientApp 共用 4 個核心，見 drl_agent.py 的說明）
+ENV OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+
 # 複製推論伺服器程式碼
 COPY drl_agent.py .
 COPY reward_calculator.py .

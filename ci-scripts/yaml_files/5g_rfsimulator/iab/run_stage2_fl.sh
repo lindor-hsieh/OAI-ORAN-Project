@@ -53,10 +53,16 @@ echo -e "${CYAN}[1/4] 停止全部 12 個 inference-nodeN 容器...${NC}"
 $DC stop inference-node{1..12}
 
 echo -e "${CYAN}[2/4] 清空 checkpoint（實際 volume 名稱 iab-xapp-model-nodeN）與 MongoDB 經驗...${NC}"
+# STAGE2_KEEP_MODELS=1：保留模型 checkpoint（暖啟動；只清 MongoDB 經驗）。動作語意改變（DRL_CAP_MODE）後重訓時用：
+# 舊經驗是在舊語意下收的不能混用，但權重可以當起點。預設 0（一併清空）。
+if [ "${STAGE2_KEEP_MODELS:-0}" != "1" ]; then
 for i in $(seq 1 12); do
     docker run --rm -v "iab-xapp-model-node${i}:/models" alpine \
         sh -c 'rm -f /models/*.pt /models/*.tmp.* 2>/dev/null || true'
 done
+else
+    echo -e "${YELLOW}  STAGE2_KEEP_MODELS=1：保留 checkpoint，只清空 MongoDB 經驗${NC}"
+fi
 docker exec mongodb mongosh iab_xapp --quiet --eval \
     'for(let i=1;i<=12;i++){db["node"+i+"_experiences"].drop()}; db.getCollectionNames()'
 echo -e "${GREEN}  checkpoint / 經驗已清空${NC}"
@@ -84,8 +90,9 @@ REWARD_MODE="$REWARD_MODE" FL_MODE="$FL_MODE" MODEL_ARCH="$MODEL_ARCH" $DC --pro
 echo -e "${GREEN}==================================================${NC}"
 echo -e "${GREEN} Stage 2+ 服務已就緒（REWARD_MODE=${REWARD_MODE}, FL_MODE=${FL_MODE}, MODEL_ARCH=${MODEL_ARCH}）${NC}"
 echo -e "${GREEN}==================================================${NC}"
-echo -e "${YELLOW}下一步（量測前，務必先做，見 CLAUDE.md 第 3 節）：${NC}"
+echo -e "${YELLOW}下一步（2026-09-26 更新；量測前／訓練前務必先做，見 CLAUDE.md 第 3、6 節）：${NC}"
 echo "  1. bash scenarios/setup_iperf_servers.sh"
-echo "  2. 對全部 17 個 UE 做一次現場 ping 測試，確認 0% 封包遺失"
-echo "  3. python3 scenarios/traffic_scenario.py --scenario R --seed 20260914 --host {pc1,pc2,pc3} --phase-duration 60 --num-phases 15"
-echo "  4. python3 iab/measure_stage.py --host {pc1,pc2,pc3} --duration 900 --interval 5 --out /tmp/stage_{host}.csv"
+echo "  2. bash iab/precheck_measure.sh（EXPECT_XAPP=12；13/13 E2、RestartCount、17 UE ping、iperf3 server、S）"
+echo "  3. 訓練：三台各跑 training_scenario_driver.sh（PC2/PC3；同一個 --epoch），並在 PC1 跑 training_watchdog.sh"
+echo "     （PC1 沒有 UE，不需要驅動器）；訓練場景 = 隨機化兩狀態 T（TR）+ 新版 R，TCP/UDP 混合"
+echo "  4. 量測（訓練完成後）：OUT_DIR=<dir> bash iab/run_stage_measure.sh {tcp,udp} <tag> → python3 iab/analyze_stage.py <dir> <tag>"

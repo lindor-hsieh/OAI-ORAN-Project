@@ -21,8 +21,12 @@ drl_agent.py — DRL Actor-Critic Agent for Local PRB Allocation
     一律從零初始化的隱藏狀態開始（見 train_on_batch_gru()）。詳見 DRL_DESIGN.md。
 
 State Space (固定長度向量，不足補零)：
-  [norm_bsr_0, norm_cqi_0, norm_buf_0, norm_bsr_1, norm_cqi_1, norm_buf_1, ..., active_ratio, fairness_bias]
-  長度 = MAX_UE_COUNT * 3 + 2 = 50
+  [norm_bsr_0, norm_cqi_0, norm_buf_0, ..., active_ratio, fairness_bias, bh_ratio]
+  長度 = MAX_UE_COUNT * 3 + 3 = 51
+
+  bh_ratio（2026-09-26 加入，第 51 維）：Backhaul-aware 動態 PRB 預算的可用比例 ∈ [0,1]（DU 排程器實際可用 PRB
+  池 = 106 × 此值），由 E2SM-MAC 回報（mac_ind_msg_t.backhaul_prb_ratio）經 xApp 帶進來。動作是「每 UE PRB
+  上限」，池子大小決定上限是否綁得住，DRL 必須看到它。收到前預設 1.0（池子全開）。
 
   norm_buf（dl_buffer_info，真實 RLC 佇列位元組數）：norm_bsr（Δtbs）與
   norm_cqi（dl_mcs1）在 UE 沒有排隊資料時會同時凍結在舊值（OAI 排程器直接
@@ -66,6 +70,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+# 每個 process 只用 1 個 torch 執行緒（環境變數 TORCH_NUM_THREADS 可覆寫）。12 個 inference 容器 + 12 個 FL ClientApp
+# 都釘在同一組 4 個核心（cpuset 12-15），torch 預設用 8 個執行緒會嚴重超額訂閱，讓訓練持有模型鎖的時間
+# 與推論延遲暴增（5ms 逾時 → 退回 PF）。這個模型很小（2 層 MLP），單執行緒就夠。
+torch.set_num_threads(max(1, int(os.environ.get("TORCH_NUM_THREADS", "1"))))
+
 from reward_calculator import JFI_MIN, REWARD_MODE
 
 # =============================================================================
@@ -85,23 +94,64 @@ if MODEL_ARCH not in ("mlp", "gru"):
 # =============================================================================
 
 MAX_UE_COUNT: int = 16
-STATE_DIM: int = MAX_UE_COUNT * 3 + 2   # [bsr, cqi, buf] × N + active_ratio + fairness_bias
+STATE_DIM: int = MAX_UE_COUNT * 3 + 3   # [bsr, cqi, buf] × N + active_ratio + fairness_bias + bh_ratio
 
 # fairness_bias 正規化區間（Global xApp 廣播的原始值域），見 encode_state()
 FAIRNESS_BIAS_MIN: float = 0.5
 FAIRNESS_BIAS_MAX: float = 2.0
 
-MAX_BSR: float = 1_000_000.0            # DL delta-TBS 正規化上限 (bytes/100ms, ≈80 Mbps)
-                                         # C xApp rate limiter 每 10 個 MAC callback 才送一次 ZMQ，
-                                         # 測量窗口為 100ms，故上限 = 100,000 × 10 = 1,000,000
+MAX_BSR: float = 2_000_000.0            # DL delta-TBS 正規化上限 (bytes/1 秒視窗)：xApp 的 E2 回報週期是 100ms、每 10 次回報才送一次 ZMQ →
+                                         # 每筆狀態累積 ~1 秒（實測 MongoDB 文件間隔 1.00 秒）；S=0.4 下單 UE 峰值 ~2MB/視窗，實測 max ~1.46M
 MAX_BUF_INFO: float = 2_000_000.0       # dl_buffer_info（RLC 佇列位元組數）正規化上限
                                          # 現場實測（2026-07-09，Scenario R）：node3/5 最大值
                                          # 約 2,147,000，node4 約 124,000，上限抓 2,000,000 讓多數
                                          # 觀測值落在有解析度的區間，跟 reward_calculator.py 既有
                                          # 的 MAX_BSR=2,000,000 常數同量級，非巧合
-GAMMA: float = 0.95                      # 折扣因子
+GAMMA: float = 0.95                      # 折扣因子（僅 GRU 分支使用）
 
-LR_ACTOR: float = 1e-4
+# ── MLP 分支的信用分配設計（2026-09-26 重設計，方案 A；見 DRL_DESIGN.md 附註）──────────────
+# 動機：獎勵（Δtbs）的變動主要來自「外生的流量需求」而不是動作；不壅塞時每個 UE 的需求都被滿足，
+# 獎勵與 PRB 怎麼分無關。舊版對每個批次做 advantage z-score，會把「純雜訊」放大成單位尺度，
+# Actor 變成隨機遊走（一直無法收斂的原因之一）。改為：
+#   1. γ = 0（contextual bandit）：動作幾乎不影響下一步的流量，折扣只增加變異。
+#   2. advantage = clip((r − V(s)) / running_std(r), ±ADV_CLIP)：不做每批 z-score，用「獎勵的滾動標準差」
+#      當固定尺度；V(s) 由 Critic 從 state（含佇列、MCS、上一窗 Δtbs）預測，殘差才是動作＋雜訊。
+#   3. 只在「壅塞」樣本更新 Actor：某個活躍 UE 的 RLC 佇列（dl_buffer_info）≥ CONTENDED_BUF_BYTES
+#      （決策當下 s_t 或結果 s_{t+1}），代表需求超過供給、PRB 怎麼分才有差別。非壅塞樣本只訓練 Critic。
+GAMMA_MLP: float = float(os.getenv("DRL_GAMMA_MLP", "0.0"))
+ADV_CLIP: float = 3.0
+REWARD_STD_EMA: float = 0.1              # 獎勵滾動標準差的 EMA 權重（新批次 10%）
+REWARD_STD_FLOOR: float = 1e-3           # 滾動標準差下限，避免除以 ~0
+# 壅塞判斷門檻（RLC 佇列位元組數，單一 UE）。控制視窗是 ~1 秒，UE 穩態需求約 2~10 sim Mbps ≈ 100~500 kB/視窗（牆鐘，S=0.4）。
+# 訓練日誌的 contended 比例應約 35~45%（壅塞相位佔 ~45% 時間，另有少量正常相位誤判）；偏離很多時以環境變數調整。
+CONTENDED_BUF_BYTES: float = float(os.getenv("CONTENDED_BUF_BYTES", "100000"))   # 2026-09-26 依真實 1 秒視窗資料校準：門檻 100k 時正常相位誤判 13.7%、壅塞相位命中 65%（50k：24%/74%，200k：8.7%/54%）
+# 從 BSR 啟發式切換到 DRL 推論所需的最少訓練步數。舊版只要 train_steps>0（第一輪 10 步）就切換，此時 policy
+# 近乎隨機初始化，比啟發式還差、會汙染早期資料。預設 100 步（≈10 輪 ≈ 10 分鐘，FL 客戶端訓練也計入）。
+MIN_DRL_TRAIN_STEPS: int = int(os.getenv("DRL_MIN_TRAIN_STEPS", "100"))
+# 離策略校正（PPO 式比例裁剪，2026-09-26）：回放緩衝區涵蓋多個策略版本，用一般策略梯度訓練舊資料會有偏差。
+# 推論時把當時的 log π(a|s) 存進經驗（behavior_logp），訓練時比例 ρ=exp(logπ_新−logπ_舊)，目標 min(ρA, clip(ρ,1±ε)A)。
+# 沒有 behavior_logp 的經驗（BSR 啟發式階段、舊資料）只訓練 Critic，不更新 Actor。
+PPO_CLIP_EPS: float = float(os.getenv("DRL_PPO_CLIP_EPS", "0.2"))
+MIN_CONTENDED_SAMPLES: int = 8           # 一個 batch 內壅塞樣本少於這個數就跳過本步 Actor 更新（只更新 Critic）
+
+# Actor 學習率：預設 3e-4（環境變數 DRL_LR_ACTOR）。控制週期 1 秒 → 每節點每小時只有 ~3600 筆經驗、6 小時 ~21600 筆、
+# 每分鐘 10 步梯度更新（6 小時 ~3600 步）；合成實驗顯示 1e-4 要 ~1200 步才收斂、3e-4 只要 300~600 步，真實資料更吵，1e-4 有訓練不足風險。
+LR_ACTOR: float = float(os.getenv("DRL_LR_ACTOR", "3e-4"))
+
+# 動作 → 每 UE PRB 上限的對應方式（2026-09-27）。
+#   "split"（舊）：Dirichlet 樣本 s（總和 1）直接當份額，上限 = s×106，兩個 UE 就各被切成約一半——
+#                  「不截斷（= 原本的 PF）」不是可表達的動作，均分也會讓每個 UE 每個 slot 都被截斷（非 work-conserving）。
+#   "relative"（新，預設）：上限 = min(1, n_active × s)。均分（s=1/n）→ 所有 UE 上限 1.0 = 不截斷 = 原本的 PF，
+#                  策略只在「偏離均分」時才限制份額低於平均的 UE；PF 是策略空間內可達的恆等點，學不到東西時退化成 PF，
+#                  而不是比 PF 差。C 端 xApp 對每個 UE 獨立換算比例（>1 夾成 1、不檢查總和），不需要改 C 程式。
+CAP_MODE: str = os.getenv("DRL_CAP_MODE", "relative").strip().lower()
+
+# 2026-09-27：推論時是否用確定性輸出（policy 機率本身，不做 Dirichlet 採樣）。
+# 動機：Dirichlet 採樣噪音＋relative 上限的夾值（min(1, n·s)）在夾到 1 的那一側被浪費、
+# 在夾到下限的那一側直接扣掉吞吐量，是非對稱的——噪音本身就會拉低平均送達量，
+# 與 policy 是否收斂無關。訓練仍應保留隨機策略（探索、log π(a|s) 梯度都需要），
+# 只在凍結模型做評估/量測時開這個開關，不影響訓練邏輯。
+DETERMINISTIC: bool = os.getenv("DRL_DETERMINISTIC", "0").strip() not in ("0", "false", "False")
 LR_CRITIC: float = 3e-4
 HIDDEN_DIM: int = 128
 MIN_TRAIN_EXPERIENCES: int = 200         # 觸發第一次訓練所需的最少「原始經驗」數
@@ -331,6 +381,10 @@ class DRLAgent:
         # Lagrangian 限制式的乘子，見 LAMBDA_INIT/LAMBDA_LR/LAMBDA_MAX 說明
         self._lambda: float = LAMBDA_INIT
 
+        # 獎勵的滾動標準差（MLP 分支 advantage 的固定尺度，見 GAMMA_MLP 說明）；None=尚未初始化。
+        # 存進 checkpoint（見 save()/load()），重啟後不必重新估。
+        self._reward_std: Optional[float] = None
+
         # 推論時 Actor 的隱藏狀態，跨 infer() 呼叫持久化（見 reset_hidden()）。
         # 不存進 checkpoint——見 save()/load() 的說明。
         self._actor_hidden: Optional[torch.Tensor] = None
@@ -375,6 +429,7 @@ class DRLAgent:
         self,
         ues: list[dict],
         fairness_bias: float = 1.0,
+        bh_ratio: float = 1.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         將 UE 列表編碼為固定長度的 numpy 向量。
@@ -384,6 +439,7 @@ class DRLAgent:
             fairness_bias : Global xApp 廣播的全域公平性偏差，原始值域
                             [FAIRNESS_BIAS_MIN, FAIRNESS_BIAS_MAX]，尚未收到
                             廣播或無資料時傳中性值 1.0（預設值）。
+            bh_ratio      : Backhaul-aware 可用 PRB 比例 ∈ [0,1]（E2 回報），預設 1.0。
 
         回傳：
             state_vec : (STATE_DIM,)  float32
@@ -413,6 +469,8 @@ class DRLAgent:
             (clipped_bias - FAIRNESS_BIAS_MIN) / (FAIRNESS_BIAS_MAX - FAIRNESS_BIAS_MIN)
         )
 
+        state_vec[MAX_UE_COUNT * 3 + 2] = float(np.clip(bh_ratio, 0.0, 1.0))
+
         return state_vec, mask_vec
 
     def _to_tensors(
@@ -441,9 +499,10 @@ class DRLAgent:
         self,
         ues: list[dict],
         fairness_bias: float = 1.0,
-    ) -> tuple[list[dict], np.ndarray]:
+        bh_ratio: float = 1.0,
+    ) -> tuple[list[dict], np.ndarray, Optional[float]]:
         """
-        執行 DRL Actor 推論，回傳 PRB 分配結果與比例向量。
+        執行 DRL Actor 推論，回傳 (PRB 分配結果, 比例向量, 行為策略 log π(a|s))。
 
         Args:
             ues           : [{"rnti": int, "bsr": int, "wb_cqi": int}, ...]
@@ -452,12 +511,13 @@ class DRLAgent:
         Returns:
             allocations   : [{"rnti": int, "prb_abs": int}, ...]
             action_ratios : (MAX_UE_COUNT,) float32，用於 MongoDB 儲存
+            behavior_logp : 這次採樣動作在當時策略下的 log π(a|s)（存進經驗供 PPO 比例裁剪；n<2 時為 0）
         """
         if not ues:
-            return [], np.zeros(MAX_UE_COUNT, dtype=np.float32)
+            return [], np.zeros(MAX_UE_COUNT, dtype=np.float32), None
 
         n = min(len(ues), MAX_UE_COUNT)
-        state_vec, mask_vec = self.encode_state(ues, fairness_bias)
+        state_vec, mask_vec = self.encode_state(ues, fairness_bias, bh_ratio)
         state_t, mask_t = self._to_tensors(state_vec, mask_vec)
 
         self.actor.eval()
@@ -469,12 +529,38 @@ class DRLAgent:
             else:
                 probs = self.actor(state_t, mask_t)[0]      # (MAX_UE_COUNT,)，無隱藏狀態
 
-            # Dirichlet 隨機策略：從 Dirichlet(α = probs[:n] × K) 採樣
-            # 確保 action_ratios ≠ actor probs，訓練時 log π(a|s) 梯度有效
-            # K 隨訓練步數退火（見 _current_concentration()），訓練越久取樣越集中
-            alpha = torch.clamp(probs[:n] * self._current_concentration(), min=1e-3)
-            dist = torch.distributions.Dirichlet(alpha)
-            active_ratios = dist.sample().cpu().numpy()     # (n,)，加總恰好為 1
+            if DETERMINISTIC:
+                # 確定性輸出：直接用 policy 的機率當份額（= Dirichlet 期望值），不採樣、無噪音。
+                # 沒有採樣就沒有「行為策略」可言，behavior_logp 留 None（PPO 訓練端本來就會跳過缺
+                # behavior_logp 的經驗，只訓練 Critic；凍結評估時 TRAIN_ENABLED=0，這條路徑不影響訓練）。
+                p_c = torch.clamp(probs[:n], min=1e-6)
+                active_ratios = (p_c / p_c.sum()).cpu().numpy()
+                behavior_logp = None
+            else:
+                # Dirichlet 隨機策略：從 Dirichlet(α = probs[:n] × K) 採樣
+                # 確保 action_ratios ≠ actor probs，訓練時 log π(a|s) 梯度有效
+                # K 隨訓練步數退火（見 _current_concentration()），訓練越久取樣越集中
+                alpha = torch.clamp(probs[:n] * self._current_concentration(), min=1e-3)
+                dist = torch.distributions.Dirichlet(alpha)
+                sample_t = dist.sample()
+                active_ratios = sample_t.cpu().numpy()          # (n,)，加總恰好為 1
+                # 行為策略的 log π_舊(a|s)：與訓練端 _dirichlet_log_probs_and_entropy_flat() 相同的夾值＋重新正規化，
+                # 才能讓新舊 logπ 的比例只反映「策略差異」而不是夾值差異
+                a_c = torch.clamp(sample_t, min=1e-6)
+                behavior_logp = float(dist.log_prob(a_c / a_c.sum()).item()) if n >= 2 else 0.0
+
+        if CAP_MODE == "relative" and n >= 2:
+            # 上限 = min(1, n·s)：均分 = 不截斷（PF）；只限制份額低於平均的 UE。每 UE 至少 MIN_PRB。
+            MIN_PRB_REL = 5
+            caps = np.minimum(1.0, n * active_ratios)
+            prb_ints = np.clip(np.rint(caps * self.total_prb), MIN_PRB_REL, self.total_prb).astype(np.int32)
+            allocations = [
+                {"rnti": int(ues[i]["rnti"]), "prb_abs": int(prb_ints[i])}
+                for i in range(n)
+            ]
+            action_ratios = np.zeros(MAX_UE_COUNT, dtype=np.float32)
+            action_ratios[:n] = active_ratios              # 訓練用的動作仍是 Dirichlet 樣本 s（PPO 的 logπ 不變）
+            return allocations, action_ratios, behavior_logp
 
         # 轉換為整數 PRB，修正捨入誤差
         prb_floats = active_ratios * self.total_prb
@@ -510,7 +596,7 @@ class DRLAgent:
         action_ratios = np.zeros(MAX_UE_COUNT, dtype=np.float32)
         action_ratios[:n] = active_ratios
 
-        return allocations, action_ratios
+        return allocations, action_ratios, behavior_logp
 
     # -------------------------------------------------------------------------
     # 離線訓練 — 公開介面（依 self.arch 分派給 MLP 或 GRU 分支）
@@ -567,6 +653,81 @@ class DRLAgent:
         next_masks = torch.tensor(
             np.array([e["next_mask_vec"] for e in batch], dtype=bool), device=self.device)
         return states, masks, actions, rewards, next_states, next_masks
+
+    @staticmethod
+    def _max_queue_bytes(states: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+        """
+        由 state 向量還原每個樣本「活躍 UE 中最大的 RLC 佇列位元組數」，形狀 (batch,)。
+        state 的第 3i+2 維是 log1p(buf)/log1p(MAX_BUF_INFO)，反轉即得 bytes；非活躍 slot 以 mask 排除。
+        """
+        norm_buf = states[:, 2:MAX_UE_COUNT * 3:3]                       # (batch, MAX_UE_COUNT)
+        buf_bytes = torch.expm1(norm_buf * math.log1p(MAX_BUF_INFO))
+        buf_bytes = buf_bytes.masked_fill(~masks, 0.0)
+        return buf_bytes.max(dim=1).values
+
+    def _contended_mask(
+        self,
+        states: torch.Tensor, masks: torch.Tensor,
+        next_states: torch.Tensor, next_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        壅塞樣本遮罩 (batch,)：決策當下或結果狀態任一活躍 UE 的 RLC 佇列 ≥ CONTENDED_BUF_BYTES，
+        **且決策當下至少有 2 個活躍 UE**——只有 1 個 UE 時 Dirichlet 只有一維、log_prob 恆為 0、梯度為 0，
+        沒有任何分配決策可學，不能算成「可更新 Actor 的樣本」。
+        """
+        q = torch.maximum(self._max_queue_bytes(states, masks),
+                          self._max_queue_bytes(next_states, next_masks))
+        return (q >= CONTENDED_BUF_BYTES) & (masks.sum(dim=1) >= 2)
+
+    def count_contended(self, experiences: list[dict]) -> int:
+        """
+        數一批經驗中「可更新 Actor 的壅塞樣本」有幾筆（同 _contended_mask 的定義）。供 FL 客戶端回報
+        num-examples 用：FedAvg 應該用「對 Actor 有貢獻的樣本數」加權，沒壅塞的節點 Actor 沒被更新，
+        不該用全部樣本數（緩衝區滿了之後每個節點都約 10000 筆）把有學到的節點稀釋掉。
+        """
+        exps = self._filter_valid_experiences(experiences)
+        if not exps:
+            return 0
+        states, masks, _, _, next_states, next_masks = self._build_experience_tensors(exps)
+        _, has_old = self._behavior_logp_tensors(exps)
+        return int((self._contended_mask(states, masks, next_states, next_masks) & has_old).sum().item())
+
+    def _advantages_mlp(
+        self, rewards: torch.Tensor, current_values: torch.Tensor, next_values: torch.Tensor,
+        update_std: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        MLP 分支的 advantage：clip((target − V(s)) / running_std(r), ±ADV_CLIP)，不做每批 z-score。
+        Returns: (advantages, targets)。update_std=True（訓練）時才更新獎勵滾動標準差。
+        """
+        targets = rewards + GAMMA_MLP * next_values
+        if update_std:
+            batch_std = float(rewards.std().item()) if rewards.numel() > 1 else 0.0
+            if self._reward_std is None:
+                self._reward_std = batch_std
+            else:
+                self._reward_std = (1.0 - REWARD_STD_EMA) * self._reward_std + REWARD_STD_EMA * batch_std
+        scale = max(self._reward_std if self._reward_std is not None else 0.0, REWARD_STD_FLOOR)
+        adv = torch.clamp((targets - current_values).detach() / scale, -ADV_CLIP, ADV_CLIP)
+        return adv, targets
+
+    def _behavior_logp_tensors(self, batch: list[dict]) -> tuple[torch.Tensor, torch.Tensor]:
+        """取出批次的行為策略 log π_舊(a|s)（(batch,)）與「是否有這個欄位」遮罩。缺欄位者填 0、遮罩 False。"""
+        vals = [e.get("behavior_logp") for e in batch]
+        has = torch.tensor([v is not None for v in vals], dtype=torch.bool, device=self.device)
+        old = torch.tensor([float(v) if v is not None else 0.0 for v in vals], dtype=torch.float32, device=self.device)
+        return old, has
+
+    @staticmethod
+    def _ppo_actor_loss(
+        log_new: torch.Tensor, log_old: torch.Tensor, adv: torch.Tensor, mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, float]:
+        """PPO 裁剪目標（只在 mask 內）：-mean(min(ρA, clip(ρ,1-ε,1+ε)A))。回傳 (loss, 被裁剪的樣本比例)。"""
+        ratio = torch.exp(torch.clamp(log_new - log_old, -20.0, 20.0))[mask]
+        a = adv[mask]
+        surr = torch.minimum(ratio * a, torch.clamp(ratio, 1.0 - PPO_CLIP_EPS, 1.0 + PPO_CLIP_EPS) * a)
+        clipped = ((ratio < 1.0 - PPO_CLIP_EPS) | (ratio > 1.0 + PPO_CLIP_EPS)).float().mean().item()
+        return -surr.mean(), float(clipped)
 
     def _dirichlet_log_probs_and_entropy_flat(
         self,
@@ -639,15 +800,12 @@ class DRLAgent:
 
         states, masks, actions, rewards, next_states, next_masks = self._build_experience_tensors(batch)
 
-        # ── Critic 更新 (最小化 TD 誤差) ──────────────────────────────────
+        # ── Critic 更新（γ=GAMMA_MLP，預設 0 → 回歸 V(s)≈E[r|s]；全部樣本都訓練）─────────────
         self.critic.train()
         current_values = self.critic(states)
         with torch.no_grad():
             next_values = self.critic(next_states)
-            targets = rewards + GAMMA * next_values
-            advantages = (targets - current_values).detach()
-            if advantages.std() > 1e-8:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages, targets = self._advantages_mlp(rewards, current_values, next_values, update_std=True)
 
         critic_loss = F.mse_loss(current_values, targets)
 
@@ -656,46 +814,68 @@ class DRLAgent:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_opt.step()
 
-        # ── Actor 更新 (Dirichlet Policy Gradient) ────────────────────────
-        self.actor.train()
-        probs = self.actor(states, masks)
-        log_probs_t, entropy_t = self._dirichlet_log_probs_and_entropy_flat(probs, masks, actions)
+        # ── Actor 更新（Dirichlet Policy Gradient，只用「壅塞」樣本）────────────────────
+        contended = self._contended_mask(states, masks, next_states, next_masks)
+        old_logp, has_old = self._behavior_logp_tensors(batch)
+        actor_mask = contended & has_old     # 只有「壅塞」且「有行為策略 logπ」的樣本能更新 Actor
+        n_contended = int(contended.sum().item())
+        n_actor = int(actor_mask.sum().item())
+        contended_frac = n_contended / len(batch)
 
-        actor_loss = -(advantages * log_probs_t).mean()
-        entropy_coeff = max(
-            ENTROPY_COEFF_MIN, ENTROPY_COEFF_INIT * (ENTROPY_DECAY_RATE ** self._train_steps)
-        )
-        current_entropy = float(entropy_t.mean())
-        if current_entropy < -5.0:
-            entropy_coeff = max(entropy_coeff, 0.1 * abs(current_entropy) / 5.0)
+        actor_loss_val = 0.0
+        entropy_val = 0.0
+        actor_updated = False
+        clip_frac = 0.0
+        if n_actor >= MIN_CONTENDED_SAMPLES:
+            self.actor.train()
+            probs = self.actor(states, masks)
+            log_probs_t, entropy_t = self._dirichlet_log_probs_and_entropy_flat(probs, masks, actions)
 
-        actor_loss = actor_loss - entropy_coeff * entropy_t.mean()
+            actor_loss, clip_frac = self._ppo_actor_loss(log_probs_t, old_logp, advantages, actor_mask)
+            entropy_coeff = max(
+                ENTROPY_COEFF_MIN, ENTROPY_COEFF_INIT * (ENTROPY_DECAY_RATE ** self._train_steps)
+            )
+            current_entropy = float(entropy_t[actor_mask].mean().detach())
+            if current_entropy < -5.0:
+                entropy_coeff = max(entropy_coeff, 0.1 * abs(current_entropy) / 5.0)
 
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-        self.actor_opt.step()
+            actor_loss = actor_loss - entropy_coeff * entropy_t[actor_mask].mean()
+
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+            self.actor_opt.step()
+            actor_updated = True
+            actor_loss_val = float(actor_loss.item())
+            entropy_val = current_entropy
 
         self._train_steps += 1
         self._is_trained = True
 
         metrics = {
             "train_step":  self._train_steps,
-            "actor_loss":  float(actor_loss.item()),
+            "actor_loss":  actor_loss_val,
             "critic_loss": float(critic_loss.item()),
-            "entropy":     float(entropy_t.mean().item()),
+            "entropy":     entropy_val,
             "mean_reward": float(rewards.mean().item()),
             "mean_adv":    float(advantages.mean().item()),
             "lambda":      self._lambda,
             "batch_jfi_mean": batch_jfi_mean,
             "n_experiences": len(batch),
+            "contended_frac": contended_frac,
+            "n_actor_samples": n_actor,
+            "ppo_clip_frac": clip_frac,
+            "actor_updated": actor_updated,
+            "reward_std":  float(self._reward_std) if self._reward_std is not None else 0.0,
         }
         self._log.info(
-            "[訓練][MLP] step=%d actor_loss=%.4f critic_loss=%.4f "
-            "entropy=%.4f mean_reward=%.4f lambda=%.4f batch_jfi=%s n=%d",
+            "[訓練][MLP] step=%d actor_loss=%.4f critic_loss=%.5f entropy=%.4f mean_reward=%.4f "
+            "contended=%.0f%%(%s,n_actor=%d,clip=%.0f%%) reward_std=%.4f lambda=%.4f batch_jfi=%s n=%d",
             self._train_steps,
             metrics["actor_loss"], metrics["critic_loss"], metrics["entropy"],
-            metrics["mean_reward"], self._lambda,
+            metrics["mean_reward"], 100.0 * contended_frac,
+            "Actor更新" if actor_updated else "Actor跳過", n_actor, 100.0 * clip_frac,
+            metrics["reward_std"], self._lambda,
             f"{batch_jfi_mean:.4f}" if batch_jfi_mean is not None else "N/A",
             len(batch),
         )
@@ -709,28 +889,33 @@ class DRLAgent:
 
         idxs = np.random.choice(len(experiences), TRAIN_BATCH_SIZE, replace=False)
         batch = [experiences[i] for i in idxs]
-        states, masks, actions, rewards, next_states, _ = self._build_experience_tensors(batch)
+        states, masks, actions, rewards, next_states, next_masks = self._build_experience_tensors(batch)
 
         self.actor.eval()
         self.critic.eval()
         with torch.no_grad():
             current_values = self.critic(states)
             next_values = self.critic(next_states)
-            targets = rewards + GAMMA * next_values
-            advantages = targets - current_values
-            if advantages.std() > 1e-8:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            advantages, targets = self._advantages_mlp(rewards, current_values, next_values, update_std=False)
 
             test_critic_loss = F.mse_loss(current_values, targets)
 
             probs = self.actor(states, masks)
             log_probs_t, entropy_t = self._dirichlet_log_probs_and_entropy_flat(probs, masks, actions)
-            test_actor_loss = -(advantages * log_probs_t).mean()
+            contended = self._contended_mask(states, masks, next_states, next_masks)
+            old_logp, has_old = self._behavior_logp_tensors(batch)
+            am = contended & has_old
+            if int(am.sum().item()) > 0:
+                test_actor_loss, _ = self._ppo_actor_loss(log_probs_t, old_logp, advantages, am)
+                test_entropy = entropy_t[am].mean()
+            else:
+                test_actor_loss = torch.tensor(0.0)
+                test_entropy = entropy_t.mean()
 
         return {
             "test_actor_loss":  float(test_actor_loss.item()),
             "test_critic_loss": float(test_critic_loss.item()),
-            "test_entropy":     float(entropy_t.mean().item()),
+            "test_entropy":     float(test_entropy.item()),
             "test_mean_reward": float(rewards.mean().item()),
         }
 
@@ -1033,8 +1218,8 @@ class DRLAgent:
 
     @property
     def is_trained(self) -> bool:
-        """是否已完成至少一次訓練，可切換至 DRL 推論模式。"""
-        return self._is_trained
+        """是否已訓練足夠步數（>= MIN_DRL_TRAIN_STEPS），可從 BSR 啟發式切換至 DRL 推論模式。"""
+        return self._is_trained and self._train_steps >= MIN_DRL_TRAIN_STEPS
 
     # -------------------------------------------------------------------------
     # 模型持久化
@@ -1064,6 +1249,7 @@ class DRLAgent:
                 "critic_opt":  self.critic_opt.state_dict(),
                 "train_steps": self._train_steps,
                 "lambda":      self._lambda,
+                "reward_std":  self._reward_std,
             },
             tmp_path,
         )
@@ -1109,6 +1295,7 @@ class DRLAgent:
             self._is_trained  = self._train_steps > 0
             # 舊 checkpoint（Lagrangian 上線前存的）沒有 lambda 欄位，優雅降級為初始值
             self._lambda = ckpt.get("lambda", LAMBDA_INIT)
+            self._reward_std = ckpt.get("reward_std", None)   # 舊 checkpoint 沒有此欄位 → 重新估
             self.reset_hidden()
             self._log.info(
                 "模型已從 %s 載入 (arch=%s, 訓練步數: %d, lambda=%.4f)",

@@ -1,0 +1,152 @@
+===== finish.log =====
+[finish 2026-09-27 03:39:27] 訓練時間到（6 小時），開始收尾
+watchdog 已停
+驅動器/場景已停（pc2,pc3）
+1449f83f51ce
+9f99e528cdcd
+69bad7e1784b
+de0fd122ca16
+0a417961138b
+d28a192e47e6
+9c170fc13833
+f69134125192
+2b95a4cac008
+ce82f5da40eb
+63e361f912a7
+e413bf02c274
+9e0a41dd6107
+e94eee9ce1f7
+cea5e2a26d05
+4d964e42a5e1
+2b9fec4a6147
+7768651a2ad2
+f0c25005bd57
+7f6ed4bcd9cc
+0ed99d8ce343
+1579facdac08
+2db05b43d620
+51927e67cc1a
+8086f3f13b1b
+26586528629d
+c7962b5a4c97
+7076ddb94d27
+ba635b377a81
+0fcfb5e8454a
+d452d573fe55
+cd609957bc86
+8c7c4462853b
+54faaa6fb0be
+cc007017fea5
+d5731e003134
+e81ad64a88b4
+8f6bec7e8752
+34c4379255ae
+xApp / inference / FL / Global xApp 已停止（模型已凍結，volume 保留）
+[finish 2026-09-27 03:40:10] 完成。RAN 與 CN 仍在運行；FINAL checkpoint 在 /home/lindor/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/experiment_results/checkpoints_archive/stage2_avgfl_tcp_20260926/FINAL_*
+
+===== checkpoint 目錄 =====
+total 108
+drwxrwxr-x 21 lindor lindor  4096 Sep 27 03:40 .
+drwxrwxr-x  3 lindor lindor  4096 Sep 26 21:14 ..
+drwxrwxr-x  2 lindor lindor  4096 Sep 26 21:59 ckpt_01_2159
+drwxrwxr-x  2 lindor lindor  4096 Sep 26 22:19 ckpt_02_2219
+drwxrwxr-x  2 lindor lindor  4096 Sep 26 22:39 ckpt_03_2239
+drwxrwxr-x  2 lindor lindor  4096 Sep 26 22:59 ckpt_04_2259
+drwxrwxr-x  2 lindor lindor  4096 Sep 26 23:19 ckpt_05_2319
+drwxrwxr-x  2 lindor lindor  4096 Sep 26 23:39 ckpt_06_2339
+drwxrwxr-x  2 lindor lindor  4096 Sep 26 23:59 ckpt_07_2359
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 00:19 ckpt_08_0019
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 00:39 ckpt_09_0039
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 00:59 ckpt_10_0059
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 01:19 ckpt_11_0119
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 01:39 ckpt_12_0139
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 01:59 ckpt_13_0159
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 02:19 ckpt_14_0219
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 02:39 ckpt_15_0239
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 02:59 ckpt_16_0259
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 03:20 ckpt_17_0320
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 03:40 ckpt_18_0340
+drwxrwxr-x  2 lindor lindor  4096 Sep 27 03:39 FINAL_0339
+-rw-rw-r--  1 lindor lindor 18445 Sep 27 03:40 index.log
+
+FINAL 目錄：/home/lindor/openairinterface5g/ci-scripts/yaml_files/5g_rfsimulator/experiment_results/checkpoints_archive/stage2_avgfl_tcp_20260926/FINAL_0339；模型檔數：12/12
+
+===== index.log（最後 30 行；含各節點 train_steps） =====
+node9  train_steps=4100   reward_std=0.06734 arch=mlp lambda=0.0 size=497765B
+node10 train_steps=4090   reward_std=0.06269 arch=mlp lambda=0.0 size=497819B
+node11 train_steps=4030   reward_std=0.07273 arch=mlp lambda=0.0 size=497819B
+node12 train_steps=4110   reward_std=0.07353 arch=mlp lambda=0.0 size=497819B
+== FINAL_0339 2026-09-27 03:39:58
+node1  train_steps=4420   reward_std=0.08945 arch=mlp lambda=0.0 size=497765B
+node2  train_steps=4450   reward_std=0.10171 arch=mlp lambda=0.0 size=497765B
+node3  train_steps=4430   reward_std=0.10856 arch=mlp lambda=0.0 size=497765B
+node4  train_steps=4390   reward_std=0.07433 arch=mlp lambda=0.0 size=497765B
+node5  train_steps=4340   reward_std=0.06101 arch=mlp lambda=0.0 size=497765B
+node6  train_steps=4400   reward_std=0.06591 arch=mlp lambda=0.0 size=497765B
+node7  train_steps=4380   reward_std=0.06107 arch=mlp lambda=0.0 size=497765B
+node8  train_steps=4350   reward_std=0.06732 arch=mlp lambda=0.0 size=497765B
+node9  train_steps=4370   reward_std=0.06745 arch=mlp lambda=0.0 size=497765B
+node10 train_steps=4360   reward_std=0.06487 arch=mlp lambda=0.0 size=497819B
+node11 train_steps=4300   reward_std=0.07547 arch=mlp lambda=0.0 size=497819B
+node12 train_steps=4370   reward_std=0.06721 arch=mlp lambda=0.0 size=497819B
+== ckpt_18_0340 2026-09-27 03:40:03
+node1  train_steps=4420   reward_std=0.08945 arch=mlp lambda=0.0 size=497765B
+node2  train_steps=4450   reward_std=0.10171 arch=mlp lambda=0.0 size=497765B
+node3  train_steps=4440   reward_std=0.10834 arch=mlp lambda=0.0 size=497765B
+node4  train_steps=4390   reward_std=0.07433 arch=mlp lambda=0.0 size=497765B
+node5  train_steps=4340   reward_std=0.06101 arch=mlp lambda=0.0 size=497765B
+node6  train_steps=4400   reward_std=0.06591 arch=mlp lambda=0.0 size=497765B
+node7  train_steps=4380   reward_std=0.06107 arch=mlp lambda=0.0 size=497765B
+node8  train_steps=4350   reward_std=0.06732 arch=mlp lambda=0.0 size=497765B
+node9  train_steps=4370   reward_std=0.06745 arch=mlp lambda=0.0 size=497765B
+node10 train_steps=4360   reward_std=0.06487 arch=mlp lambda=0.0 size=497819B
+node11 train_steps=4300   reward_std=0.07547 arch=mlp lambda=0.0 size=497819B
+node12 train_steps=4380   reward_std=0.06682 arch=mlp lambda=0.0 size=497819B
+
+===== watchdog 統計 =====
+確認崩潰(整套重啟觸發)=4  完整重啟成功=3  UE重啟偵測=3  UE就地修復完成=3  UE修復失敗=0
+--- watchdog 事件（去重前 60 行） ---
+[watchdog 2026-09-26 21:39:26] 開始監控（每 60s 輪詢一次，疑似崩潰後等 90s 二次確認，冷卻窗 600s）
+[watchdog 2026-09-26 21:55:06] ⚠ 疑似崩潰訊號：ran_container_restarted(0->1)，等待 90s 二次確認...
+[watchdog 2026-09-26 21:56:38] ⚠ 確認崩潰（ran_container_restarted(0->1)），開始完整重啟...
+[watchdog 2026-09-26 22:05:40] ✓ ===== 完整重啟成功（累計第 1 次），基準已重設 =====
+[watchdog 2026-09-26 22:12:26] ⚠ 疑似崩潰訊號：ran_container_restarted(0->1)，等待 90s 二次確認...
+[watchdog 2026-09-26 22:13:57] ✗ 確認崩潰（ran_container_restarted(0->1)），但距離上次重啟只有 497s（< 冷卻窗 600s）——
+[watchdog 2026-09-26 22:13:57] ✗ 代表恢復沒有生效，不再自動重試。停止 watchdog 與場景驅動器，需要人工介入。
+[watchdog 2026-09-26 22:15:05] 開始監控（每 60s 輪詢一次，疑似崩潰後等 90s 二次確認，冷卻窗 600s）
+[watchdog 2026-09-26 22:22:24] ⚠ 疑似崩潰訊號：ran_container_restarted(1->2)，等待 90s 二次確認...
+[watchdog 2026-09-26 22:23:55] ⚠ 確認崩潰（ran_container_restarted(1->2)），開始完整重啟...
+[watchdog 2026-09-26 22:32:48] ✓ ===== 完整重啟成功（累計第 1 次），基準已重設 =====
+[watchdog 2026-09-26 22:34:33] 開始監控（每 60s 輪詢一次，疑似崩潰後等 90s 二次確認，冷卻窗 600s）
+[watchdog 2026-09-26 23:00:34] ⚠ 偵測到 UE 容器重啟： 8 —— 就地修復（重新斷言預設路由＋驗證連通），不做整套重啟
+[watchdog 2026-09-26 23:00:51] ✓ UE8 就地修復完成（ping ext-dn 0% 遺失）
+[watchdog 2026-09-26 23:06:26] 開始監控（每 60s 輪詢一次，疑似崩潰後等 90s 二次確認，冷卻窗 600s）
+[watchdog 2026-09-26 23:36:25] 開始監控（每 60s 輪詢一次，疑似崩潰後等 90s 二次確認，冷卻窗 600s）
+[watchdog 2026-09-27 01:29:51] ⚠ 偵測到 UE 容器重啟： 10 —— 就地修復（重新斷言預設路由＋驗證連通），不做整套重啟
+[watchdog 2026-09-27 01:30:10] ✓ UE10 就地修復完成（ping ext-dn 0% 遺失）
+[watchdog 2026-09-27 01:37:19] ⚠ 疑似崩潰訊號：restart_count_regression(flexric:0->1)，等待 90s 二次確認...
+[watchdog 2026-09-27 01:38:51] ⚠ 確認崩潰（restart_count_regression(flexric:0->1)），開始完整重啟...
+[watchdog 2026-09-27 01:47:46] ✓ ===== 完整重啟成功（累計第 1 次），基準已重設 =====
+[watchdog 2026-09-27 02:21:23] ⚠ 偵測到 UE 容器重啟： 15 —— 就地修復（重新斷言預設路由＋驗證連通），不做整套重啟
+[watchdog 2026-09-27 02:21:41] ✓ UE15 就地修復完成（ping ext-dn 0% 遺失）
+
+===== MongoDB 各節點經驗筆數 =====
+node1=19563 node2=19769 node3=19587 node4=19441 node5=20079 node6=20100 node7=19931 node8=19968 node9=20000 node10=19981 node11=19988 node12=19996
+
+===== 收斂檢查（check_convergence_mongo.py，最近 360 分鐘） =====
+Node  狀態        最新區間 reward       區間數     樣本數       原因
+----------------------------------------------------------------------------------------------------
+Node1    疑似收斂      0.2688            70      19234     reward 已打平（視窗內變化量佔平均值 4%）
+Node2    仍在變動      0.2495            70      19431     reward 仍有趨勢（視窗內變化量佔平均值 19%）
+Node3    仍在變動      0.2106            70      19242     reward 仍有趨勢（視窗內變化量佔平均值 39%）
+Node4    仍在變動      0.2245            70      19092     reward 仍有趨勢（視窗內變化量佔平均值 25%）
+Node5    疑似收斂      0.0837            70      19707     reward 已打平（視窗內變化量佔平均值 3%）
+Node6    疑似收斂      0.1309            70      19728     reward 已打平（視窗內變化量佔平均值 4%）
+Node7    仍在變動      0.1330            70      19512     reward 仍有趨勢（視窗內變化量佔平均值 36%）
+Node8    疑似收斂      0.1079            70      19415     reward 已打平（視窗內變化量佔平均值 12%）
+Node9    仍在變動      0.1418            70      19614     reward 仍有趨勢（視窗內變化量佔平均值 38%）
+Node10   仍在變動      0.0622            70      19490     reward 仍有趨勢（視窗內變化量佔平均值 29%）
+Node11   仍在變動      0.0852            70      19596     reward 仍有趨勢（視窗內變化量佔平均值 42%）
+Node12   疑似收斂      0.1584            70      19572     reward 已打平（視窗內變化量佔平均值 4%）
+
+[提示] 還有節點未達「疑似收斂」，建議之後再跑一次本腳本追蹤趨勢。

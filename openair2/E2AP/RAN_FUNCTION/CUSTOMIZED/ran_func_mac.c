@@ -53,6 +53,10 @@ bool read_mac_sm(void* data)
   gNB_MAC_INST *nrmac = RC.nrmac[mod_id];
   NR_UEs_t *UE_info = &nrmac->UE_info;
 
+  // Backhaul-aware 動態 PRB 預算的可用比例（節點級；DU 排程器實際可用 PRB 池 = 106 × 此值，
+  // 見 gNB_scheduler_dlsch.c 的 backhaul_prb_ratio）。放在 UE 數量檢查之前，沒有 UE 時也照常填寫。
+  mac->msg.backhaul_prb_ratio = atomic_load_explicit(&nrmac->backhaul_prb_ratio, memory_order_relaxed);
+
   // -------------------------------------------------------------
   // [Fix 2] 放棄 UE_iterator 巨集，改用暴力陣列遍歷
   // -------------------------------------------------------------

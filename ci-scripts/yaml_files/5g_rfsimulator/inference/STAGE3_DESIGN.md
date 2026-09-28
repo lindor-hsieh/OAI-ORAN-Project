@@ -1,20 +1,23 @@
 # Stage 3 詳細設計文件（Local xApp + Local rApp + Global xApp + Global rApp）
 
 > **文件定位**：本檔案整合 Stage 3（`REWARD_MODE=throughput_only`、`MODEL_ARCH=mlp`、`FL_MODE=cluster`）
-> 四個元件的現行設計與完整數學公式，以程式碼現況（2026-09-28，`server_app.py` 的 ESS 收縮修正已上線、
-> 2026-09-27/28 兩輪訓練與量測已完成）為準。格式比照 `STAGE2_DESIGN.md`。除錯過程與歷史沿革見
-> `STAGE3_CLUSTER_FL_DESIGN.md`（Global rApp 聚合演算法的推導過程與離線驗證）、`DRL_DESIGN.md`
-> （Local xApp/rApp 的 GRU／Lagrangian 分支）與 `HISTORY.md`；本檔案只保留現在式的架構事實與公式，
-> 不重複踩坑敘事。拓樸、IP/ID 對照見 `CLAUDE.md` 第 1 節。
+> 四個元件的現行設計與完整數學公式，以程式碼現況（2026-09-28，`server_app.py` 的 ESS 收縮修正已上線）
+> 為準。格式比照 `STAGE2_DESIGN.md`。除錯過程與歷史沿革見 `STAGE3_CLUSTER_FL_DESIGN.md`（Global rApp
+> 聚合演算法的推導過程與離線驗證）、`DRL_DESIGN.md`（Local xApp/rApp 的 GRU／Lagrangian 分支）與
+> `HISTORY.md`；本檔案只保留現在式的架構事實與公式，不重複踩坑敘事。拓樸、IP/ID 對照見 `CLAUDE.md`
+> 第 1 節。
+>
+> **硬性規則**：Stage 2→3→4 之間 Local xApp（`xapp_nodeN.c`）與 Local rApp（`drl_agent.py`／
+> `reward_calculator.py`／`training_pipeline.py`／`inference_server.py`）必須逐行完全相同，只有
+> Global xApp／Global rApp（`server_app.py`／`client_app.py`）的聚合演算法可以不同——這是單變數
+> 控制的實驗設計，任何時候都不能為了修正某個 stage 的表現而改動 Local 端程式碼（2026-09-28 曾經
+> 短暫違反這條規則，已撤銷，過程見 `HISTORY.md`）。
 >
 > **Stage 3 與 Stage 2 唯一的差異點**：Global rApp 的聚合演算法（`server_app.py::IABClusterFedAvg`，
-> `FL_MODE=cluster`）。**Local xApp（`xapp_nodeN.c`）、Local rApp（`drl_agent.py`／`reward_calculator.py`／
-> `training_pipeline.py`／`inference_server.py`）、Global xApp（`global_xapp.py`）三個元件的原始碼
-> 逐行核對後確認與 Stage 2 完全相同**（`grep -rn "FL_MODE\|cluster" inference/drl_agent.py
-> inference/inference_server.py inference/reward_calculator.py inference/training_pipeline.py
-> inference/global_xapp.py` 全部零命中；`xapp_node1.c`／`xapp_node4.c` 亦無 Stage 3 專屬邏輯），
-> 下面第 1~3 節據此逐一重列（非「同 Stage 2，故省略」，而是重新核對程式碼後確認内容一致才寫入）。
-> **第 4 節（Global rApp）與第 5 節（分群優勢尚未發揮的診斷）才是本檔案的實質新內容。**
+> `FL_MODE=cluster`）。**Local xApp、Local rApp、Global xApp（`global_xapp.py`）三個元件的原始碼
+> 逐行核對後確認與 Stage 2 完全相同**，下面第 1~3 節據此逐一重列（非「同 Stage 2，故省略」，而是
+> 重新核對程式碼後確認内容一致才寫入）。**第 4 節（Global rApp）與第 5 節（分群優勢尚未發揮的診斷）
+> 才是本檔案的實質新內容。**
 
 ---
 
@@ -174,10 +177,14 @@ $$A(s,a) = \text{clip}\!\left(\frac{r - V(s)}{\max(\hat{\sigma}_r,\ 10^{-3})},\ 
 
 $$\text{contended}(s,s') = \Big(\max_i q_i(s) \geq \tau\ \lor\ \max_i q_i(s') \geq \tau\Big)\ \land\ (n_{active}(s)\geq 2)$$
 
-$\tau = 100{,}000$ bytes（`CONTENDED_BUF_BYTES`）；batch 內壅塞樣本 $n_{actor} < 8$
-（`MIN_CONTENDED_SAMPLES`）時整批跳過 Actor 更新。**這個門檻是 Stage 3 分群設計成敗的關鍵前提**
-——見第 5 節：relay 節點（Node1~3）的 MT 通道從不被場景惡化，`max_i q_i` 幾乎恆低於 $\tau$，導致
-這三個節點結構性幾乎產生不出可訓練 Actor 的樣本。
+$\tau = 100{,}000$ bytes（`CONTENDED_BUF_BYTES`，Stage 2/3 全部 12 個節點共用同一個門檻）；batch 內
+壅塞樣本 $n_{actor} < 8$（`MIN_CONTENDED_SAMPLES`）時整批跳過 Actor 更新。**這個門檻是 Stage 3 分群
+設計成敗的關鍵前提**——見第 5 節：relay 節點（Node1~3）的 MT 通道從不被場景惡化，`max_i q_i` 幾乎
+恆低於 $\tau$，導致這三個節點結構性幾乎產生不出可訓練 Actor 的樣本（2026-09-27 訓練資料證實：
+Node1~3 的 $q$ 值 p99 僅 25k~33k bytes，遠低於 $\tau$）。**2026-09-28 曾嘗試給 relay 節點設定獨立的
+較低門檻，但這違反了 Stage 2/3 Local rApp 必須逐行相同的硬性規則，已撤銷**——這個門檻與其造成的
+relay 訓練訊號不足問題，只能透過 Global 端（聚合演算法）或訓練場景（讓 relay MT 通道真的被惡化）
+解決，見第 5.4 節；過程見 `HISTORY.md`。
 
 **(d) 離策略校正（PPO 式比例裁剪）**：
 
@@ -435,6 +442,16 @@ relay 節點（Node1~3）結構性幾乎不產生壅塞樣本（$n_i\approx0$）
 - **診斷驗證**：若要在不改動場景或門檻的前提下確認分群機制「有沒有用」，可以做一次 Stage 3 vs
   一個「假想的 Stage 2.5」（即 Stage 3 訓練資料、但廣播時故意換回 Stage 2 的 `IABFedAvg` 邏輯）的
   逐節點吞吐量 A/B 對照，直接驗證 Node4 的差異化權重是否真的比它在標準 FedAvg 下的權重表現更好。
+
+### 5.5 §5.4「較保守」方案曾短暫實作、已撤銷（2026-09-28）
+
+2026-09-28 曾實作 §5.4「較保守」方案（relay 專用壅塞門檻 `DRL_CONTENDED_BUF_BYTES_RELAY=3000`），
+訓練期間證實 relay 節點確實開始產生可訓練 Actor 樣本（contended 比例從 ~0% 回升到 16~55%），但
+量測結果對照 Stage 3 第二輪（5.08 Mbps）是好壞參半的權衡（滿足率變好、吞吐量/整段JFI/RTT 變差），
+沒有明確變好。**更關鍵的是，這個改動修改了 `drl_agent.py`（Local rApp），違反了本文件開頭的硬性
+規則——Stage 2/3 Local 端必須逐行相同**，因此已完全撤銷（程式碼還原、docker image 重建、模型
+checkpoint 復原成 Stage 3 第二輪的 FINAL 狀態）。relay 節點訓練訊號不足的問題**仍未解決**，若要
+修正只能從 Global 端或訓練場景下手（見 §5.4），不能再嘗試修改 Local rApp。完整過程見 `HISTORY.md`。
 
 ---
 

@@ -1,6 +1,6 @@
 # Stage 3 — soft cluster FL + 最基礎 DRL 量測結果
 
-> **最新結果請看文末「2026-09-27/28 — 新拓樸＋ESS 收縮修正＋DRL_CAP_MODE=relative 的 Stage 3 結果」章節。** 本檔前面的數字是舊拓樸、舊平台、舊動作對應（`split`）、relay 原型被 Node4 壟斷（未修正）下的結果，已作廢，勿引用比較。
+> **官方結果請看「2026-09-27/28 — 新拓樸＋ESS 收縮修正＋DRL_CAP_MODE=relative 的 Stage 3 結果」章節：TCP 5.08 Mbps（優於 avg FL 5.02、PF 4.93）。** 文末另有一段「2026-09-28 — relay 壅塞門檻修正（已撤銷）」——這次嘗試修改了 Local rApp（`drl_agent.py`），違反 Stage 2/3 Local 端必須逐行相同的硬性規則，且量測結果對 5.08 也不是全面勝出（見該節），**已完全撤銷（程式碼、docker image、checkpoint 皆已還原），不是官方結果，僅保留過程記錄供參考**。
 
 **量測日期**：2026-09-19（三度重測版，取代 2026-09-14 的舊版本）；文末另含 2026-09-21 Scenario T 量測
 **狀態**：全部 12 個 Local xApp+Local rApp 上線，`MODEL_ARCH=mlp`、`REWARD_MODE=throughput_only`，Global xApp（全域公平性廣播）+ Global rApp（`IABClusterFedAvg`，`FL_MODE=cluster`）全程運作
@@ -205,3 +205,117 @@ Node4 壟斷問題已解決）、$ESS_{access}\approx7.86$（收縮係數≈0.87
 原始量測資料：`experiment_results/data_20260927_stage3_final/`（`stage3_3h_tcp_analysis.txt`／
 `stage3v2_2h_fl60s_tcp_analysis.txt`）。checkpoint：`checkpoints_archive/stage3_cluster_tcp_20260927/`
 （第一輪）與 `checkpoints_archive/stage3v2_cluster_tcp_20260927/`（第二輪）。過程細節見 `HISTORY.md`。
+
+---
+
+## 2026-09-28 — relay 壅塞門檻修正（`DRL_CONTENDED_BUF_BYTES_RELAY`，**已撤銷，非官方結果**）
+
+> ⚠️ **本節記錄的改動已完全撤銷**：這次修正改到了 `drl_agent.py`（Local rApp），違反了 Stage 2/3
+> Local xApp/rApp 必須逐行完全相同的硬性規則（只能改 Global 端或訓練場景，見 `STAGE3_DESIGN.md`
+> 開頭的規則說明）。程式碼已還原、docker image 已重建、12 個節點的 checkpoint 已復原成撤銷前
+> （上一節第二輪 FINAL、5.08 Mbps）的狀態。**Stage 3 的官方結果維持上一節的 5.08 Mbps**，本節
+> 只保留過程與資料供之後參考（例如證實了「relay 缺乏訓練訊號」這個診斷本身是對的，只是修法選錯了
+> 允許改動的範圍）。
+>
+> 承接上一節結尾指出的方法論限制：「relay 節點（Node1~3）壅塞樣本仍結構性趨近 0（ESS_relay≈1），
+> Stage 3 對 relay 節點沒有額外貢獻」。本節是針對這個根本原因的（後來被撤銷的）修正嘗試，設計推導見
+> `inference/STAGE3_DESIGN.md` §5.4／§5.5。
+
+### 修正內容
+
+診斷（`STAGE3_DESIGN.md` §5.3）：relay 節點（Node1~4）的壅塞來源跟 access 節點本質不同——access
+節點的壅塞由流量場景直接惡化下行通道造成，relay 節點的 MT 通道從未被場景惡化，唯一的壅塞來源是
+Backhaul-aware 動態 PRB 預算機制間接造成的排隊，bytes 量級低了 1~2 個數量級。用同一個 100k 門檻，
+relay 節點結構性幾乎產生不出「壅塞」樣本。真實訓練資料校準（stage3v2 訓練資料，MongoDB
+`dl_buffer_info` 分布）：Node1~3 的 p90≈3771、p95≈10056、p99 僅 25k~33k bytes，遠低於 100k 門檻；
+Node4（直連 UE17）因此才較高。
+
+**修正**：`drl_agent.py` 新增 `CONTENDED_BUF_BYTES_RELAY`（環境變數 `DRL_CONTENDED_BUF_BYTES_RELAY`，
+預設 `3000` bytes，依上述真實資料校準），僅套用於 Node1~4；`_contended_mask()` 依 `self.node_id`
+是否屬於 relay 選擇門檻，access 節點（Node5~12）維持原本的 100k 門檻不變。純 Python 常數修改，
+不改變 MongoDB 經驗文件格式，無需清空既有經驗（沿用 stage3v2 的 FINAL checkpoint 暖啟動）。
+`FL_ROUND_INTERVAL_S` 沿用 stage3v2 已驗證的 60 秒，本輪未再調整。
+
+### 訓練與量測設定
+
+| | 內容 |
+|---|---|
+| 訓練時長 | 2.5 小時（2026-09-28 02:11~04:41），暖啟動延續 stage3v2 的 FINAL 模型 |
+| 場景 | TCP（`TR`／`R` 輪替） |
+| `FL_MODE`／`REWARD_MODE`／`MODEL_ARCH` | `cluster`／`throughput_only`／`mlp`（同 Stage 2/3 既有設定） |
+| 訓練中崩潰 | UE5 就地修復 1 次（watchdog 自動處理，無整套重啟） |
+| 結束時 train_steps | 13891~14740（12 節點，皆較 stage3v2 結束時成長約 2500~3500 步） |
+| 量測 | TCP，`DRL_DETERMINISTIC=1`／`DRL_TRAIN_ENABLED=0`／FL 關閉（凍結模型評估，同既有方法論）；第一次嘗試因 UE1 訓練場景崩潰判定無效，自動重試第二次成功 |
+
+**修正是否確實生效（訓練期間即時證據）**：訓練全程 healthcheck 定期擷取的 `[訓練][MLP]` 日誌顯示
+Node1~4 的 `contended` 比例穩定落在 16%~55%（例：Node1 18~38%、Node2 29~36%、Node3 32~35%、
+Node4 52~55%），`n_actor` 持續 20~71（遠高於 `MIN_CONTENDED_SAMPLES=8`）——相較修正前（真實資料
+顯示 Node1~3 幾乎恆為 0%），relay 節點現在確實規律產生可訓練 Actor 的壅塞樣本，診斷的根本原因
+（relay 缺乏訓練訊號）在機制層面已解決。
+
+### 結果對照（TCP，`DRL_DETERMINISTIC=1` 凍結評估，數字為模擬時間）
+
+| 指標 | Stage 3（relay 門檻修正後，本輪） | Stage 3（第二輪，僅 ESS+FL60s） | Stage 2 基準（avg FL） | PF |
+|---|---|---|---|---|
+| 平均吞吐量 | 5.00 Mbps | 5.08 Mbps | 5.02 | 4.93 |
+| **壅塞相位需求滿足率** | **0.805** | 0.764 | 0.768 | 0.767 |
+| 壅塞相位滿足率 JFI | 0.9380 | 0.9339 | 0.933 | 0.936 |
+| 整段 JFI | 0.9856 | 0.9933 | 0.9896 | 0.9871 |
+| 壅塞相位平均 RTT | 119.4 ms | 114.1 ms | ~114（估） | ~116（估，見 CLAUDE.md 第 8 節） |
+| 整段平均 RTT | 61.9 ms | 58.6 ms | 58.4 | 59.3 |
+
+### 結論：誠實的混合結果，不是全面勝出
+
+**修正後的壅塞相位需求滿足率 0.805 是目前 Stage 1~3 全部量測中最高的一次**（優於 PF 0.767、
+Stage 2 的 0.768、修正前 Stage 3 的 0.764），滿足率 JFI 也小幅提升（0.9380 vs 0.9339）——這正是
+`CLAUDE.md` 第 3 節訂定的判讀方法論中，**明確指定為主要鑑別指標**的那個數字（「整段 JFI 因時間
+平均天然偏高，Stage 2~5 比較不能只看它」），在這個指標上，relay 壅塞門檻修正確實帶來目前為止
+最好的結果。
+
+但代價是：平均吞吐量從 5.08 降到 5.00（−1.6%，甚至略低於 Stage 2 基準的 5.02，不是打平，僅仍優於
+PF 的 4.93）、整段 JFI 從 0.9933 降到 0.9856（也低於 Stage 2 的 0.9896）、壅塞相位 RTT 從 114.1ms
+升到 119.4ms、整段 RTT 從 58.6ms 升到 61.9ms（皆劣於 Stage 2 的 58.4ms）。**四項指標裡三項比
+Stage 2 差、一項略差一點，只有壅塞相位滿足率這一項比 Stage 2 好——這不是「權衡」，是在論文驗收
+標準（每一階全部指標都要贏過前一階）下的失敗結果，不能算達標。**
+
+**逐 relay 分支拆解（診斷用，非官方結果的一部分）**：把整體吞吐量差異拆到每個 relay 底下的 UE，
+對照 Stage 3 第二輪：Node1（UE1~4）−0.80 Mbps、**Node2（UE5~8）+1.21 Mbps**、**Node3（UE9~12）
+−1.64 Mbps（最大拖累）**、Node4（UE13~17）−0.20 Mbps。四個 relay 只有一個變好、其餘三個變差，
+方向不一致。進一步重放 `_contended_mask` 邏輯查看 relay Actor 實際的分配行為：兩個下游分支之間的
+PRB 分配偏斜程度（max/sum）平均僅 0.58（均分是 0.5），p90 也只到 0.67，未見任何極端偏斜
+（>0.9 的比例是 0%），且 contended 樣本的平均 reward（0.29~0.31）明顯高於全體平均（0.22~0.26），
+代表這個門檻確實在抓真實流量升高的時刻、不是雜訊。**最可能的解釋**：relay 的 Actor 在此之前幾乎
+從未在真實壅塞樣本上訓練過（contended 長期 ≈0%），這 2.5 小時是它第一次真正學習如何在兩個下游
+分支間分配資源；在只有 2300~3000 筆樣本、reward 又是純吞吐量（沒有公平性懲罰項）的情況下，不同
+relay 各自學到的「溫和傾斜」規則，剛好對某些節點的下游流量型態有利（Node2）、對某些不利（Node3），
+呈現好壞參半而非一致改善——比較像「訓練時間太短、還沒收斂到穩定有益的規則」，不是機制設計上的
+根本錯誤。
+
+**為什麼這整個修正被撤銷**：即使上述診斷成立、即使結果不算太糟，這次修正的做法本身違反了 Stage
+2/3 實驗設計的硬性規則——`drl_agent.py` 屬於 Local rApp，Stage 2→3 之間不能有任何差異，只能改
+Global 端（`server_app.py`／`client_app.py`／`global_xapp.py`）或訓練場景。**規則本身不因「這次
+剛好結果普通」而有彈性**，因此改動已完全撤銷，relay 節點缺乏訓練訊號的問題依然存在，留給 Global
+端或訓練場景的方案解決（見 `inference/STAGE3_DESIGN.md` §5.4）。
+
+### 方法論限制與待辦（本節記錄僅供參考，因整段修正已撤銷、不會有人接續這些待辦）
+
+- 只跑了一輪（2.5 小時，暖啟動延續 stage3v2），沒有做多次重複量測評估雜訊範圍——0.805 vs 0.764
+  的差距（+5.4%）是否穩定超出訓練/量測本身的隨機變異，需要更多輪次才能確認。
+- `CONTENDED_BUF_BYTES_RELAY=3000` 只試了這一個值（依 p90/p95 校準選定），未做敏感度掃描；
+  更低或更高的門檻是否有更好的權衡（例如更高滿足率但吞吐量損失更小）未知。
+- 只量了 TCP，UDP 尚未用這個修正量過。
+- relay 節點的 ESS 這次沒有直接從 Flower ServerApp 的執行日誌中取得（`flwr run` 的實際執行輸出
+  不落在 `flower-superlink`／`flower-scheduler` 的 `docker logs` 裡，屬於已知監控缺口），本節「修正
+  是否生效」的證據來自 Local rApp 訓練日誌的 `contended`/`n_actor` 欄位，是間接但充分的證據。
+- `FL_ROUND_INTERVAL_S` 沿用 60 秒未重新掃描；relay 門檻修正與 FL 聚合週期兩個變數是否有交互作用
+  未知。
+
+### 檔案位置
+
+原始量測資料：`experiment_results/data_20260928_stage3v3/`（`stage3v3_tcp_analysis.txt` +
+逐相位 CSV，僅供參考，非官方結果）。撤銷前的 checkpoint 存檔：
+`checkpoints_archive/stage3v3_relaycontention_tcp_20260928/`（`FINAL_0442`）。訓練/量測全程紀錄：
+`/home/lindor/stage3v3_run_20260928/`（`logs/healthcheck.log`、`logs/finish.log`、
+`logs/post_measure.log`）。**現行 docker volume 內的 12 個模型已復原成撤銷前（即上一節第二輪
+FINAL_2207、5.08 Mbps）的狀態**，`drl_agent.py` 已還原並重建 `local-xapp-inference:latest` image。
+過程細節見 `HISTORY.md`。

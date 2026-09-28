@@ -27,7 +27,8 @@ C 層機制依「節點自己 MT 的真實 backhaul 使用量」動態縮小該�
   2. **同角色內比較（2026-09-26 起）**：`role_mean[role]` = 同一角色（relay=Node1~4、access=Node5~12）
      有資料節點的平均吞吐量之平均值。relay 的「UE」是 access 節點的 MT，承載匯聚流量，吞吐量結構上高於 access
      節點；舊版把 relay 與 access 混在一起算全域平均，relay 的 bias 恆 <1、access 恆 >1，只是「節點身分」而
-     不是公平性訊號。統計視窗也從最近 50 筆（~5 秒，只反映當下流量相位）拉長到 300 筆（~30 秒）。
+     不是公平性訊號。統計視窗也從最近 50 筆（~50 秒，只反映當下流量相位）拉長到 300 筆（~5 分鐘；
+     控制/觀測週期實測是 1 秒/筆，不是早期誤以為的 100ms，見 CLAUDE.md 第 2 節）。
   3. `fairness_bias_i = clip(role_mean[role_i] / (mean_i + eps), BIAS_MIN, BIAS_MAX)`
      ——吞吐量低於同角色平均 → bias > 1（代表被犧牲，可以更積極）；
      高於平均 → bias < 1。沒有資料的節點給中性值 1.0。
@@ -63,7 +64,7 @@ MONGO_DB: str = os.getenv("MONGO_DB", "iab_xapp")
 
 NUM_NODES: int = int(os.getenv("GLOBAL_XAPP_NUM_NODES", "12"))
 INTERVAL_S: float = float(os.getenv("GLOBAL_XAPP_INTERVAL_S", "2.0"))
-LOOKBACK: int = int(os.getenv("GLOBAL_XAPP_LOOKBACK", "300"))   # ~30 秒（每節點 ~10 筆/秒）；舊值 50 只有 ~5 秒
+LOOKBACK: int = int(os.getenv("GLOBAL_XAPP_LOOKBACK", "300"))   # ~5 分鐘（每節點 ~1 筆/秒）；舊值 50 只有 ~50 秒
 
 # 必須跟 drl_agent.py 的 FAIRNESS_BIAS_MIN/MAX 一致，否則 Actor 收到的
 # state 特徵正規化區間會跟這裡廣播的原始值域對不上。

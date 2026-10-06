@@ -41,16 +41,18 @@ err()  { echo -e "${RED}[driver $(date '+%H:%M:%S')] ✗${NC} $*" >&2; }
 HOST=""
 EPOCH=""
 PROTOCOL=""
+SCENARIO_FAMILY="t"   # t（既有，TR+R，訓練「對稱」版模型）｜th（新，TH+R，訓練「異質性」版模型）
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --host) HOST="$2"; shift 2 ;;
         --epoch) EPOCH="$2"; shift 2 ;;
         --protocol) PROTOCOL="$2"; shift 2 ;;
+        --scenario-family) SCENARIO_FAMILY="$2"; shift 2 ;;
         *) err "未知參數: $1"; exit 1 ;;
     esac
 done
 if [[ -z "$HOST" || -z "$EPOCH" ]]; then
-    err "用法: $0 --host {pc1,pc2,pc3} --epoch <unix_timestamp> [--protocol {tcp,udp}]"
+    err "用法: $0 --host {pc1,pc2,pc3} --epoch <unix_timestamp> [--protocol {tcp,udp}] [--scenario-family {t,th,tm,tmh}]"
     exit 1
 fi
 case "$PROTOCOL" in
@@ -61,31 +63,84 @@ case "$HOST" in
     pc1|pc2|pc3) ;;
     *) err "--host 必須是 pc1、pc2 或 pc3（收到: $HOST）"; exit 1 ;;
 esac
+case "$SCENARIO_FAMILY" in
+    t|th|tm|tmh|hs|hsh|hsc|hshc|hsxc|hsx5c|hsbc|hscc|hsdc|hsec|hseo) ;;
+    *) err "--scenario-family 必須是 t、th、tm、tmh、hs、hsh、hsc 或 hshc（收到: $SCENARIO_FAMILY）"; exit 1 ;;
+esac
+# hsc／hshc（2026-10-04）：hs／hsh 的「只跑壅塞相位」版（traffic_scenario.py --congested-only），決策狀態出現頻率約 2.2 倍；
+# 正常相位（全部 UE 需求都送得完、最佳動作恆為不介入）不進訓練。slot 結構、seed、協定與 hs／hsh 相同。
+CONG_ARG=()
+case "$SCENARIO_FAMILY" in hseo) SCENARIO_FAMILY=hseo_; CONG_ARG=(--congested-only) ;; hsec) SCENARIO_FAMILY=hse_; CONG_ARG=(--congested-only) ;; hsdc) SCENARIO_FAMILY=hsd_; CONG_ARG=(--congested-only) ;; hscc) SCENARIO_FAMILY=hsc_; CONG_ARG=(--congested-only) ;; hsbc) SCENARIO_FAMILY=hsb; CONG_ARG=(--congested-only) ;; hsx5c) SCENARIO_FAMILY=hsx5; CONG_ARG=(--congested-only) ;; hsxc) SCENARIO_FAMILY=hsx; CONG_ARG=(--congested-only) ;; hsc) SCENARIO_FAMILY=hs; CONG_ARG=(--congested-only) ;; hshc) SCENARIO_FAMILY=hsh; CONG_ARG=(--congested-only) ;; esac
 
 cd "$COMPOSE_DIR" || { err "cd 到 $COMPOSE_DIR 失敗"; exit 1; }
 
-# ── 輪替表（2026-09-26 重寫）─────────────────────────────────────────────────────
-# 只用兩種場景，且都已對齊新平台的流量量級（模擬時間 Mbps，S=0.4，見 CLAUDE.md 第 8 節）：
-#   TR：隨機化的兩狀態 T——同量測用 Scenario T 的檔位與 ~45% 壅塞比例，但壅塞相位排列與每 UE 的組合由 seed
-#       打散，訓練分佈與固定的測試場景 T 不同（「訓練場景不可等於測試場景」的原則）。
-#   R ：新版真實隨機（idle:burst:traffic = 1:2.5:6.5，TCP/UDP 混合），保留另一種隨機結構的多樣性。
+# ── 輪替表（2026-09-26 重寫，2026-09-29 加入 T/TH 雙軌 `--scenario-family`）──────────
+# 只用兩種場景結構，且都已對齊新平台的流量量級（模擬時間 Mbps，S=0.4，見 CLAUDE.md 第 8 節）：
+#   TR／TH：兩狀態 T 的隨機化版本——同量測用 Scenario T 的檔位與 ~45% 壅塞比例，訓練分佈與固定
+#       的測試場景 T 不同（「訓練場景不可等於測試場景」的原則）。TR 是長期均勻版（round-robin，
+#       節點間沒有持久差異，訓練出「對稱」版模型，量測時比照 Scenario T）；TH 是持久異質性版
+#       （見 CLAUDE.md 第 8 節、`scenarios/traffic_scenario.py::scenario_th_heterogeneous()`，
+#       訓練出「異質性」版模型，量測時比照 Scenario TH）。**T/TH 雙軌框架要求每個 Stage 分別
+#       用兩種家族各訓練一次**，不要混在同一次訓練裡，才能乾淨歸因「表現差異是不是異質性訓練
+#       造成的」——用 `--scenario-family {t,th}` 切換，兩者的 slot 位置／佔比／協定／時長
+#       完全相同，只有 TR↔TH 這一個變數不同。
+#   R ：新版真實隨機（idle:burst:traffic = 1:2.5:6.5，TCP/UDP 混合），兩個家族都保留，提供另一種
+#       隨機結構的多樣性，不受 T/TH 雙軌切換影響。
 # 舊表的 A/B/C 已移除：它們的流量（每 UE 25~50 Mbps 模擬時間）是重設平台前的舊量級，17 個 UE 加總 400~850，
-# 遠超 CPU 平台（~100~108），會讓平台飽和、RTT 秒級、UE 崩潰。固定的 Scenario T（測試基準）也不進訓練。
+# 遠超 CPU 平台（~100~108），會讓平台飽和、RTT 秒級、UE 崩潰。固定的 Scenario T／TH（測試基準）也不進訓練。
 # 協定：TCP／UDP 在不同 slot 混合訓練（最後量測兩種都要量）；R 的協定維持其內建 TCP/UDP 混合（75/25）。
 # 每個 slot 的 seed = 基底 + 週期編號×10 + slot 序號，每一輪循環都是全新的隨機排列。
 # scenario / 協定（tcp|udp|mix，mix=用場景內建）/ 這個 slot 的秒數。總長 13200 秒 ≈ 3.7 小時一輪，無限循環。
-SLOT_SCENARIO=(TR  TR  R   TR  TR  R)
+# tm（2026-10-01）：混合通道壅塞候選基準 TM 的訓練家族，TMR＝TM 的隨機化版本（見 scenario_tm_random()），slot 結構同 t/th。
+if [[ "$SCENARIO_FAMILY" == "th" ]]; then
+    SLOT_SCENARIO=(TH  TH  R   TH  TH  R)
+elif [[ "$SCENARIO_FAMILY" == "tm" ]]; then
+    SLOT_SCENARIO=(TMR TMR R   TMR TMR R)
+elif [[ "$SCENARIO_FAMILY" == "tmh" ]]; then
+    # tmh：TMH 本身用每個 slot 不同的 seed 訓練（同 th 家族用 TH 訓練的做法）；量測用固定 seed（MEASURE_SEED）
+    SLOT_SCENARIO=(TMH TMH R   TMH TMH R)
+elif [[ "$SCENARIO_FAMILY" == "hseo_" ]]; then
+    SLOT_SCENARIO=(HSE HSE HSE HSE HSE HSE)   # 2026-10-05：只有 HSE 壅塞相位（收探索資料用，不含 G）
+elif [[ "$SCENARIO_FAMILY" == "hse_" ]]; then
+    SLOT_SCENARIO=(HSE HSE G HSE HSE G)   # HSE：熱點（backhaul 瓶頸）＋另一 branch 的小混合 access 節點
+elif [[ "$SCENARIO_FAMILY" == "hsd_" ]]; then
+    SLOT_SCENARIO=(HSD HSD G HSD HSD G)   # HSD：第三版熱點＋熱點 branch 內的混合 access 節點
+elif [[ "$SCENARIO_FAMILY" == "hsc_" ]]; then
+    SLOT_SCENARIO=(HSC HSC G HSC HSC G)   # HSC：第三版熱點＋縮小的混合 access 節點
+elif [[ "$SCENARIO_FAMILY" == "hsb" ]]; then
+    SLOT_SCENARIO=(HSB HSB G HSB HSB G)   # HSB（HS 平衡版，壅塞總需求約 98，落在平台容量內）
+elif [[ "$SCENARIO_FAMILY" == "hsx5" ]]; then
+    SLOT_SCENARIO=(HSX5 HSX5 G HSX5 HSX5 G)   # HS 第五版的訓練版（3 個混合 access 節點）
+elif [[ "$SCENARIO_FAMILY" == "hsx" ]]; then
+    # hsxc（2026-10-04）：訓練用 HSX（每個非熱點 branch 各一個混合 access 節點，access 決策狀態約 ×3）＋G，只跑壅塞相位；量測仍用 HS
+    SLOT_SCENARIO=(HSX HSX G HSX HSX G)
+elif [[ "$SCENARIO_FAMILY" == "hs" || "$SCENARIO_FAMILY" == "hsh" ]]; then
+    # hs／hsh（2026-10-01 主實驗）：HS／HSH（熱點＋細胞邊緣結構化隨機）與 G（通用隨機，學「不該介入」）交替；
+    # 都含 relay 直連 UE（PC1 也要跑驅動器）。量測用固定 MEASURE_SEED，訓練用下面各自的 seed 區段。
+    HS_NAME=HS; [[ "$SCENARIO_FAMILY" == "hsh" ]] && HS_NAME=HSH
+    SLOT_SCENARIO=($HS_NAME $HS_NAME G $HS_NAME $HS_NAME G)
+else
+    SLOT_SCENARIO=(TR  TR  R   TR  TR  R)
+fi
 SLOT_PROTOCOL=(tcp udp mix udp tcp mix)
-SLOT_DURATION_S=(2400 2400 1800 2400 2400 1800)
+[[ "$SCENARIO_FAMILY" == "hs" || "$SCENARIO_FAMILY" == "hsh" || "$SCENARIO_FAMILY" == "hsx" || "$SCENARIO_FAMILY" == "hsx5" || "$SCENARIO_FAMILY" == "hsb" || "$SCENARIO_FAMILY" == "hsc_" || "$SCENARIO_FAMILY" == "hsd_" || "$SCENARIO_FAMILY" == "hse_" || "$SCENARIO_FAMILY" == "hseo_" ]] && SLOT_PROTOCOL=(tcp udp tcp udp tcp udp)
+SLOT_DURATION_S=(2400 2400 1800 2400 2400 1800)   # TR/TH 佔 9600s=72.7%，R 佔 3600s=27.3%（兩家族相同比例）
 TR_SEED_BASE=140000
+TH_SEED_BASE=145000    # 跟 TR/R 的種子區段分開，避免同一 seed 值在不同場景下被誤用
 R_SEED_BASE=150000     # 刻意避開固定測試 seed 20260914
+TMR_SEED_BASE=155000   # TMR 專用區段
+TMH_SEED_BASE=160000   # TMH 訓練用區段（避開量測 seed 20260930）
+HS_SEED_BASE=165000    # HS／HSH／G 訓練用區段（量測用 MEASURE_SEED=20260930）
+HSH_SEED_BASE=170000
+G_SEED_BASE=175000
 TR_PHASE_S=110         # 與量測用的 Scenario T 相同的相位長度
+TH_PHASE_S=110         # 與量測用的 Scenario TH 相同的相位長度（TH 結構與 T 相同，沿用同一個值）
 R_PHASE_S=60
 N_SLOTS=${#SLOT_SCENARIO[@]}
 CYCLE_LEN_S=0
 for d in "${SLOT_DURATION_S[@]}"; do CYCLE_LEN_S=$((CYCLE_LEN_S + d)); done
 
-log "啟動：host=$HOST epoch=$EPOCH protocol=${PROTOCOL:-預設} cycle_len=${CYCLE_LEN_S}s (${N_SLOTS} slots)"
+log "啟動：host=$HOST epoch=$EPOCH protocol=${PROTOCOL:-預設} scenario_family=$SCENARIO_FAMILY cycle_len=${CYCLE_LEN_S}s (${N_SLOTS} slots)"
 
 CHILD_PID=""
 cleanup() {
@@ -136,7 +191,9 @@ while true; do
     [[ "$proto" != "mix" ]] && proto_arg=(--protocol "$proto")
 
     # 這個 slot 還要跑幾個相位：第一個相位可能是「進行到一半」（watchdog 重啟後接續），只算剩餘的部分
-    phase_len=$TR_PHASE_S; [[ "$scenario" == "R" ]] && phase_len=$R_PHASE_S
+    phase_len=$TR_PHASE_S
+    [[ "$scenario" == "TH" ]] && phase_len=$TH_PHASE_S
+    [[ "$scenario" == "R" ]] && phase_len=$R_PHASE_S
     first_left=$(( phase_len - (now - slot_start) % phase_len ))
     num_phases=$(( 1 + ( (remaining > first_left ? remaining - first_left : 0) + phase_len - 1 ) / phase_len ))
 
@@ -149,6 +206,31 @@ while true; do
             python3 scenarios/traffic_scenario.py --scenario TR --seed "$seed" \
                 --host "$HOST" --phase-duration "$TR_PHASE_S" --num-phases "$num_phases" \
                 --phase-origin "$slot_start" --on-crash warn "${proto_arg[@]}" &
+            ;;
+        TH)
+            seed=$(( TH_SEED_BASE + cycle_no * 10 + slot_idx ))
+            python3 scenarios/traffic_scenario.py --scenario TH --seed "$seed" \
+                --host "$HOST" --phase-duration "$TH_PHASE_S" --num-phases "$num_phases" \
+                --phase-origin "$slot_start" --on-crash warn "${proto_arg[@]}" &
+            ;;
+        TMH)
+            seed=$(( TMH_SEED_BASE + cycle_no * 10 + slot_idx ))
+            python3 scenarios/traffic_scenario.py --scenario TMH --seed "$seed" \
+                --host "$HOST" --phase-duration "$TR_PHASE_S" --num-phases "$num_phases" \
+                --phase-origin "$slot_start" --on-crash warn "${proto_arg[@]}" &
+            ;;
+        TMR)
+            seed=$(( TMR_SEED_BASE + cycle_no * 10 + slot_idx ))
+            python3 scenarios/traffic_scenario.py --scenario TMR --seed "$seed" \
+                --host "$HOST" --phase-duration "$TR_PHASE_S" --num-phases "$num_phases" \
+                --phase-origin "$slot_start" --on-crash warn "${proto_arg[@]}" &
+            ;;
+        HS|HSH|G|HSX|HSX5|HSB|HSC|HSD|HSE)
+            case "$scenario" in HS|HSX|HSX5|HSB|HSC|HSD|HSE) base=$HS_SEED_BASE;; HSH) base=$HSH_SEED_BASE;; G) base=$G_SEED_BASE;; esac
+            seed=$(( base + cycle_no * 10 + slot_idx ))
+            python3 scenarios/traffic_scenario.py --scenario "$scenario" --seed "$seed" \
+                --host "$HOST" --phase-duration "$TR_PHASE_S" --num-phases "$num_phases" \
+                --phase-origin "$slot_start" --on-crash warn "${proto_arg[@]}" "${CONG_ARG[@]}" &
             ;;
         R)
             seed=$(( R_SEED_BASE + cycle_no * 10 + slot_idx ))

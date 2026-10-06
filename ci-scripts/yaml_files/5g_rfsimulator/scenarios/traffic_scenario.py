@@ -1,5 +1,5 @@
 """
-traffic_scenario.py — UE 流量場景控制器（三主機 12-node/17-UE 拓樸版）
+traffic_scenario.py — UE 流量場景控制器（三主機 12-node/16-UE 拓樸版；UE17 已於 2026-09-30 移除）
 
 部署環境：PC1、PC2、PC3 各自執行一份（`--host pc1` / `--host pc2` / `--host pc3`），
 只控制該主機本地擁有的 UE 容器與 DU telnet 通道（channelmod port 只在
@@ -9,7 +9,7 @@ traffic_scenario.py — UE 流量場景控制器（三主機 12-node/17-UE 拓�
   - 場景提供多樣化的 (path_loss, 頻寬, 協定, 閒置) 組合，模擬真實劣化環境
 
 前置條件：
-  1. PC 1 已執行 setup_iperf_servers.sh，ext-dn 中的 iperf3 server 正在監聽（17 個 port）
+  1. PC 1 已執行 setup_iperf_servers.sh，ext-dn 中的 iperf3 server 正在監聽（16 個 port）
   2. 三主機基礎設施已啟動（run_local_pc1.sh/pc2.sh/pc3.sh），DU 容器已帶 --telnetsrv
   3. 所有 UE 容器已啟動，oaitun_ue1 介面已取得 12.1.1.x IP
 
@@ -76,20 +76,23 @@ IPERF_DURATION = 300               # iperf3 每次 session 持續時間 (s)；�
 IPERF_BIND_IF = "oaitun_ue1"      # UE PDN 介面名稱
 FLOW_WATCHDOG_INTERVAL = 30        # 每 30s 檢查一次 DL flow 是否凍結（僅 TCP 適用，UDP 無 rx_bytes 累積保證）
 
-# iperf3 server port 分配（PC 1 setup_iperf_servers.sh 必須一致）：UE1~17 → 5201~5217
+# iperf3 server port 分配（PC 1 setup_iperf_servers.sh 必須一致）：UE1~24 → 5201~5224
+# UE1~16 掛在 access 節點；UE17~24 是 relay 直連 UE（2026-10-01 起，見 RELAY_UE_IDS）。
 UE_IPERF_PORTS: dict[str, int] = {
-    f"rfsim5g-end-ue-{i}": 5200 + i for i in range(1, 18)
+    f"rfsim5g-end-ue-{i}": 5200 + i for i in range(1, 25)
 }
 
 # Node → (DU telnet port, [(ue_container, ue_id), ...])
 # telnet port 公式：relay/access 統一 9088 + node_id（見 CLAUDE.md IP/ID 配置表）。
-# relay Node1~3 沒有直連 UE（子節點都是 access node，走各自 access 的 telnet port
-# 控制），故 UE 清單為空；relay Node4 額外多一個直連 UE17。
+# relay Node r 直連 2 個 UE：UE(15+2r)、UE(16+2r)（2026-10-01 起，容器在 PC1）。ue_id 是 relay DU 上的 rfsim 連線
+# 順序：兩個 access MT 先連（0,1），relay UE 由 iab/start_relay_ues.sh 在 13/13 E2 之後才啟動（2,3）。
+# ue_id 只用於 DU 端 chanmod（上行，場景結束時 reset）；下行惡化走 UE 端 chanmod（set_ue_dl_degradation）。
 NODE_CONFIG: dict[int, tuple[int, list[tuple[str, int]]]] = {
-    1:  (9089, []),
-    2:  (9090, []),
-    3:  (9091, []),
-    4:  (9092, [("rfsim5g-end-ue-17", 2)]),   # ue_id=2：Node11/12 的 MT 先連線取走 0,1
+    1:  (9089, [("rfsim5g-end-ue-17", 2), ("rfsim5g-end-ue-18", 3)]),
+    2:  (9090, [("rfsim5g-end-ue-19", 2), ("rfsim5g-end-ue-20", 3)]),
+    3:  (9091, [("rfsim5g-end-ue-21", 2), ("rfsim5g-end-ue-22", 3)]),
+    4:  (9092, [("rfsim5g-end-ue-23", 2), ("rfsim5g-end-ue-24", 3)]),
+    # [UE17 已移除 2026-09-30] 原本：4: (9092, [("rfsim5g-end-ue-17", 2)]),   # ue_id=2：Node11/12 的 MT 先連線取走 0,1
     5:  (9093, [("rfsim5g-end-ue-1", 0), ("rfsim5g-end-ue-2", 1)]),
     6:  (9094, [("rfsim5g-end-ue-3", 0), ("rfsim5g-end-ue-4", 1)]),
     7:  (9095, [("rfsim5g-end-ue-5", 0), ("rfsim5g-end-ue-6", 1)]),
@@ -120,8 +123,9 @@ HOST_OF_NODE: dict[int, str] = {
 # CLAUDE.md），跟 HOST_OF_NODE[4]="pc1" 不一致，需要單獨覆寫（影響
 # build_ue_list()：UE17 的 iperf/ping 等 docker exec 類操作要在 pc3 執行，
 # 因為容器只存在於 pc3 的 docker daemon）；其餘 16 個 UE 沒有這個特例。
+# [UE17 已移除 2026-09-30] 唯一的特例就是 UE17，字典留空（機制保留，之後有同類特例可以再用）。
 UE_HOST_OVERRIDE: dict[str, str] = {
-    "rfsim5g-end-ue-17": "pc3",
+    # "rfsim5g-end-ue-17": "pc3",
 }
 
 # Node → 跨主機 chanmod telnet 位址覆寫。UE17 的 traffic control 現在在 pc3
@@ -131,8 +135,9 @@ UE_HOST_OVERRIDE: dict[str, str] = {
 # 但 telnetsrv 監聽 0.0.0.0，直接連 Node4 容器自己的 macvlan IP（.153）即可跨主機。
 # 只有 Node4 需要這個覆寫；其餘節點的 telnet 永遠跟自己的 DU 同機，用
 # 127.0.0.1 即可，不需要出現在這個字典裡。
+# [UE17 已移除 2026-09-30] 這個覆寫只為了讓 pc3 控制 UE17 的 pathloss，字典留空。
 NODE_TELNET_HOST_OVERRIDE: dict[int, str] = {
-    4: "192.168.88.153",
+    # 4: "192.168.88.153",
 }
 
 # 校正掃描的 path_loss 值（單位 dB）；上限 25dB，超過會斷線
@@ -177,7 +182,8 @@ def sim_speed() -> float:
 # Stage 1~3 從未有過真正的通道惡化。而且基準訊號振幅本來就低（int16 取樣），可用衰減範圍很窄，正值太大會削波、
 # 負值太大（如 ploss=-15 且 noise=-6）會讓 UE 斷線且不會自動恢復（需乾淨重啟）。
 #
-# 場景仍用原本的 0~PATHLOSS_SAFE_MAX_DB「損耗指標」L（Scenario R 抽的值、T 的 3/12/22、A/B/C/D 的 CQI 對照表），
+# 場景仍用原本的 0~PATHLOSS_SAFE_MAX_DB「損耗指標」L（Scenario R 抽的連續值、T 的 3/10/18/22/23/24 檔位、
+# A/B/C 2026-09-28 起直接引用 T 的同一組檔位、D 仍用 CQI 對照表），
 # 只是把它視為劣化程度的純量 s=L/PATHLOSS_SAFE_MAX_DB∈[0,1]，再沿著下面這條「已實測、不斷線」的 (ploss, noise)
 # 路徑套用到 UE 端下行通道（UE3/UE11 二維網格，下行 TCP MCS：s=0→28、0.25→27~28、0.5→18~21、0.75→12~13、1→3~4）。
 # 終點 (-10,-6) 離會斷線的 (-15,-6) 有 5 dB 餘裕。**上行（DU 端）通道完全不動**（維持 conf 的正常通道
@@ -240,7 +246,7 @@ def reset_ue_dl_degradation(ues: list["UEConfig"]) -> None:
 #   burst   ：高需求突發（對應 T 的高流量檔位量級，見 R_BURST_*）
 #   traffic ：一般持續流量，量級由 UE 的持久化 profile 決定（見 UE_PROFILES）
 # 單位一律是「模擬時間 Mbps」（同 Scenario T；iperf3 牆鐘頻寬 = 這裡的值 × S）。
-# 量級依 2026-09-26 容量實測訂定：全系統 CPU 平台 ~100 sim Mbps；期望每 UE offered ≈ 5 → 17 UE ≈ 85。
+# 量級依 2026-09-26 容量實測訂定：全系統 CPU 平台 ~100 sim Mbps；期望每 UE offered ≈ 5 → 16 UE ≈ 80（UE17 已於 2026-09-30 移除，原本 17 UE ≈ 85）。
 R_STATE_WEIGHTS: dict[str, float] = {"idle": 1.0, "burst": 2.5, "traffic": 6.5}   # 比例 1:2.5:6.5（自動正規化）
 R_BURST_MIN_MBPS: float = 8.0
 R_BURST_MAX_MBPS: float = 16.0            # 對應 T 壅塞相位的高流量（12）到舊 high（16）
@@ -287,7 +293,7 @@ class UEConfig:
     container: str
     ue_id: int            # channelmod ue_id（0-based，對應 rfsimulator 連線索引）
     node_id: int
-    global_id: int = 0                     # 跨主機唯一序號（UE1~17 對應 1~17），供
+    global_id: int = 0                     # 跨主機唯一序號（UE1~16 對應 1~16），供
                                             # (seed, global_id, phase_index) 決定式抽樣用
     profile: str = "light"                 # Scenario R 專用：持久化使用者 profile
     target_cqi: int = 12
@@ -531,8 +537,9 @@ def apply_scenario_phase(
     或 (target_cqi_or_path_loss_db, bandwidth_mbps, protocol) 三元組（Scenario R 用）。
     各 UE 之間插入 100ms 間隔給 channelmod telnet 指令回應。
 
-    raw_path_loss=True 時，configs 的第一個元素視為連續 path_loss_db（Scenario R），
-    否則視為 target_cqi（Scenario A/B/C/D 既有行為，預設）。
+    raw_path_loss=True 時，configs 的第一個元素視為連續 path_loss_db（Scenario R／A/B/C，
+    2026-09-28 起 A/B/C 也改用這個路徑，直接引用 Scenario T 的 PLOSS_TIERS 常數），否則
+    視為 target_cqi（Scenario D 既有行為，預設）。
     """
     assert len(configs) == len(ues), "configs 長度必須等於 UE 數量"
     log.info("── 套用場景相位 ──")
@@ -552,40 +559,64 @@ def apply_scenario_phase(
 #             泛化到 12 節點，UE 清單長度隨 build_ue_list() 而定）
 # =============================================================================
 
+# A/B/C 的通道嚴重度改直接引用 Scenario T 已實測驗證、不斷線的 NORMAL_PLOSS_TIERS／
+# CONGESTED_PLOSS_TIERS 常數（見下方定義），取代各自獨立的 CQI 對照表查表（2026-09-28，
+# 使用者要求對齊，避免未來只調整 T 的檔位、卻忘了 A/B/C 也要跟著改）。三個場景不再走
+# apply_scenario_phase() 的 CQI 查表路徑，改用 raw_path_loss=True 直接送連續 L 值——
+# 跟 Scenario R 同一種呼叫方式，run_fixed_scenario() 已同步更新。
+
+
 def scenario_a(
     ues: list[UEConfig], ctrls: dict[int, ChannelModController], protocol: str = "tcp"
-) -> list[tuple[int, float, str]]:
-    """場景 A：CQI 差異化——同 Node 內兩 UE 對比 CQI 15 vs 5，流量相等。
+) -> list[tuple[float, float, str]]:
+    """場景 A：通道差異化——同 Node 內兩 UE 對比好通道 vs 差通道，流量相等。
+
+    好／差通道直接取 Scenario T 的 NORMAL_PLOSS_TIERS 低／高檔位（3.0／18.0 dB，
+    定義見下方），跟原本 CQI 15 vs 5 的查表結果（L=0.0／18.0）幾乎一致，只是改成
+    直接共用 T 的常數而非各自查表。
 
     A/B/C 的 protocol 參數（見 CLI `--protocol`）：全部 UE 統一用這個協定，通道/頻寬
     設定完全不變，只換傳輸層，供 TCP/UDP 兩版本 1:1 對照。
     """
     configs = []
     for i, _ in enumerate(ues):
-        cqi = 15 if i % 2 == 0 else 5
-        configs.append((cqi, 30.0, protocol))
+        ploss = NORMAL_PLOSS_TIERS["low"] if i % 2 == 0 else NORMAL_PLOSS_TIERS["high"]
+        configs.append((ploss, 30.0, protocol))
     return configs
 
 
 def scenario_b(
     ues: list[UEConfig], ctrls: dict[int, ChannelModController], protocol: str = "tcp"
-) -> list[tuple[int, float, str]]:
-    """場景 B：流量不均（Jain's Fairness 壓測）——等 CQI，流量比例不對等。"""
+) -> list[tuple[float, float, str]]:
+    """場景 B：流量不均（Jain's Fairness 壓測）——等通道，流量比例不對等。
+
+    通道品質不是這個場景要測的變數，統一取 Scenario T 的 NORMAL_PLOSS_TIERS 低檔位
+    （3.0 dB，良好通道），對應原本 CQI=12（L=5.0）的「還不錯」通道品質。
+    """
     configs = []
     for i, _ in enumerate(ues):
         bw = 45.0 if i % 2 == 0 else 25.0
-        configs.append((12, bw, protocol))
+        configs.append((NORMAL_PLOSS_TIERS["low"], bw, protocol))
     return configs
 
 
 def scenario_c(
     ues: list[UEConfig], ctrls: dict[int, ChannelModController], protocol: str = "tcp"
-) -> list[tuple[int, float, str]]:
-    """場景 C：最惡公平性——差通道高需求 vs 好通道低需求。"""
+) -> list[tuple[float, float, str]]:
+    """場景 C：最惡公平性——差通道高需求 vs 好通道低需求。
+
+    要最大化對比、逼近「最惡」的場景設計意圖，好通道取 NORMAL_PLOSS_TIERS 低檔位
+    （3.0 dB），差通道取 CONGESTED_PLOSS_TIERS 高檔位（24.0 dB，T 本身壅塞相位會用到
+    的最深值，已驗證不斷線）——對比幅度比原本 CQI 4 vs 14（L=21.0 vs 0.0）更極端，但
+    仍在 T 已驗證的安全範圍內。
+    """
     configs = []
     for i, _ in enumerate(ues):
-        cqi, bw = (4, 50.0) if i % 2 == 0 else (14, 25.0)
-        configs.append((cqi, bw, protocol))
+        ploss, bw = (
+            (CONGESTED_PLOSS_TIERS["high"], 50.0) if i % 2 == 0
+            else (NORMAL_PLOSS_TIERS["low"], 25.0)
+        )
+        configs.append((ploss, bw, protocol))
     return configs
 
 
@@ -666,13 +697,238 @@ def scenario_t_tiered(
     return configs
 
 
+# ── Scenario P（混合通道壅塞試驗，2026-09-30）─────────────────────────────────────────
+# 離線模型（/home/lindor/pf16_run_20260930/upper_bound/）預測：同節點「好 UE（L=22、需求 22）＋壞 UE（L=24、需求 6）」
+# 時，PF 平分 RB 會把 RB 浪費在壞 UE；把壞 UE 限在 0.3 檔可多約 11% 總吞吐量。這個固定場景用來在平台上驗證這件事
+# （PF vs 靜態上限），通過後才正式改 T／TH。每個 branch 的第一個 access 節點是混合節點、第二個是輕節點，每個相位相同。
+P_GOOD_UES = frozenset({1, 5, 9, 13})     # 混合節點的好 UE（L=22）
+P_BAD_UES = frozenset({2, 6, 10, 14})     # 混合節點的壞 UE（L=24）
+P_GOOD = (22.0, 22.0)                     # (L, 需求 sim Mbps)
+P_BAD = (24.0, 6.0)
+P_LIGHT = (10.0, 1.0)
+
+
+def scenario_p_pilot(ues: list[UEConfig], phase_index: int, protocol: str = "tcp") -> list[tuple[float, float, str]]:
+    """場景 P：固定的混合通道壅塞配置（試驗用，每個相位相同）。"""
+    log.info("Scenario P 相位狀態：壅塞（phase_index=%d，固定配置）", phase_index)
+    out = []
+    for ue in ues:
+        L, bw = P_GOOD if ue.global_id in P_GOOD_UES else P_BAD if ue.global_id in P_BAD_UES else P_LIGHT
+        out.append((L, bw, protocol))
+    return out
+
+
+# ── Scenario TM（T-Mixed，候選新基準，2026-10-01，尚未定案）─────────────────────────
+# 場景 P 試驗發現：頻域 PRB 上限在這個平台無法重新分配資源，時域遮罩可以（HISTORY.md 續四十六）；但只有「同節點通道差很多、
+# 好 UE 需求高」的節點有空間。TM 保留 T 的骨架（11 相位、壅塞相位 2/4/5/7/9、正常相位完全等同 T），只把壅塞相位改成：
+#   每個 branch 一個「主動節點」＋一個輕節點（2×L=10、需求 1）。4 個 branch 中 3 個的主動節點是 M 類（該遮：好 UE 中差通道高需求＋
+#   壞 UE L=24/23 低需求），1 個是 N 類（不該遮：好 UE 需求小、本來就吃得飽，遮壞 UE 只會虧）。哪個 branch 是 N 類、主動節點是
+#   branch 內哪一個、節點內哪個 UE 是好 UE，都隨 phase_index 輪替 → 長期對稱。N 類讓「看到低 MCS 就遮」的固定規則吃虧，
+#   最佳動作隨狀態改變（好 UE 佇列是否堆積），DRL 才有東西可學。
+# 離線模擬（/home/lindor/pf16_run_20260930/slotsim/，MAC 層，實際增益約 ×0.4）：M 類 +12~15%、N 類遮了 −13~−20%。
+TM_M_TYPES = [((22.0, 22.0), (24.0, 6.0)),     # M22：好 UE (L, 需求 sim Mbps)、壞 UE
+              ((22.0, 18.0), (24.0, 8.0)),     # M22b
+              ((22.0, 20.0), (23.0, 6.0))]     # M23
+TM_N_TYPES = [((10.0, 8.0), (24.0, 6.0)),      # N10：好 UE 通道好、需求小
+              ((22.0, 8.0), (24.0, 6.0))]      # N22：好 UE 需求小
+TM_LIGHT = (10.0, 1.0)
+
+
+def _tm_congested_index(phase_index: int) -> int:
+    """第幾個壅塞相位（從 0 起算）：週期編號×5 + 在週期內的序號。只對壅塞相位有意義。"""
+    cyc, r = divmod(phase_index, T_CYCLE_PHASES)
+    return cyc * len(T_CONGESTED_PHASES) + sorted(T_CONGESTED_PHASES).index(r)
+
+
+def _tm_roles(k: int) -> list[tuple[int, tuple, int]]:
+    """
+    第 k 個壅塞相位、每個 branch 的角色：(主動節點在 branch 內的位置 0/1, (好 UE, 壞 UE) 類型, 好 UE 在節點內的位置 0/1)。
+    2026-10-01 修正：原本各變數都直接由 phase_index 取餘數，彼此相關、又只在固定的壅塞相位取樣，長期不對稱
+    （UE1/UE13 永遠是 N 類好 UE、從來不是 M 類好 UE；其他 UE 永遠碰不到 N 類）。改成以壅塞相位序號 k 做混合進位，
+    每個變數獨立循環：每 96 個壅塞相位（4×2×2×3×2）所有組合各出現一次，長期每個 UE 的角色比例完全相同。
+    """
+    n_branch = k % 4
+    out = []
+    for b in range(4):
+        active = ((k // 4) + b) % 2
+        good_q = ((k // 8) + b) % 2
+        if b == n_branch:
+            typ = TM_N_TYPES[(k // 48) % len(TM_N_TYPES)]
+        else:
+            typ = TM_M_TYPES[((k // 16) + b) % len(TM_M_TYPES)]
+        out.append((active, typ, good_q))
+    return out
+
+
+def _tm_assign(ues: list[UEConfig], roles: list[tuple[int, tuple, int]], protocol: str) -> list[tuple[float, float, str]]:
+    out = []
+    for ue in ues:
+        gid = ue.global_id
+        node = (gid - 1) // 2 + 5
+        branch, pos, q = (node - 5) // 2, (node - 5) % 2, (gid - 1) % 2
+        active, (good, bad), good_q = roles[branch]
+        L, bw = TM_LIGHT if pos != active else (good if q == good_q else bad)
+        out.append((L, bw, protocol))
+    return out
+
+
+def scenario_tm_mixed(ues: list[UEConfig], phase_index: int, protocol: str = "tcp") -> list[tuple[float, float, str]]:
+    """場景 TM：正常相位＝Scenario T；壅塞相位＝混合通道配置，角色依壅塞相位序號做混合進位輪替（長期對稱）。"""
+    if not t_phase_congested(phase_index):
+        cfg = scenario_t_tiered(ues, phase_index, protocol=protocol)   # 正常相位完全沿用 T（含其 log）
+        log.info("Scenario TM 相位狀態：正常（phase_index=%d，週期內第 %d/%d 個）",
+                 phase_index, phase_index % T_CYCLE_PHASES, T_CYCLE_PHASES)
+        return cfg
+    log.info("Scenario TM 相位狀態：壅塞（phase_index=%d，週期內第 %d/%d 個）",
+             phase_index, phase_index % T_CYCLE_PHASES, T_CYCLE_PHASES)
+    return _tm_assign(ues, _tm_roles(_tm_congested_index(phase_index)), protocol)
+
+
+
+
+def _tm_type_load(typ: tuple) -> float:
+    """類型的吃重程度（以每秒需要的 RB 量近似：需求 / 每 RB 效率）。用來決定 TMH 裡哪個角色比較「難」。"""
+    eff = {10.0: 91.0, 18.0: 31.8, 22.0: 19.2, 23.0: 12.5, 24.0: 8.8}   # 2026-10-01 PF-shadow 實測（HISTORY.md 續四十三）
+    (lg, dg), (lb, db) = typ
+    return dg / eff[lg] + db / eff[lb]
+
+
+def scenario_tmh_heterogeneous(
+    ues: list[UEConfig], seed: int, phase_index: int, protocol: str = "tcp"
+) -> list[tuple[float, float, str]]:
+    """
+    場景 TMH：TM 的持久異質性版本（對應 TH 之於 T，2026-10-01）。
+    - 正常相位：與 Scenario TH 相同（scenario_th_heterogeneous）。
+    - 壅塞相位：先取 TM 在這個相位的角色組合（_tm_roles），**同一台主機的兩個 branch 之間**依固定難度重新分配：
+        1. 兩個 branch 的分數＝兩個 access 節點 BRANCH_HARDSHIP 平均＋均勻隨機 ±TH_RANK_NOISE；分數高的 branch 拿較吃重的類型。
+        2. branch 內兩個節點的分數＝BRANCH_HARDSHIP＋隨機；分數高的當主動節點（混合通道），另一個是輕負載節點。
+        3. 主動節點內兩個 UE 的分數＝UE_HARDSHIP＋隨機；分數高的當壞 UE。
+      只在同一台主機內交換 → 每台主機、每個相位的總負載與 TM 完全相同，TM 與 TMH 只差「角色怎麼分」。
+    隨機部分由 _rng_for(seed, ·, phase_index) 決定式導出，PC2/PC3 一致；固定難度跟 seed 無關，長期不會平均掉。
+    """
+    if not t_phase_congested(phase_index):
+        cfg = scenario_th_heterogeneous(ues, seed, phase_index, protocol=protocol)
+        log.info("Scenario TMH 相位狀態：正常（seed=%d phase_index=%d）", seed, phase_index)
+        return cfg
+    log.info("Scenario TMH 相位狀態：壅塞（seed=%d phase_index=%d）", seed, phase_index)
+    noise = lambda key: (2.0 * _rng_for(seed, key, phase_index).random() - 1.0) * TH_RANK_NOISE
+    base = _tm_roles(_tm_congested_index(phase_index))
+    roles = list(base)
+    for host_branches in ((0, 1), (2, 3)):                       # PC2：branch 0/1（Node5~8）；PC3：branch 2/3（Node9~12）
+        types = sorted((base[b][1] for b in host_branches), key=_tm_type_load)          # 由輕到重
+        bscore = sorted(host_branches, key=lambda b: (BRANCH_HARDSHIP[2 * b + 5] + BRANCH_HARDSHIP[2 * b + 6]) / 2
+                        + noise(-10 - b))                                              # 由易到難
+        for b, typ in zip(bscore, types):
+            n0, n1 = 2 * b + 5, 2 * b + 6
+            active = 0 if BRANCH_HARDSHIP[n0] + noise(-20 - n0) >= BRANCH_HARDSHIP[n1] + noise(-20 - n1) else 1
+            node = n0 + active
+            g0, g1 = (node - 5) * 2 + 1, (node - 5) * 2 + 2
+            bad_q = 0 if UE_HARDSHIP[g0] + noise(g0) >= UE_HARDSHIP[g1] + noise(g1) else 1
+            roles[b] = (active, typ, 1 - bad_q)
+    return _tm_assign(ues, roles, protocol)
+
+
+# ── Scenario TH（T-Heterogeneous，訓練專用，2026-09-29）──────────────────────────────
+#
+# 動機：T／TR 的 combo 指派本質上是「round-robin／均勻隨機」——不管是 (i+phase_index)%9
+# 還是逐 UE 獨立均勻抽樣，長期統計下來每個 UE 都會平均經歷全部 9 種（流量×通道）組合，
+# 節點之間沒有真正可利用的持久結構差異。這是刻意設計（確保 PF vs DRL 比較公平，見
+# CLAUDE.md 第 3 節），但也代表 Stage 3 CAPA-Fed 這類「依節點差異做個人化」的聚合機制
+# 沒有素材可學——離線驗證（2026-09-29）發現即使節點有真實本地訓練，Actor 權重跟 12 節點
+# 平均比也只偏離 <1%，個人化幅度小到可忽略，因為「自己的權重」跟「大家的平均」本來就
+# 很接近。
+#
+# TH 保留 T／TR 的量級與結構完全不變（同一組 NORMAL/CONGESTED_TRAFFIC_TIERS／
+# PLOSS_TIERS、同樣兩狀態壅塞週期），只改一件事：combo 指派從「長期均勻」改成
+# 「持久化節點難度偏移＋隨機」，讓某些節點長期下來比其他節點更常遇到高負載／差通道
+# 組合，不會像 T/TR 一樣平均下來大家一樣。**只用於訓練場景，不影響最終跨 Stage 比較用
+# 的標準 Scenario T**（比照 CLAUDE.md「最終 TCP/UDP 量測場景必須維持標準 Scenario T
+# 不動，只能改訓練場景」的既有原則）。
+#
+# 節點難度指派（結構性常數，比照 ROLE_RATIO 的精神，不是即時量測值；2026-09-29 改版，
+# 取代舊版「4 個 relay 分支對半分」的粗略二分法）：**逐節點各自獨立、用固定結構性種子
+# 隨機導出**，不是手動指定哪個節點難哪個節點易——避免看起來像刻意挑數字去湊結果，
+# 對論文方法論的可信度更好交代，也讓每個節點的難度都不同（不會有「同分支內完全一樣」
+# 的問題），異質性比二分法更細緻。`TH_HARDSHIP_SEED` 是跟訓練 seed（TR/R 用的
+# 140000/150000 區段）完全無關、獨立固定的結構性種子——不隨每次訓練的 --seed 改變，
+# 保證這個「哪個節點天生比較難」的指派本身也是**持久、跨訓練輪次一致**的環境屬性，
+# 不是每次重跑訓練就換一批。key 是 UE 實際的 node_id（access 節點），不含 relay Node1~4 本身（沒有 UE
+# 直接掛在它們的 DU 下）。[UE17 已移除 2026-09-30] 原本含 Node4（UE17 直連），已拿掉；每個節點的值由
+# (TH_HARDSHIP_SEED, node_id) 獨立導出，拿掉 Node4 不影響 Node5~12 的值。
+TH_HARDSHIP_SEED: int = 999999999  # 固定結構性種子，與訓練 seed 無關，不要跟著訓練變動
+
+
+def _structural_rng(seed: int, key: int) -> random.Random:
+    """跟下方 `_rng_for()` 完全相同的決定式導出邏輯，這裡獨立複製一份——因為
+    `BRANCH_HARDSHIP` 在模組載入時就要算好（模組級常數），此時 `_rng_for()` 還沒定義
+    （它在檔案後段），不能在載入時期呼叫尚未定義的函式；`_rng_for()` 定義好之後，
+    兩者算出來的值必須一致（同一份雜湊公式），不要各自漂移。"""
+    h = hashlib.sha256(f"{seed}:{key}".encode()).digest()
+    return random.Random(int.from_bytes(h[:8], "big"))
+
+
+BRANCH_HARDSHIP: dict[int, float] = {
+    node_id: 2.0 * _structural_rng(TH_HARDSHIP_SEED, node_id).random() - 1.0
+    for node_id in (5, 6, 7, 8, 9, 10, 11, 12)   # [UE17 已移除 2026-09-30] 原本含 4
+}
+
+# TMH 用的每 UE 固定難度（決定節點內誰是壞 UE）；與 BRANCH_HARDSHIP 同一個結構性種子、不同索引（100+global_id），跟訓練 seed 無關。
+UE_HARDSHIP: dict[int, float] = {
+    gid: 2.0 * _structural_rng(TH_HARDSHIP_SEED, 100 + gid).random() - 1.0 for gid in range(1, 17)
+}
+
+
+TH_RANK_NOISE: float = 0.5   # 排序分數的隨機幅度（±0.5）：節點難度差 >1 時幾乎固定，差距小的節點之間會輪流
+
+
+def scenario_th_heterogeneous(
+    ues: list[UEConfig], seed: int, phase_index: int, protocol: str = "tcp"
+) -> list[tuple[float, float, str]]:
+    """
+    場景 TH：Scenario T 的異質性版本——**每個相位、每台主機用的（流量×通道）組合跟 T 完全相同**（同一批組合、
+    同樣兩狀態壅塞週期），唯一差異是「哪個 UE 拿到哪一個組合」：
+
+      1. 先取 T 在這台主機、這個相位會用的那批組合（T 給第 i 個 UE 的是 TIER_COMBOS[(i+phase_index)%9]），
+         依組合編號由易到難排好（TIER_COMBOS 以流量為主、通道為輔排序，編號越大越吃重）。
+      2. 每個 UE 算排序分數 = 所屬節點的 BRANCH_HARDSHIP + 均勻隨機 ±TH_RANK_NOISE
+         （隨機部分由 _rng_for(seed, global_id, phase_index) 決定式導出，PC2/PC3 各自算出一致結果）。
+      3. 分數低的 UE 拿較易的組合、分數高的拿較難的。
+
+    效果：難度高的節點長期下來較常拿到重的組合（持久異質性，不隨時間平均掉），但每台主機、每個相位的
+    **總負載與 T 逐一相等**，T 與 TH 只差「負載怎麼分給節點」，不差「總共多少負載」。
+
+    2026-09-30 改版前的做法是把每個 UE 的組合編號往「難」的方向平移 round(hardship×4) 格：節點難度平均
+    +0.375（偏正），又集中在 PC2 側，結果 TH 的總負載明顯比 T 重（seed 20260930 下壅塞相位總目標 149 對 118），
+    T 與 TH 同時差了「異質性」與「總負載」兩件事，無法把差異歸因到異質性，已改掉。
+    """
+    configs: list[tuple[float, float, str]] = []
+    n_combos = len(TIER_COMBOS)
+    congested = t_phase_congested(phase_index)
+    traffic_tiers = CONGESTED_TRAFFIC_TIERS if congested else NORMAL_TRAFFIC_TIERS
+    ploss_tiers = CONGESTED_PLOSS_TIERS if congested else NORMAL_PLOSS_TIERS
+    log.info("Scenario TH 相位狀態：%s（phase_index=%d，週期內第 %d/%d 個）",
+             "壅塞" if congested else "正常", phase_index, phase_index % T_CYCLE_PHASES, T_CYCLE_PHASES)
+    pool = sorted((i + phase_index) % n_combos for i in range(len(ues)))   # T 的同一批組合，由易到難
+    scores = []
+    for k, ue in enumerate(ues):
+        noise = (2.0 * _rng_for(seed, ue.global_id, phase_index).random() - 1.0) * TH_RANK_NOISE
+        scores.append((BRANCH_HARDSHIP.get(ue.node_id, 0.0) + noise, k))
+    combo_of = [0] * len(ues)
+    for rank, (_, k) in enumerate(sorted(scores)):
+        combo_of[k] = pool[rank]
+    for k in range(len(ues)):
+        traffic_name, ploss_name = TIER_COMBOS[combo_of[k]]
+        configs.append((ploss_tiers[ploss_name], traffic_tiers[traffic_name], protocol))
+    return configs
+
+
 # ── Scenario TR（隨機化的兩狀態 T，訓練專用，2026-09-26）──────────────────────────────
 # 與量測基準用的固定 Scenario T 結構、量級完全相同（同樣的正常/壅塞兩組流量與通道檔位、同樣的 45% 時間壅塞），
 # 但**壅塞相位的排列與每個 UE 的（流量×通道）組合都由 seed 隨機打散**，訓練資料因此跟測試場景不同分佈
 # （驅動器的原則：訓練場景不可等於測試場景）。跨主機一致性：全部隨機值只由 (seed, phase_index) 導出，
 # PC2/PC3 各自算出相同結果，不需要通訊。
 T_RANDOM_CONGESTED_P: float = 5.0 / 11.0     # 每個相位為壅塞相位的機率（期望 45.5% 的時間壅塞，同 T）
-T_RANDOM_NUM_UES: int = 17                   # 全系統 UE 數（global_id 1~17）
+T_RANDOM_NUM_UES: int = 16                   # 全系統 UE 數（global_id 1~16）[UE17 已移除 2026-09-30] 原本 17
 
 
 def t_random_phase_congested(seed: int, phase_index: int) -> bool:
@@ -686,15 +942,17 @@ def scenario_t_random(
     """
     場景 TR：隨機化的兩狀態 T（訓練用）。狀態（正常/壅塞）隨機，檔位表與 Scenario T 相同。
 
-    每個相位把 9 種（流量×通道）組合各重複到 18 份、依 (seed, phase_index) 洗牌，再依 UE 的 global_id 分配
-    （17 個 UE 各拿一份）：組合分佈與 T 一樣均衡（不會因為獨立抽樣而偶爾全部 UE 同時抽到高流量、壓垮平台的 CPU
+    每個相位把 9 種（流量×通道）組合各重複 2 次共 18 份、依 (seed, phase_index) 洗牌，再依 UE 的 global_id 分配
+    （16 個 UE 各拿一份）：組合分佈與 T 一樣均衡（不會因為獨立抽樣而偶爾全部 UE 同時抽到高流量、壓垮平台的 CPU
     上限），但誰拿哪個組合每個相位都不同。
     """
     congested = t_random_phase_congested(seed, phase_index)
     traffic_tiers = CONGESTED_TRAFFIC_TIERS if congested else NORMAL_TRAFFIC_TIERS
     ploss_tiers = CONGESTED_PLOSS_TIERS if congested else NORMAL_PLOSS_TIERS
     n_combos = len(TIER_COMBOS)
-    perm = [k % n_combos for k in range(T_RANDOM_NUM_UES + 1)]
+    # 固定 2×9=18 份（原本寫成 T_RANDOM_NUM_UES+1，17 個 UE 時剛好 18）：UE17 移除後若改成 16+1=17 份會不平衡，
+    # 也會讓 UE1~16 的洗牌結果全部改變；固定 18 份讓 UE1~16 的組合序列跟移除前完全相同
+    perm = [k % n_combos for k in range(2 * n_combos)]
     _rng_for(seed, -2, phase_index).shuffle(perm)
     log.info("Scenario TR 相位狀態：%s（seed=%d phase_index=%d）",
              "壅塞" if congested else "正常", seed, phase_index)
@@ -703,6 +961,43 @@ def scenario_t_random(
         traffic_name, ploss_name = TIER_COMBOS[perm[(ue.global_id - 1) % len(perm)]]
         configs.append((ploss_tiers[ploss_name], traffic_tiers[traffic_name], protocol))
     return configs
+
+
+def scenario_tm_random(
+    ues: list[UEConfig], seed: int, phase_index: int, protocol: str = "tcp"
+) -> list[tuple[float, float, str]]:
+    """
+    場景 TMR：TM 的隨機化版本（訓練用，2026-10-01）。訓練不可用量測用的固定 TM（同 TR 之於 T）。
+    - 相位狀態：與 TR 相同的隨機壅塞（t_random_phase_congested，約 45%）；正常相位＝TR 的正常相位。
+    - 壅塞相位：節點類型只用 TM 已驗證過的類型庫（TM_M_TYPES／TM_N_TYPES／TM_LIGHT），但每個相位隨機決定
+      N 類 branch 的數量（0／1／2 個，機率 1/4／1/2／1/4）與位置、每個 branch 的主動節點、M/N 類型、節點內好 UE 是哪個。
+      N 類數量有變化，讓「何時該遮」不是固定比例、策略必須看狀態判斷。
+    全部由 _rng_for(seed, -3, phase_index) 決定式導出，兩台主機一致。
+    """
+    congested = t_random_phase_congested(seed, phase_index)
+    if not congested:
+        cfg = scenario_t_random(ues, seed, phase_index, protocol=protocol)
+        log.info("Scenario TMR 相位狀態：正常（seed=%d phase_index=%d）", seed, phase_index)
+        return cfg
+    rng = _rng_for(seed, -3, phase_index)
+    n_n = rng.choices([0, 1, 2], weights=[1, 2, 1])[0]
+    n_branches = sorted(rng.sample(range(4), n_n))
+    active_pos = [rng.randrange(2) for _ in range(4)]
+    good_q = [rng.randrange(2) for _ in range(4)]
+    types = [rng.choice(TM_N_TYPES) if b in n_branches else rng.choice(TM_M_TYPES) for b in range(4)]
+    log.info("Scenario TMR 相位狀態：壅塞（seed=%d phase_index=%d，N 類 branch=%s）", seed, phase_index, n_branches)
+    out = []
+    for ue in ues:
+        gid = ue.global_id
+        node = (gid - 1) // 2 + 5
+        branch, pos, q = (node - 5) // 2, (node - 5) % 2, (gid - 1) % 2
+        if pos != active_pos[branch]:
+            L, bw = TM_LIGHT
+        else:
+            good, bad = types[branch]
+            L, bw = good if q == good_q[branch] else bad
+        out.append((L, bw, protocol))
+    return out
 
 
 def _rng_for(seed: int, global_id: int, phase_index: int) -> random.Random:
@@ -968,7 +1263,9 @@ def run_fixed_scenario(
 
     log.info("=== 場景 %s 開始，持續 %d 秒，protocol=%s ===", scenario_name, duration, protocol)
     configs = scenario_fn(ues, ctrls, protocol)
-    apply_scenario_phase(ues, ctrls, configs)
+    # A/B/C 2026-09-28 起改直接送連續 path_loss_db（引用 Scenario T 的 PLOSS_TIERS 常數，
+    # 見 scenario_a/b/c docstring），不再是 CQI 查表，raw_path_loss 須為 True（同 Scenario R）。
+    apply_scenario_phase(ues, ctrls, configs, raw_path_loss=True)
 
     # 啟動所有 iperf3（apply_scenario_phase 已處理 BW 變更，這裡補起初次啟動）
     for ue in ues:
@@ -1191,20 +1488,319 @@ def run_calibration(node_id: int) -> None:
 
 
 # =============================================================================
+# 主實驗場景 HS／HSH（熱點＋細胞邊緣的結構化隨機場景）與泛化測試場景 G（2026-10-01）
+# =============================================================================
+# 離線評估（/home/lindor/pf16_run_20260930/bh_model/rs_design.py）：通用隨機場景（G）的壅塞相位，PF 與上限的平均差距只有
+# 約 0.2~1%（TCP），PF 已接近最佳；改進空間只出現在「下游熱點＋relay 帶細胞邊緣 UE」與「同節點重需求 UE＋邊緣 UE」。
+# HS 的每個壅塞相位一定包含這兩種現象（relay 與 access 同時壅塞），其餘全部隨機；並含「不該介入」的變體。
+# 相位狀態沿用 T 的 11 相位骨架（壅塞相位 2/4/5/7/9），量測分析可直接沿用。
+#   熱點 branch（隨機 1 支）：一個 access 節點 2 個好通道 UE 各需求 18~24、另一個 2 個好通道 UE 各需求 10~16；
+#     relay 直連 UE：80% 為細胞邊緣（L23/24、需求 4~8，該介入：讓 slot 給 backhaul）、20% 為好通道（不該介入）。
+#   （2026-10-01 調參：離線上限壅塞相位平均 +10.5%、中位數 +12.4%；60%／16~22／8~14 時為 +5.3%。）
+#   混合 branch（其餘 3 支隨機 1 支）：一個 access 節點＝重需求 UE（L18/22、16~22）＋邊緣 UE（L23/24、4~8）；
+#     30% 為 N 類變體（重需求 UE 改需求 6~9，不該遮邊緣 UE）。另一個 access 節點與 relay UE 輕負載。
+#   其餘 2 支 branch：背景輕負載（通道依 G 的分布、需求 0.3~1）。混合 branch 的輕節點與 relay UE 也是 0.3~1。
+#   正常相位：G 的抽樣，總需求縮放到 HS_NORMAL_TOTAL。
+# HSH（異質版）：熱點／混合 branch 依每個 branch 固定的熱度機率抽（HS_BRANCH_HOT_P，依結構性種子排列），其餘同 HS。
+HS_L_TIERS: list[tuple[float, float]] = [(3.0, 0.10), (10.0, 0.25), (18.0, 0.25), (22.0, 0.20), (23.0, 0.10), (24.0, 0.10)]
+HS_NORMAL_TOTAL: float = 60.0      # 正常相位總需求（donor 上限約 109 的 55%）
+G_CONGESTED_TOTAL: float = 115.0   # G 壅塞相位總需求（donor 上限的約 105%）
+HS_UE_CAP: float = 25.0
+HS_BRANCH_HOT_P: list[float] = [0.55, 0.25, 0.12, 0.08]
+HS_VERY_RANGE: tuple[float, float] = (18.0, 24.0)    # 熱點 branch 極重 access 節點的每 UE 需求（PB 實測配置 22）
+HS_HEAVY_RANGE: tuple[float, float] = (10.0, 14.0)    # 熱點 branch 中等 access 節點的每 UE 需求（PB 實測配置 12）
+HS_BG_RANGE: tuple[float, float] = (0.3, 1.0)        # 非熱點 branch 的每 UE 需求（PB 實測配置 1）
+HS_P_RELAY_EDGE: float = 0.8       # 熱點 branch 的 relay UE 為細胞邊緣 L24（該介入）的機率；否則 L10（不該遮）
+HS_RELAY_UE_RANGE: tuple[float, float] = (6.0, 10.0)  # 熱點 branch relay UE 的需求（PB 實測配置 8）
+# 2026-10-03 HS 第四版：每個壅塞相位另在一個非熱點 branch 放一個「混合 access 節點」（場景 PA 平台實測：M 類遮壞 UE +12～14%、
+# N 類遮了 −17～−25%），讓 access 節點也有依狀態而定的決策。M 類機率 HS_P_ACCESS_M，否則 N 類；哪個 UE 是好 UE 隨機。
+HS_P_ACCESS_M: float = 0.6
+HS_MIX_M_GOOD_RANGE: tuple[float, float] = (20.0, 24.0)   # M 類好 UE（L22）需求（PA 實測配置 22）
+HS_MIX_N_GOOD_RANGE: tuple[float, float] = (7.0, 9.0)     # N 類好 UE（L22）需求（PA 實測配置 8）
+HS_MIX_BAD_RANGE: tuple[float, float] = (5.0, 7.0)        # 壞 UE（L24）需求（PA 實測配置 6）
+# HS 第五版（2026-10-04，HS5＝量測、HSX5＝訓練）：混合 access 節點的好 UE 改為好通道 L10（每個 slot 送得多，遮壞 UE 讓出的 slot 價值高）、
+# 壞 UE 需求提高到 10～12（PF 下會佔走較多 slot），擴大 access 層的改善空間；量測放 2 個混合節點、訓練放 3 個。
+HS5_MIX_GOOD_L: float = 10.0
+HS5_MIX_M_GOOD_RANGE: tuple[float, float] = (20.0, 24.0)
+HS5_MIX_N_GOOD_RANGE: tuple[float, float] = (6.0, 8.0)
+HS5_MIX_BAD_RANGE: tuple[float, float] = (10.0, 12.0)
+# HSB（HS 平衡版，2026-10-04）：結構同 HS 第四版（PB 熱點＋1 個混合 access 節點），但需求縮小，讓壅塞總需求（約 95）落在
+# 平台容量（CPU 限制約 100～108 sim Mbps）以內——第四版約 115，超過容量，排程改善被平台上限壓縮（同 seed 規則增益第三版 +9、第四版 +5～7）。
+HSB_RANGES: dict[str, tuple[float, float]] = {
+    "very": (15.0, 19.0), "heavy": (8.0, 11.0), "relay_ue": (6.0, 10.0),
+    "mix_m_good": (14.0, 17.0), "mix_n_good": (6.0, 8.0), "mix_bad": (5.0, 7.0),
+}
+# HSC（2026-10-04）：熱點 branch 完全同 HS 第三版（relay backhaul 瓶頸，規則 +13%），混合 access 節點保留但需求縮小
+# （M 類好 UE 12～14＋壞 UE 5～7、N 類好 UE 5～6），只取代一個非熱點 branch 的背景負載，總需求只比第三版多約 15。
+HSC_RANGES: dict[str, tuple[float, float]] = {"mix_m_good": (12.0, 14.0), "mix_n_good": (5.0, 6.0), "mix_bad": (5.0, 7.0)}
+# HSD（2026-10-04）：第三版（PF 約 70，熱點 relay backhaul 是局部瓶頸）的熱點 branch 中，把「中等」access 節點改成混合節點
+# （M 類 60%：好 UE L22 需求 12～14＋壞 UE L24 需求 5～7；N 類：好 UE 需求 4～6），其他 branch 維持背景輕負載、不加混合節點。
+# 理由：第四版／HSB／HSC 的 PF 都在 81～83（平台總吞吐量天花板附近），排程沒有空間；access 決策要放在被卡住的熱點 branch 裡。
+HSD_MIX = {"m_good": (12.0, 14.0), "n_good": (4.0, 6.0), "bad": (5.0, 7.0)}
+# HSE（2026-10-04）：HSD（熱點 branch＝relay backhaul 瓶頸，含熱點內混合節點）＋另一個非熱點 branch 放一個小的混合 access 節點
+# （瓶頸在 access 自己的無線端：M 類好 UE L22 需求 9～11＋壞 UE L24 4～6；N 類好 UE 3～4），熱點極重節點調低到 15～19。
+# HSD 實測：只有 relay 介入 +23%，但熱點內的 access 遮罩有害（瓶頸在 backhaul）；access 的正向決策要放在 backhaul 沒卡住的分支。
+# 2026-10-04 參數修正（HSE v2）：v1 平台實測 PF 下熱點外好 UE 已拿到需求的約 99%（seed 1041／20260930 逐相位），access 沒有缺口。
+# 改為：熱點外混合節點回到 PA 規模（M 類好 UE 20～24、壞 UE 5～7、N 類好 UE 7～9）、拿掉熱點內混合節點（遮了有害），
+# 熱點 branch 減量（極重 11～13、中等 7～9）把壅塞總需求維持在約 89。v1 的範圍保留在 HSE_V1_RANGES。
+HSE_V1_RANGES: dict = {"hsd": True, "very": (15.0, 19.0), "mix_m_good": (9.0, 11.0), "mix_n_good": (3.0, 4.0), "mix_bad": (4.0, 6.0)}
+# HSE v3（2026-10-04）：v2 把熱點 branch 減量後熱點下游 access 在 PF 下多已吃飽（relay 沒有空間），且 DU 速度 0.300、CPU 閒置 66～78%，
+# 平台仍有餘裕 → 熱點加回第三版的量（極重 15～19、中等 10～14），熱點外混合節點維持 v2。v2 的範圍保留在 HSE_V2_RANGES。
+HSE_V2_RANGES: dict = {"very": (11.0, 13.0), "heavy": (7.0, 9.0), "mix_m_good": (20.0, 24.0), "mix_n_good": (7.0, 9.0), "mix_bad": (5.0, 7.0)}
+HSE_RANGES: dict = {"very": (15.0, 19.0), "heavy": (10.0, 14.0), "mix_m_good": (20.0, 24.0), "mix_n_good": (7.0, 9.0), "mix_bad": (5.0, 7.0)}
+HS_MIX_KEY: int = 100                                     # _rng_for 的鍵（避開 UE 編號 1～24 與 0）
+_HS_BRANCH_ORDER: list[int] = sorted(range(4), key=lambda b: _structural_rng(TH_HARDSHIP_SEED + 7, b).random())
+
+
+def _hs_nodes_of_branch(b: int) -> tuple[int, int, int]:
+    """branch b（0~3）＝ relay b+1、access 2b+5、2b+6。"""
+    return b + 1, 2 * b + 5, 2 * b + 6
+
+
+def _hs_ues_of_node(n: int) -> list[int]:
+    return [2 * n - 9, 2 * n - 8] if n >= 5 else [15 + 2 * n, 16 + 2 * n]
+
+
+def _hs_tier(rng: random.Random) -> float:
+    return rng.choices([l for l, _ in HS_L_TIERS], [p for _, p in HS_L_TIERS])[0]
+
+
+def _g_all(seed: int, phase_index: int, total: float) -> dict[int, tuple[float, float]]:
+    """通用隨機：每個節點負載權重 Gamma(1)、每 UE 通道依 HS_L_TIERS、需求＝權重×U(0.5,1.5)，整體縮放到 total。"""
+    prng = _rng_for(seed, 0, phase_index)
+    w = {n: prng.gammavariate(1.0, 1.0) for n in range(1, 13)}
+    raw: dict[int, tuple[float, float]] = {}
+    for u in range(1, 25):
+        r = _rng_for(seed, u, phase_index)
+        n = (u - 1) // 2 + 5 if u <= 16 else (u - 17) // 2 + 1
+        raw[u] = (_hs_tier(r), w[n] * r.uniform(0.5, 1.5))
+    scale = total / sum(d for _, d in raw.values())
+    return {u: (L, min(HS_UE_CAP, d * scale)) for u, (L, d) in raw.items()}
+
+
+def _hs_all(seed: int, phase_index: int, hetero: bool, n_mix: int = 1, v5: bool = False,
+            rng_over: Optional[dict] = None) -> tuple[dict[int, tuple[float, float]], str]:
+    """
+    HS／HSH 壅塞相位的全部 24 個 UE 配置與一行描述（給 log）。
+
+    2026-10-02 改版：每個壅塞相位＝一個「PB 結構」熱點 branch（平台實測 PF 74 → 遮 relay 邊緣 UE 84，+14.5%；
+    動態規則 RULE_KIND=dyn 83，+12%），其他三個 branch 輕負載。熱點 relay 的兩個直連 UE 以 HS_P_RELAY_EDGE 機率在細胞邊緣
+    （L24，該讓 slot 給 backhaul），否則好通道（L10，不該遮）；下游一個 access 節點極重、一個中等，全部 L10。
+    數值在 PB 實測配置（relay UE 8、下游 12／22）附近抽樣。原本的「混合 access 節點」結構平台實測沒有增益（好 UE 在 PF 下已被滿足），已移除。
+    """
+    prng = _rng_for(seed, 0, phase_index)
+    branches = list(range(4))
+    if hetero:
+        p = {_HS_BRANCH_ORDER[i]: HS_BRANCH_HOT_P[i] for i in range(4)}
+        hot = prng.choices(branches, [p[b] for b in branches])[0]
+    else:
+        hot = prng.choice(branches)
+    relay_edge = prng.random() < HS_P_RELAY_EDGE
+    cfg: dict[int, tuple[float, float]] = {}
+    r = lambda u: _rng_for(seed, u, phase_index)
+    rl, a1, a2 = _hs_nodes_of_branch(hot)
+    very, heavy = (a1, a2) if prng.random() < 0.5 else (a2, a1)
+    R = rng_over or {}
+    for u in _hs_ues_of_node(very):
+        g = r(u); cfg[u] = (10.0, g.uniform(*R.get("very", HS_VERY_RANGE)))
+    hsd_desc = ""
+    if R.get("hsd"):
+        hr = _rng_for(seed, HS_MIX_KEY + 50, phase_index)
+        hm = hr.random() < HS_P_ACCESS_M
+        hg, hb = _hs_ues_of_node(heavy) if hr.random() < 0.5 else _hs_ues_of_node(heavy)[::-1]
+        cfg[hg] = (22.0, hr.uniform(*(HSD_MIX["m_good"] if hm else HSD_MIX["n_good"])))
+        cfg[hb] = (24.0, hr.uniform(*HSD_MIX["bad"]))
+        hsd_desc = f"混合 access Node{heavy}＝{'M 類→該遮' if hm else 'N 類→不該遮'}（好 UE{hg}、壞 UE{hb}）"
+    else:
+        for u in _hs_ues_of_node(heavy):
+            g = r(u); cfg[u] = (10.0, g.uniform(*R.get("heavy", HS_HEAVY_RANGE)))
+    for u in _hs_ues_of_node(rl):
+        g = r(u); cfg[u] = ((24.0 if relay_edge else 10.0), g.uniform(*R.get("relay_ue", HS_RELAY_UE_RANGE)))
+    for b in branches:
+        if b == hot:
+            continue
+        rb, b1, b2 = _hs_nodes_of_branch(b)
+        for u in _hs_ues_of_node(b1) + _hs_ues_of_node(b2) + _hs_ues_of_node(rb):
+            g = r(u); cfg[u] = (_hs_tier(g), g.uniform(*HS_BG_RANGE))
+    # 混合 access 節點（第四版）：用獨立的亂數流，熱點與背景的抽樣與第三版逐值相同。
+    # n_mix＞1（訓練用 HSX，2026-10-04）：每個非熱點 branch 各放一個混合節點（第一個與 HS 逐值相同，其餘用另外的鍵），
+    # access 決策狀態約 ×3；量測場景 HS 仍為 n_mix=1。
+    mrng = _rng_for(seed, HS_MIX_KEY, phase_index)
+    others = [b for b in branches if b != hot]
+    mb0 = mrng.choice(others)
+    order = [mb0] + [b for b in others if b != mb0]
+    mixdesc = []
+    for i, mb in enumerate(order[:n_mix]):
+        rr = mrng if i == 0 else _rng_for(seed, HS_MIX_KEY + i, phase_index)
+        mnode = _hs_nodes_of_branch(mb)[1 + rr.randrange(2)]
+        m_type = rr.random() < HS_P_ACCESS_M
+        good_u, bad_u = _hs_ues_of_node(mnode) if rr.random() < 0.5 else _hs_ues_of_node(mnode)[::-1]
+        if v5:
+            cfg[good_u] = (HS5_MIX_GOOD_L, rr.uniform(*(HS5_MIX_M_GOOD_RANGE if m_type else HS5_MIX_N_GOOD_RANGE)))
+            cfg[bad_u] = (24.0, rr.uniform(*HS5_MIX_BAD_RANGE))
+        else:
+            cfg[good_u] = (22.0, rr.uniform(*(R.get("mix_m_good", HS_MIX_M_GOOD_RANGE) if m_type else R.get("mix_n_good", HS_MIX_N_GOOD_RANGE))))
+            cfg[bad_u] = (24.0, rr.uniform(*R.get("mix_bad", HS_MIX_BAD_RANGE)))
+        mixdesc.append(f"混合 access Node{mnode}＝{'M 類→該遮' if m_type else 'N 類→不該遮'}（好 UE{good_u}、壞 UE{bad_u}）")
+    if hsd_desc:
+        mixdesc = [hsd_desc] + (mixdesc if n_mix > 0 else [])
+    desc = (f"熱點 branch={hot + 1}（PB 結構；relay UE {'邊緣→該介入' if relay_edge else '好通道→不該介入'}）；" + "；".join(mixdesc))
+    return {u: (L, min(HS_UE_CAP, d)) for u, (L, d) in cfg.items()}, desc
+
+
+def scenario_hs(name: str, ues: list[UEConfig], seed: int, phase_index: int, protocol: str = "tcp") -> list[tuple[float, float, str]]:
+    """HS／HSH／G：對 ues（任意主機子集，含 relay UE）回傳配置；每台主機都會印相位狀態（含 PC1）。"""
+    congested = t_phase_congested(phase_index)
+    if not congested:
+        allc = _g_all(seed, phase_index, HS_NORMAL_TOTAL); desc = f"正常相位（通用隨機，總需求 {HS_NORMAL_TOTAL:.0f}）"
+    elif name == "G":
+        allc = _g_all(seed, phase_index, G_CONGESTED_TOTAL); desc = f"壅塞相位（通用隨機，總需求 {G_CONGESTED_TOTAL:.0f}）"
+    else:
+        allc, desc = _hs_all(seed, phase_index, hetero=(name == "HSH"),
+                             n_mix={"HSX": 3, "HSX5": 3, "HS5": 2, "HSD": 0}.get(name, 1), v5=name in ("HS5", "HSX5"),
+                             rng_over={"HSB": HSB_RANGES, "HSC": HSC_RANGES, "HSD": {"hsd": True}, "HSE": HSE_RANGES}.get(name))
+    log.info("Scenario %s 相位狀態：%s（phase_index=%d，週期內第 %d/%d 個）%s", name, "壅塞" if congested else "正常",
+             phase_index, phase_index % T_CYCLE_PHASES, T_CYCLE_PHASES, desc)
+    return [(allc[u.global_id][0], allc[u.global_id][1], protocol) for u in ues]
+
+
+# =============================================================================
+# relay 直連 UE（UE17~24，2026-10-01）與場景配置的單一入口
+# =============================================================================
+# relay 直連 UE 的角色（需求、下行通道惡化）尚未設計：在 relay_ue_configs() 定義之前，所有場景對 relay UE 一律閒置
+# （需求 0 → iperf3 不啟動），下行通道設為 RELAY_UE_DEFAULT_L，16 個 access UE 的行為與加入 relay UE 之前完全相同。
+# 場景執行（run_dynamic_scenario）與量測分析（iab/analyze_stage.py）都經由 scenario_configs() 取每相位配置，
+# 目標值只在這裡定義一次。
+
+RELAY_UE_IDS: frozenset[int] = frozenset(range(17, 25))
+RELAY_UE_DEFAULT_L: float = 10.0   # 場景損耗指標 L（下行 MCS≈28）；relay UE 閒置時的通道
+
+
+def is_relay_ue(ue: UEConfig) -> bool:
+    return ue.global_id in RELAY_UE_IDS
+
+
+def relay_ue_configs(
+    scenario: str, ues: list[UEConfig], phase_index: int, seed: Optional[int] = None, protocol: str = "tcp"
+) -> list[tuple[float, float, str]]:
+    """
+    relay 直連 UE 每相位的 (L, 需求 sim Mbps, 協定)，順序同 ues。
+
+    目前（2026-10-01）只有試驗場景 PB／PU 定義了 relay UE（RELAY_PILOT_CFGS）；其他場景一律閒置，下行通道 RELAY_UE_DEFAULT_L。
+    之後要讓 relay UE 產生流量或惡化它的下行路徑時只改這裡：L 經 UE 端 chanmod 套用（set_ue_dl_degradation，
+    relay UE 用的是 nrue.uicc.chanmod.conf，與 access UE 相同），需求 > 0 就會啟動 iperf3。
+    """
+    if scenario in RELAY_PILOT_CFGS:
+        return scenario_relay_pilot(scenario, ues, phase_index, protocol)
+    return [(RELAY_UE_DEFAULT_L, 0.0, protocol) for _ in ues]
+
+
+# relay 直連 UE 平台試驗（2026-10-01，固定配置、每相位相同，同場景 P 的用法）：只壓 branch 1（relay Node1、access Node5/6），
+# 其他 access UE 輕負載（L=10、需求 1），其他 relay UE 閒置。離線模型（/home/lindor/pf16_run_20260930/bh_model/relay_scan2.py）：
+#   PB（backhaul 與 relay 自己 UE 的取捨）：relay 兩個壞通道 UE＋下游極重負載 → relay 層上限 TCP +12.4／UDP +13.5 sim Mbps
+#   PU（relay 自己 UE 之間）：relay 一個 L18 重需求＋一個 L24 UE，下游重負載 → relay 層上限 +7.5（TCP／UDP）
+RELAY_PILOT_CFGS: dict[str, dict[int, tuple[float, float]]] = {
+    "PB": {1: (10.0, 12.0), 2: (10.0, 12.0), 3: (10.0, 22.0), 4: (10.0, 22.0), 17: (24.0, 8.0), 18: (24.0, 8.0)},
+    "PU": {1: (10.0, 12.0), 2: (10.0, 12.0), 3: (10.0, 12.0), 4: (10.0, 12.0), 17: (18.0, 22.0), 18: (24.0, 4.0)},
+    # PA（2026-10-03，access 層決策試驗）：Node5／Node9＝M 類（好 UE L22 需求 22＋壞 UE L24 需求 6，該遮壞 UE；同場景 P），
+    # Node7／Node11＝N 類（好 UE L22 需求 8＋壞 UE L24 需求 6，好 UE 本來就吃得飽，遮了只會虧；同 TM 的 N22）；其他 access UE 輕負載、relay UE 閒置。
+    "PA": {1: (22.0, 22.0), 2: (24.0, 6.0), 9: (22.0, 22.0), 10: (24.0, 6.0),
+           5: (22.0, 8.0), 6: (24.0, 6.0), 13: (22.0, 8.0), 14: (24.0, 6.0)},
+    # SW1／SW2（2026-10-03，Σlog 遮罩強度掃描）：branch 1＝PB 結構（relay UE17/18 L24，下游 Node5 2×需求 12、Node6 2×需求 22），
+    # Node9＝混合 access 節點（好 UE9 L22、壞 UE10 L24 需求 6）。兩組只差需求：SW1 relay UE 4／好 UE9 22，SW2 relay UE 10／好 UE9 14。
+    # 用固定遮罩檔位掃描，看 Σlog（relay 子樹 UE17,18,1~4；access 子樹 UE9,10）的最佳檔位是否隨需求改變。
+    "SW1": {17: (24.0, 4.0), 18: (24.0, 4.0), 1: (10.0, 12.0), 2: (10.0, 12.0), 3: (10.0, 22.0), 4: (10.0, 22.0),
+            9: (22.0, 22.0), 10: (24.0, 6.0)},
+    "SW2": {17: (24.0, 10.0), 18: (24.0, 10.0), 1: (10.0, 12.0), 2: (10.0, 12.0), 3: (10.0, 22.0), 4: (10.0, 22.0),
+            9: (22.0, 14.0), 10: (24.0, 6.0)},
+    # SW3（2026-10-03，遮罩位置敏感度分析）：relay UE 需求 10（同 SW2）＋access 好 UE9 需求 22（同 SW1），兩層的遮罩效果都較明顯。
+    "SW3": {17: (24.0, 10.0), 18: (24.0, 10.0), 1: (10.0, 12.0), 2: (10.0, 12.0), 3: (10.0, 22.0), 4: (10.0, 22.0),
+            9: (22.0, 22.0), 10: (24.0, 6.0)},
+}
+
+
+def scenario_relay_pilot(name: str, ues: list[UEConfig], phase_index: int, protocol: str = "tcp") -> list[tuple[float, float, str]]:
+    """relay 直連 UE 平台試驗 PB／PU：固定配置，每個相位相同（對 access UE 與 relay UE 都適用）。"""
+    if any(not is_relay_ue(u) for u in ues):
+        log.info("Scenario %s 相位狀態：壅塞（phase_index=%d，固定配置）", name, phase_index)
+    cfg = RELAY_PILOT_CFGS[name]
+    out = []
+    for ue in ues:
+        default = (RELAY_UE_DEFAULT_L, 0.0) if is_relay_ue(ue) else (10.0, 1.0)
+        L, bw = cfg.get(ue.global_id, default)
+        out.append((L, bw, protocol))
+    return out
+
+
+# access UE（UE1~16）的場景函數；簽名統一為 (ues, phase_index, seed, protocol)
+_ACCESS_SCENARIO_FNS: dict[str, Callable[..., list[tuple]]] = {
+    "T":   lambda u, pi, seed, p: scenario_t_tiered(u, pi, protocol=p),
+    "TR":  lambda u, pi, seed, p: scenario_t_random(u, seed, pi, protocol=p),
+    "TH":  lambda u, pi, seed, p: scenario_th_heterogeneous(u, seed, pi, protocol=p),
+    "TM":  lambda u, pi, seed, p: scenario_tm_mixed(u, pi, protocol=p),
+    "TMR": lambda u, pi, seed, p: scenario_tm_random(u, seed, pi, protocol=p),
+    "TMH": lambda u, pi, seed, p: scenario_tmh_heterogeneous(u, seed, pi, protocol=p),
+    "P":   lambda u, pi, seed, p: scenario_p_pilot(u, pi, protocol=p),
+    "PB":  lambda u, pi, seed, p: scenario_relay_pilot("PB", u, pi, protocol=p),
+    "PU":  lambda u, pi, seed, p: scenario_relay_pilot("PU", u, pi, protocol=p),
+    "PA":  lambda u, pi, seed, p: scenario_relay_pilot("PA", u, pi, protocol=p),
+    "SW1": lambda u, pi, seed, p: scenario_relay_pilot("SW1", u, pi, protocol=p),
+    "SW2": lambda u, pi, seed, p: scenario_relay_pilot("SW2", u, pi, protocol=p),
+    "SW3": lambda u, pi, seed, p: scenario_relay_pilot("SW3", u, pi, protocol=p),
+    "R":   lambda u, pi, seed, p: scenario_r_realistic(u, seed, pi, protocol=p),
+}
+
+
+def _phase_congested(scenario: str, seed: Optional[int], phase_index: int) -> Optional[bool]:
+    """場景在這個相位是否為壅塞相位（R 沒有狀態標籤，回傳 None）。"""
+    if scenario in ("T", "TH", "TM", "TMH"):
+        return t_phase_congested(phase_index)
+    if scenario in ("TR", "TMR"):
+        return t_random_phase_congested(seed, phase_index)
+    if scenario in ("P", "PB", "PU", "PA", "SW1", "SW2", "SW3"):
+        return True
+    return None
+
+
+def scenario_configs(
+    scenario: str, ues: list[UEConfig], phase_index: int, seed: Optional[int] = None, protocol: Optional[str] = "tcp"
+) -> list[tuple]:
+    """
+    場景在 phase_index 對 ues（任意主機的 UE 子集，可含 relay UE）的配置，順序同 ues。
+    access UE 交給原場景函數、relay UE 交給 relay_ue_configs()。本機只有 relay UE（PC1）時，access 場景函數不會被
+    呼叫、不會印出「相位狀態」log；這裡補印同樣格式的一行，量測分析才能對齊相位。
+    protocol=None 只用於 Scenario R（TCP/UDP 混合）；relay UE 此時用 tcp。
+    """
+    if scenario in ("HS", "HSH", "G", "HSX", "HS5", "HSX5", "HSB", "HSC", "HSD", "HSE"):   # 完整場景：access UE 與 relay UE 一起抽樣（HSX＝訓練用，3 個混合 access 節點）
+        return scenario_hs(scenario, ues, seed, phase_index, protocol or "tcp")
+    access = [u for u in ues if not is_relay_ue(u)]
+    relay = [u for u in ues if is_relay_ue(u)]
+    acc = _ACCESS_SCENARIO_FNS[scenario](access, phase_index, seed, protocol) if access else []
+    if relay and not access:
+        cong = _phase_congested(scenario, seed, phase_index)
+        if cong is not None:
+            log.info("Scenario %s 相位狀態：%s（phase_index=%d，本機只有 relay 直連 UE）",
+                     scenario, "壅塞" if cong else "正常", phase_index)
+    rel = relay_ue_configs(scenario, relay, phase_index, seed, protocol or "tcp") if relay else []
+    it_a, it_r = iter(acc), iter(rel)
+    return [next(it_r) if is_relay_ue(u) else next(it_a) for u in ues]
+
+
+# =============================================================================
 # 入口
 # =============================================================================
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="IAB 流量+路徑損耗場景控制器（三主機 12-node/17-UE 版）"
+        description="IAB 流量+路徑損耗場景控制器（三主機 12-node/24-UE 版：UE17~24 為 relay 直連 UE）"
     )
     parser.add_argument(
         "--host", choices=["pc1", "pc2", "pc3"], default=None,
         help="只控制該主機負責的 UE/Node 子集（見 CLAUDE.md HOST_OF_NODE）。"
-             "未指定時嘗試從 hostname 猜測，猜不出來則控制全部 17 個 UE（單機測試用）。",
+             "未指定時嘗試從 hostname 猜測，猜不出來則控制全部 24 個 UE（單機測試用）。",
     )
     parser.add_argument(
-        "--scenario", choices=["A", "B", "C", "D", "R", "T", "TR"], default="R",
+        "--scenario", choices=["A", "B", "C", "D", "R", "T", "TR", "TH", "P", "PB", "PU", "PA", "SW1", "SW2", "SW3", "TM", "TMR", "TMH", "HS", "HSH", "G", "HSX", "HS5", "HSX5", "HSB", "HSC", "HSD", "HSE"], default="R",
         help="場景選擇：A=CQI差異, B=流量不均, C=最差公平性, D=均勻隨機（已被R取代）, "
              "R=真實隨機（預設，area-uniform path_loss + 持久化 profile + 協定混合）, "
              "T=分層交叉（低/中/高流量 × 低/中/高路徑損耗 3x3，2026-09-18 新增，"
@@ -1258,6 +1854,11 @@ def parse_args() -> argparse.Namespace:
              "每相位剛好 --phase-duration 秒、編號連號；未指定則沿用固定 epoch（相位可能跳號）。",
     )
     parser.add_argument(
+        "--congested-only", action="store_true",
+        help="驗證用（2026-10-03）：只跑 T 骨架的壅塞相位——第 k 個實際相位對應週期內第 k 個壅塞相位的 phase_index"
+             "（2,4,5,7,9,13,...），log 印出的是對應後的 phase_index，analyze_stage.py 不需修改。正式量測不要用。",
+    )
+    parser.add_argument(
         "--on-crash", choices=["abort", "warn"], default=None,
         help="場景期間本機 UE/MT/DU 容器崩潰重啟時的處理：abort=清理後以 exit code 2 結束"
              "（本次量測無效）、warn=只記錄錯誤繼續跑。預設：有限相位/固定場景（量測）=abort，"
@@ -1278,7 +1879,7 @@ def main() -> None:
     if host:
         log.info("--host=%s：只控制該主機負責的 UE/Node 子集", host)
     else:
-        log.warning("未指定 --host 且無法從 hostname 猜測，將控制全部 17 個 UE（單機測試用）")
+        log.warning("未指定 --host 且無法從 hostname 猜測，將控制全部 24 個 UE（單機測試用）")
 
     if args.calibrate:
         run_calibration(args.node)
@@ -1286,6 +1887,12 @@ def main() -> None:
 
     ues = build_ue_list(host)
     ctrls = build_controllers(host)
+    if args.scenario in ("A", "B", "C", "D") and any(is_relay_ue(u) for u in ues):
+        # 舊固定／均勻隨機場景沒有 relay 直連 UE 的定義，只控制 access UE（relay UE 維持閒置、通道不動）
+        ues = [u for u in ues if not is_relay_ue(u)]
+        if not ues:
+            log.info("場景 %s 不控制 relay 直連 UE，本機（--host=%s）沒有其他 UE，直接結束", args.scenario, host)
+            return
     if not ues:
         log.error("此 --host=%s 沒有任何 UE，請確認 HOST_OF_NODE/NODE_CONFIG 設定", host)
         sys.exit(1)
@@ -1293,8 +1900,8 @@ def main() -> None:
     if not args.no_wait:
         wait_for_ue_interfaces(ues)
 
-    finite = args.scenario in ("A", "B", "C") or (
-        args.scenario in ("T", "TR", "R") and args.num_phases is not None)
+    # 有限相位（量測）一律 abort；2026-10-01 前這裡只列 T/TR/R，TH/TM/TMH/P 的量測崩潰時只會警告
+    finite = args.scenario in ("A", "B", "C") or (args.scenario != "D" and args.num_phases is not None)
     on_crash = args.on_crash or ("abort" if finite else "warn")
     guard = CrashGuard(abort=(on_crash == "abort"))
     guard.arm()
@@ -1305,64 +1912,57 @@ def main() -> None:
         sys.exit(2)
 
 
+def _congested_phase_index(k: int) -> int:
+    """第 k 個（從 0 起）壅塞相位在 T 骨架中的 phase_index（--congested-only 用）。"""
+    cong = sorted(T_CONGESTED_PHASES)
+    return (k // len(cong)) * T_CYCLE_PHASES + cong[k % len(cong)]
+
+
 def _run_selected(args: argparse.Namespace, ues: list[UEConfig],
                   ctrls: dict[int, ChannelModController], guard: CrashGuard) -> None:
     if args.scenario == "D":
         run_dynamic_scenario(ues, ctrls, phase_duration=args.phase_duration, guard=guard)
-    elif args.scenario == "T":
-        FIXED_EPOCH = 1700000000.0  # 同 Scenario R 用的錨點，純粹是絕對時間基準，兩者不衝突
-        t_protocol = args.protocol or "tcp"
-        log.info("Scenario T protocol=%s", t_protocol)
-        run_dynamic_scenario(
-            ues, ctrls,
-            phase_duration=args.phase_duration,
-            phase_fn=lambda u, phase_index: scenario_t_tiered(u, phase_index, protocol=t_protocol),
-            raw_path_loss=True,
-            scenario_label="T",
-            max_phases=args.num_phases,
-            epoch=(args.phase_origin if args.phase_origin else FIXED_EPOCH),
-            guard=guard,
-            grid_align=bool(args.phase_origin),
-        )
-    elif args.scenario == "TR":
-        import secrets
+        return
+    if args.scenario in ("A", "B", "C"):
+        run_fixed_scenario(args.scenario, ues, ctrls, duration=args.duration,
+                           protocol=args.protocol or "tcp", guard=guard)
+        return
+
+    # 動態場景（T/TR/TH/TM/TMR/TMH/P/R）：每相位配置一律經 scenario_configs()（access UE＋relay 直連 UE）
+    import secrets
+    scn = args.scenario
+    seed: Optional[int] = None
+    if scn in ("TR", "TH", "TMR", "TMH", "R", "HS", "HSH", "G", "HSX", "HS5", "HSX5", "HSB", "HSC", "HSD", "HSE"):
         seed = args.seed if args.seed is not None else secrets.randbits(32)
-        t_protocol = args.protocol or "tcp"
-        log.info("Scenario TR seed=%d protocol=%s（兩台主機必須用同一個 --seed；建議同時給 --phase-origin）", seed, t_protocol)
-        run_dynamic_scenario(
-            ues, ctrls,
-            phase_duration=args.phase_duration,
-            phase_fn=lambda u, phase_index: scenario_t_random(u, seed, phase_index, protocol=t_protocol),
-            raw_path_loss=True,
-            scenario_label="TR",
-            max_phases=args.num_phases,
-            epoch=(args.phase_origin if args.phase_origin else 1700000000.0),
-            guard=guard,
-            grid_align=bool(args.phase_origin),
-        )
-    elif args.scenario == "R":
-        import secrets
-        seed = args.seed if args.seed is not None else secrets.randbits(32)
+    if scn == "R":
+        proto: Optional[str] = args.protocol   # None＝TCP/UDP 混合（P_UDP）
         log.info("Scenario R seed=%d（PC1/PC2/PC3 三邊用同一個 --seed %d 才會場景一致）protocol=%s",
                  seed, seed, args.protocol or "mix")
         assign_ue_profiles(ues, seed)
-        # 固定 epoch：兩台主機各自的 process 只要系統時鐘沒有嚴重飄移就會落在同一個
-        # phase_index，不需要任何跨主機通訊或啟動時刻同步。
-        FIXED_EPOCH = 1700000000.0  # 2023-11-14，純粹當作絕對時間的錨點，無特殊意義
-        run_dynamic_scenario(
-            ues, ctrls,
-            phase_duration=args.phase_duration,
-            phase_fn=lambda u, phase_index: scenario_r_realistic(u, seed, phase_index, protocol=args.protocol),
-            raw_path_loss=True,
-            scenario_label="R",
-            max_phases=args.num_phases,
-            epoch=(args.phase_origin if args.phase_origin else FIXED_EPOCH),
-            guard=guard,
-            grid_align=bool(args.phase_origin),
-        )
     else:
-        run_fixed_scenario(args.scenario, ues, ctrls, duration=args.duration,
-                           protocol=args.protocol or "tcp", guard=guard)
+        proto = args.protocol or "tcp"
+        if seed is not None:
+            log.info("Scenario %s seed=%d protocol=%s（各主機必須用同一個 --seed；建議同時給 --phase-origin）",
+                     scn, seed, proto)
+        elif scn == "TM":
+            log.info("Scenario TM protocol=%s（混合通道壅塞候選基準）", proto)
+        elif scn == "P":
+            log.info("Scenario P protocol=%s（混合通道壅塞試驗，固定配置）", proto)
+        else:
+            log.info("Scenario %s protocol=%s", scn, proto)
+    # 固定 epoch 1700000000（2023-11-14）只是絕對時間錨點：各主機不需通訊就落在同一個 phase_index
+    run_dynamic_scenario(
+        ues, ctrls,
+        phase_duration=args.phase_duration,
+        phase_fn=lambda u, phase_index: scenario_configs(
+            scn, u, _congested_phase_index(phase_index) if args.congested_only else phase_index, seed, proto),
+        raw_path_loss=True,
+        scenario_label=scn,
+        max_phases=args.num_phases,
+        epoch=(args.phase_origin if args.phase_origin else 1700000000.0),
+        guard=guard,
+        grid_align=bool(args.phase_origin),
+    )
 
 
 if __name__ == "__main__":

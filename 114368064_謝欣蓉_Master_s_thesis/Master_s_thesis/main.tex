@@ -1,0 +1,159 @@
+% !TeX program = xelatex
+\documentclass[12pt, a4paper]{ntut-report}
+\usepackage{graphicx}
+%\usepackage{fontspec}
+\usepackage{geometry}
+\usepackage{lipsum}
+\usepackage{xeCJK}
+\usepackage{wallpaper}
+\usepackage{pdfpages}
+\usepackage{indentfirst}
+\usepackage{setspace}
+\usepackage{hyperref}
+\usepackage{zhnumber}
+\usepackage{titlesec}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{tabularx}
+\usepackage{booktabs,array,longtable}
+\usepackage{subcaption}
+
+\captionsetup{justification=centering,singlelinecheck=false,font={normalsize,stretch=2}}
+\captionsetup[sub]{justification=centering,singlelinecheck=false,font={normalsize,stretch=2}}
+
+\renewcommand{\baselinestretch}{1.5}
+\xeCJKsetup{AutoFakeBold=true, AutoFakeSlant=true}
+\setCJKmainfont{AR PL KaitiM Big5} % 中文字體
+\setmainfont{Times New Roman} % 英文字體
+\geometry{a4paper,total={297mm,210mm},top=4.5cm,bottom=0.75cm,left=2.5cm,right=2.5cm} % 頁面設定，不需修改
+\pagestyle{plain} % 頁碼
+\input{ntut-labels.tex}
+
+%
+% English-thesis settings
+% 將模板中的中文標題（第X章、目錄、圖、表、誌謝）改為英文
+%
+\makeatletter
+% Chapter heading: "CHAPTER 1  Introduction"
+\renewcommand\prechaptername{CHAPTER~}
+\renewcommand\postchaptername{}
+\renewcommand\countermapping[1]{\arabic{chapter}}
+% Table of contents entry: "Chapter 1  Introduction"
+\renewcommand\tocprechaptername{Chapter~}
+\renewcommand\tocpostchaptername{}
+% Names of lists, captions and references
+\renewcommand\contentsname{TABLE OF CONTENTS}
+\renewcommand\listfigurename{LIST OF FIGURES}
+\renewcommand\listtablename{LIST OF TABLES}
+\renewcommand\figurename{Figure}
+\renewcommand\tablename{Table}
+\renewcommand\tableofcontents{%
+    \chapter*{\contentsname}%
+    \phantomsection
+    \addcontentsline{toc}{chapter}{TABLE OF CONTENTS}%
+    \@starttoc{toc}}
+\renewcommand\listoffigures{%
+    \chapter*{\listfigurename}%
+    \phantomsection
+    \addcontentsline{toc}{chapter}{LIST OF FIGURES}%
+    \@starttoc{lof}}
+\renewcommand\listoftables{%
+    \chapter*{\listtablename}%
+    \phantomsection
+    \addcontentsline{toc}{chapter}{LIST OF TABLES}%
+    \@starttoc{lot}}
+% Acknowledgements page in English
+\renewenvironment{Thanks}
+{
+    \chapter*{ACKNOWLEDGEMENTS}
+    \vspace{0.5cm}
+    \
+    \begin{spacing}{2}
+    \phantomsection % for hyperref to register this
+    \addcontentsline{toc}{chapter}{ACKNOWLEDGEMENTS}
+}
+{
+    \end{spacing}
+    \vspace{0.5cm}
+}
+% Body chapters (English)
+\newenvironment{EnChapter}
+{
+    \begin{spacing}{2}
+}
+{
+    \end{spacing}
+}
+\makeatother
+
+%
+% Theorem-like environments and notation used in the thesis
+%
+\newtheorem{definition}{Definition}[chapter]
+\newtheorem{assumption}{Assumption}[chapter]
+\newtheorem{proposition}{Proposition}[chapter]
+\newtheorem{remark}{Remark}[chapter]
+\newtheorem{example}{Example}[chapter]
+
+\newcommand{\Nset}{\mathcal{N}}
+\newcommand{\Uset}{\mathcal{U}}
+\newcommand{\Vset}{\mathcal{V}}
+\newcommand{\Eset}{\mathcal{E}}
+\newcommand{\Cset}{\mathcal{C}}
+\newcommand{\Aset}{\mathcal{A}}
+\newcommand{\Tset}{\mathcal{T}}
+\newcommand{\Bset}{\mathcal{B}}
+\newcommand{\Gset}{\mathcal{G}}
+\newcommand{\parent}{p}
+\newcommand{\Ind}{\mathbb{1}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\act}{\mathrm{act}}
+\DeclareMathOperator{\clip}{clip}
+\DeclareMathOperator{\br}{br}
+\DeclareMathOperator{\role}{role}
+
+\begin{document}
+
+% 封面、不用浮水印 Cover without a watermark
+\include{page/titlepage.tex}
+% 留白頁、不用浮水印 Blank page without a watermark
+\include{page/blankpage.tex}
+
+% 新增浮水印 Add Watermarks
+\CenterWallPaper{.64}{ntut-logo.png}
+
+% 封面、要浮水印 Cover with a watermark
+\input{page/titlepage.tex}
+% 「學位論文口試委員會審定書」掃描檔，請檢附完整簽名之審定書掃描檔
+% Please add "Oral Defense Committee Signature Form" with complete signatures.
+\includepdf[pages=-]{static-page/signpage.pdf}
+
+\pagenumbering{roman}
+
+% 摘要頁（中文）Abstract (Chinese)
+% If you don’t have Chinese abstract, please delete this one.
+\include{page/abstract.tex}
+% 摘要頁（英文）Abstract (English)
+\include{page/abstract-en.tex}
+% 鳴謝 Acknowledgements
+\include{page/thanks.tex}
+% 目錄、表目錄與圖目錄 Table of Contents, List of tables, List of figures
+\include{page/table-of-content.tex}
+
+\pagenumbering{arabic}
+
+% Chapter 1
+\include{chapter/chapter1-introduction.tex}
+% Chapter 2
+\include{chapter/chapter2-related-work.tex}
+% Chapter 3
+\include{chapter/chapter3-system-model.tex}
+% Chapter 4
+\include{chapter/chapter4-experiments.tex}
+% Chapter 5
+\include{chapter/chapter5-conclusion.tex}
+
+% 參考文獻，請在段落上隨意註解，你同時需要 reference.bib
+% References omitted from the current draft; source files are retained.
+% \include{page/reference}
+
+\end{document}

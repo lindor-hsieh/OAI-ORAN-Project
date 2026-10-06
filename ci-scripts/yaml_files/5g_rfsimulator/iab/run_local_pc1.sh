@@ -1,10 +1,10 @@
 #!/bin/bash
 # run_local_pc1.sh — PC1 三主機版基礎設施啟動流程
 #
-# 本輪範疇（1 donor + 4 relay + 8 access + 17 UE，三主機）明確不含 CQI 校正、
+# 本輪範疇（1 donor + 4 relay + 8 access + 24 UE，三主機；UE17~24 為 relay 直連 UE，2026-10-01 起，在 Step 2.5 啟動）明確不含 CQI 校正、
 # PF Baseline 對比、流量場景（這些綁在舊的 5-node NODE_CONFIG，尚未針對新
 # 12-node 拓樸更新，見 CLAUDE.md）。這支腳本只做：啟動基礎設施 → 等待全部
-# 13 個 E2 連線（1 donor + 12 node）→ 逐一啟動 12 個 xApp。
+# 13 個 E2 連線（1 donor + 12 node）→ 啟動 relay 直連 UE → 逐一啟動 12 個 xApp。
 #
 # 用法：
 #   bash run_local_pc1.sh               # 完整流程
@@ -38,6 +38,12 @@ while true; do
 done
 echo ""
 ok "13 個 E2 連線已就緒"
+
+# ── Step 2.5: relay 直連 UE（UE17~24，2026-10-01） ───────────
+# 必須在 PC2/PC3 的 access MT 都連上 relay DU 之後（13/13 E2 代表 access 節點都已起來）才啟動，
+# relay DU 上的連線順序才會固定為 MT=0,1、UE=2,3。RELAY_UES=0 時跳過。
+log "Step 2.5: 啟動 relay 直連 UE（UE17~24）..."
+bash "$COMPOSE_DIR/iab/start_relay_ues.sh"
 
 # ── Step 3: 逐一啟動 12 個 xApp ──────────────────────────────
 log "Step 3: 逐一啟動 12 個 xApp（每個間隔 3 秒，避免 FlexRIC pending queue 打爆）..."

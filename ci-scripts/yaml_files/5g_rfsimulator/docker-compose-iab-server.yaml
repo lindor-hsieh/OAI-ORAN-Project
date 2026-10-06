@@ -106,6 +106,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node1:/app/models
@@ -151,6 +180,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node2:/app/models
@@ -196,6 +254,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node3:/app/models
@@ -241,6 +328,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node4:/app/models
@@ -286,6 +402,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node5:/app/models
@@ -331,6 +476,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node6:/app/models
@@ -376,6 +550,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node7:/app/models
@@ -421,6 +624,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node8:/app/models
@@ -466,6 +698,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node9:/app/models
@@ -511,6 +772,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node10:/app/models
@@ -556,6 +846,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node11:/app/models
@@ -601,6 +920,35 @@ services:
             DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
             DRL_TRAIN_ENABLED: "${DRL_TRAIN_ENABLED:-1}"
             DRL_DETERMINISTIC: "${DRL_DETERMINISTIC:-0}"
+            XAPP_MODE: "${XAPP_MODE:-active}"                     # shadow=PF-shadow 資料收集（LOCAL_DRL_V2_DESIGN.md §1.3）
+            PF_SHADOW_SCENARIO_TAG: "${PF_SHADOW_SCENARIO_TAG:-unknown}"   # shadow 資料的場景家族標記（t／th）
+            RULE_KIND: "${RULE_KIND:-cap}"                          # XAPP_MODE=rule 的試驗規則：cap（頻域上限）／mask（時域遮罩）
+            RULE_MASK: "${RULE_MASK:-0x9292}"                       # RULE_KIND=mask 時壞 UE 的 slot_mask
+            RULE_MAX_MASKED: "${RULE_MAX_MASKED:-1}"                # 每節點最多同時遮幾個 UE（relay 試驗 PB 設 2）
+            RULE_BAD_MCS: "${RULE_BAD_MCS:-5}"                      # 壞 UE 判定：MCS ≤ 此值且比同節點最好的低 ≥3（L24 的 MCS 在 3~7 循環，relay 試驗設 7）
+            RULE_DYN_GOOD_MCS: "${RULE_DYN_GOOD_MCS:-20}"            # RULE_KIND=dyn：積壓好 UE 的 MCS 下限（access 試驗設 6）
+            RULE_DYN_GAP: "${RULE_DYN_GAP:-0}"                       # RULE_KIND=dyn：壞 UE 須比積壓好 UE 低幾個 MCS（0＝不檢查；access 試驗設 4）
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"        # Local DRL：factored（v3.1 兩段式）／per_ue（v3）／macro（v2.1）
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"                  # MLP 分支折扣因子（v3＝0.5；v2／v2.1＝0）
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"                          # REWARD_MODE=alpha_fair 的 α（子樹 α-fair 效用）
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"            # 遮罩選單：acktier（21 檔）或逗號列表（v3.2 為 6 檔）
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"                # 動作持續：每幾個控制週期（秒）才重選一次動作（v3.3）
+            DRL_NSTEP: "${DRL_NSTEP:-1}"                            # n 步回報（v3.4＝3；1＝一步 TD）
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"          # DQN ε 起始值（預訓練起步時 0.1）
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"      # 兩段式動作：apply_first（v3.5，每子節點自己決定是否被遮）／node_on（v3.1～v3.4）
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"  # 每 60 秒一輪的梯度更新次數（v3 訓練設 30）
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"                      # α-fair reward 換算模擬時間用（須等於速度檔 S）
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"  # Critic 線上暖身：前 N 個訓練步只更新 Critic（v3）
+            RULE_MASK_REFRESH_S: "${RULE_MASK_REFRESH_S:-5.0}"     # 規則模式重讀 /tmp/rule_mask 的間隔
+            RULE_NODES: "${RULE_NODES:-}"                          # 規則只套用到這些節點（逗號列表，空＝全部）
+            RULE_ACCESS_PHAT_MAX: "${RULE_ACCESS_PHAT_MAX:-0}"      # access 只在 p̂ ≤ 此值時套用規則（0＝不設）
         volumes:
             - /tmp:/tmp
             - inference_models_node12:/app/models
@@ -654,10 +1002,11 @@ services:
         restart: on-failure
 
     # FL_MODE 是 server_app.py::main() 決定 instantiate IABFedAvg（avg，Stage 2，
-    # 預設值）還是 IABClusterFedAvg（cluster，Stage 3）的開關，比照 REWARD_MODE
-    # 的既有模式，見 CLAUDE.md 第 3 節。PYTHONUNBUFFERED=1 是 2026-09-14 除錯
-    # Stage 3 時補上的——沒有這個，server_app.py 裡的 print() 會卡在這個長駐
-    # process 的 stdio buffer 裡，docker logs 永遠看不到，很難確認到底套用的
+    # 預設值）、IABCapaFedAvg（capa，新 Stage 3）還是 IABElasticFedAvg（elastic，
+    # 新 Stage 4）的開關，比照 REWARD_MODE 的既有模式，見 CLAUDE.md 第 3 節。
+    # PYTHONUNBUFFERED=1 是 2026-09-14 除錯 Stage 3 時補上的——沒有這個，
+    # server_app.py 裡的 print() 會卡在這個長駐 process 的 stdio buffer 裡，
+    # docker logs 永遠看不到，很難確認到底套用的
     # 是哪個 FL_MODE、聚合有沒有真的跑。
     flower-superlink:
         image: local-xapp-inference:latest
@@ -674,6 +1023,20 @@ services:
             FL_NUM_NODES: "12"
             FL_MODE: "${FL_MODE:-avg}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # ServerApp 也會建 DRLAgent（_seed_initial_arrays／_apply_weights_to_node），網路形狀相關設定須與 inference-nodeN 一致（2026-10-04）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            REWARD_MODE: "${REWARD_MODE:-lagrangian}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
             MONGO_URI: "mongodb://localhost:27017"
             MONGO_DB: "iab_xapp"
             MODEL_DIR_NODE1: "/app/models_node1"
@@ -732,6 +1095,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node1:/app/models
         command:
@@ -758,6 +1142,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node2:/app/models
         command:
@@ -784,6 +1189,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node3:/app/models
         command:
@@ -810,6 +1236,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node4:/app/models
         command:
@@ -836,6 +1283,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node5:/app/models
         command:
@@ -862,6 +1330,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node6:/app/models
         command:
@@ -888,6 +1377,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node7:/app/models
         command:
@@ -914,6 +1424,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node8:/app/models
         command:
@@ -940,6 +1471,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node9:/app/models
         command:
@@ -966,6 +1518,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node10:/app/models
         command:
@@ -992,6 +1565,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node11:/app/models
         command:
@@ -1018,6 +1612,27 @@ services:
             MODEL_DIR: "/app/models"
             REWARD_MODE: "${REWARD_MODE:-lagrangian}"
             MODEL_ARCH: "${MODEL_ARCH:-mlp}"
+            # 2026-10-04：FL ClientApp 會建同一個 DRLAgent、用 fetch_experiences() 重算 reward，下列設定必須與 inference-nodeN 一致
+            # （漏傳 DRL_MASK_TIERS 會建出不同形狀的 tier_head、漏傳 DRL_ALPHA／RFSIM_SPEED 會算出不同的 reward）
+            DRL_CAP_MODE: "${DRL_CAP_MODE:-relative}"
+            DRL_ACTION_SPACE: "${DRL_ACTION_SPACE:-factored}"
+            DRL_GAMMA_MLP: "${DRL_GAMMA_MLP:-0.5}"
+            DRL_ALPHA: "${DRL_ALPHA:-0.5}"
+            DRL_MASK_TIERS: "${DRL_MASK_TIERS:-acktier}"
+            DRL_ACTION_HOLD: "${DRL_ACTION_HOLD:-1}"
+            DRL_NSTEP: "${DRL_NSTEP:-1}"
+            DRL_DQN_EPS_START: "${DRL_DQN_EPS_START:-0.3}"
+            DRL_DQN_LR: "${DRL_DQN_LR:-5e-4}"
+            DRL_DQN_NET: "${DRL_DQN_NET:-flat}"
+            DRL_DQN_PF_MARGIN: "${DRL_DQN_PF_MARGIN:-0}"
+            DRL_DQN_EXPLORE_PF: "${DRL_DQN_EXPLORE_PF:-0}"
+            DRL_MIN_TRAIN_EXP: "${DRL_MIN_TRAIN_EXP:-200}"
+            DRL_TRAIN_BATCH: "${DRL_TRAIN_BATCH:-128}"
+            TRAIN_FETCH_LIMIT: "${TRAIN_FETCH_LIMIT:-5000}"
+            DRL_FACTORED_MODE: "${DRL_FACTORED_MODE:-node_on}"
+            TRAIN_EPOCHS_PER_ROUND: "${TRAIN_EPOCHS_PER_ROUND:-10}"
+            RFSIM_SPEED: "${RFSIM_SPEED:-0.3}"
+            DRL_ACTOR_WARMUP_STEPS: "${DRL_ACTOR_WARMUP_STEPS:-0}"
         volumes:
             - inference_models_node12:/app/models
         command:
@@ -1150,7 +1765,7 @@ services:
         privileged: true
         cap_add: [NET_ADMIN, NET_RAW]
         environment:
-            USE_ADDITIONAL_OPTIONS: --rfsim --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -E --log_config.global_log_options level,nocolor,time
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
         depends_on: [rfsim5g-donor-cu]
         restart: on-failure
@@ -1167,7 +1782,7 @@ services:
         ports:
             - "4043:4043/udp"
             - "4043:4043/tcp"
-        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /opt/oai-gnb/etc/gnb.conf --rfsim -E --log_config.global_log_options level,nocolor,time
 
     # ==========================================================
     # 3. Relay Node2 + Access Node7,8 + UE5~8（原本在 PC2，2026-09-12
@@ -1187,7 +1802,7 @@ services:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9190 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9190 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
@@ -1197,7 +1812,7 @@ services:
             - "4045:4045/tcp"
             - "127.0.0.1:9090:9090"   # Node 2 DU telnetsrv (chanmod control)
             - "127.0.0.1:9190:9190"   # Node 2 MT telnetsrv (backhaul-aware PRB budget)
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9190 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001101 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9190 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-iab-du-2:
         image: custom-oai-runtime:24.04
@@ -1231,7 +1846,7 @@ services:
               cp /opt/oai-gnb/etc/gnb.conf /tmp/gnb.conf
               sed -i "s|local_n_address = \"[0-9.]*\"|local_n_address = \"$$IP\"|" /tmp/gnb.conf
               echo "[du-entrypoint] local_n_address synced to $$IP，啟動 nr-softmodem"
-              chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /tmp/gnb.conf --rfsim --rfsimulator.serverport 4045 --telnetsrv --backhaul-mt-telnet-port 9190 --log_config.global_log_options level,nocolor,time &
+              chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /tmp/gnb.conf --rfsim -E --rfsimulator.serverport 4045 --telnetsrv --backhaul-mt-telnet-port 0 --log_config.global_log_options level,nocolor,time &
               NR_PID=$$!
               while kill -0 $$NR_PID 2>/dev/null; do
                 sleep 5
@@ -1263,7 +1878,7 @@ services:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9189 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9189 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
@@ -1273,7 +1888,7 @@ services:
             - "4044:4044/tcp"
             - "127.0.0.1:9089:9089"   # Node 1 DU telnetsrv (chanmod control)
             - "127.0.0.1:9189:9189"   # Node 1 MT telnetsrv (backhaul-aware PRB budget)
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9189 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001100 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9189 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-iab-du-1:
         image: custom-oai-runtime:24.04
@@ -1314,7 +1929,7 @@ services:
               cp /opt/oai-gnb/etc/gnb.conf /tmp/gnb.conf
               sed -i "s|local_n_address = \"[0-9.]*\"|local_n_address = \"$$IP\"|" /tmp/gnb.conf
               echo "[du-entrypoint] local_n_address synced to $$IP，啟動 nr-softmodem"
-              chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /tmp/gnb.conf --rfsim --rfsimulator.serverport 4044 --telnetsrv --backhaul-mt-telnet-port 9189 --log_config.global_log_options level,nocolor,time &
+              chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /tmp/gnb.conf --rfsim -E --rfsimulator.serverport 4044 --telnetsrv --backhaul-mt-telnet-port 0 --log_config.global_log_options level,nocolor,time &
               NR_PID=$$!
               while kill -0 $$NR_PID 2>/dev/null; do
                 sleep 5
@@ -1349,7 +1964,7 @@ services:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001102 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9191 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001102 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9191 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
@@ -1359,7 +1974,7 @@ services:
             - "4046:4046/tcp"
             - "127.0.0.1:9091:9091"   # Node 3 DU telnetsrv (chanmod control)
             - "127.0.0.1:9191:9191"   # Node 3 MT telnetsrv (backhaul-aware PRB budget)
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001102 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9191 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001102 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9191 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-iab-du-3:
         image: custom-oai-runtime:24.04
@@ -1400,7 +2015,7 @@ services:
               cp /opt/oai-gnb/etc/gnb.conf /tmp/gnb.conf
               sed -i "s|local_n_address = \"[0-9.]*\"|local_n_address = \"$$IP\"|" /tmp/gnb.conf
               echo "[du-entrypoint] local_n_address synced to $$IP，啟動 nr-softmodem"
-              chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /tmp/gnb.conf --rfsim --rfsimulator.serverport 4046 --telnetsrv --backhaul-mt-telnet-port 9191 --log_config.global_log_options level,nocolor,time &
+              chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /tmp/gnb.conf --rfsim -E --rfsimulator.serverport 4046 --telnetsrv --backhaul-mt-telnet-port 0 --log_config.global_log_options level,nocolor,time &
               NR_PID=$$!
               while kill -0 $$NR_PID 2>/dev/null; do
                 sleep 5
@@ -1433,7 +2048,7 @@ services:
              - /dev/net/tun:/dev/net/tun
         environment:
             LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
-            USE_ADDITIONAL_OPTIONS: --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001103 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9192 --log_config.global_log_options level,nocolor,time
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001103 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9192 --log_config.global_log_options level,nocolor,time
         volumes:
              - ./conf/nrue.uicc.conf:/opt/oai-nr-ue/etc/nr-ue.conf
              - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
@@ -1441,9 +2056,9 @@ services:
         ports:
             - "4047:4047/udp"
             - "4047:4047/tcp"
-            - "192.168.88.1:9092:9092"   # Node 4 DU telnetsrv (chanmod control) — 2026-09-22 從 127.0.0.1 改綁 macvlan-br 位址，UE17 容器搬到 PC3 後，PC3 上的 traffic_scenario.py 需要跨主機連這個 port 控制 UE17 的 pathloss（見 scenarios/traffic_scenario.py 的 NODE_TELNET_HOST_OVERRIDE）
+            - "192.168.88.1:9092:9092"   # Node 4 DU telnetsrv (chanmod control)（[UE17 已移除 2026-09-30] 下述跨主機用途已不需要，保留無害）— 2026-09-22 從 127.0.0.1 改綁 macvlan-br 位址，UE17 容器搬到 PC3 後，PC3 上的 traffic_scenario.py 需要跨主機連這個 port 控制 UE17 的 pathloss（見 scenarios/traffic_scenario.py 的 NODE_TELNET_HOST_OVERRIDE）
             - "127.0.0.1:9192:9192"   # Node 4 MT telnetsrv (backhaul-aware PRB budget)，僅本機使用，維持 127.0.0.1
-        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001103 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9192 --log_config.global_log_options level,nocolor,time
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001103 --rfsimulator.serveraddr 192.168.88.144 --rfsimulator.serverport 4043 --telnetsrv --telnetsrv.listenport 9192 --log_config.global_log_options level,nocolor,time
 
     rfsim5g-iab-du-4:
         image: custom-oai-runtime:24.04
@@ -1477,7 +2092,7 @@ services:
               cp /opt/oai-gnb/etc/gnb.conf /tmp/gnb.conf
               sed -i "s|local_n_address = \"[0-9.]*\"|local_n_address = \"$$IP\"|" /tmp/gnb.conf
               echo "[du-entrypoint] local_n_address synced to $$IP，啟動 nr-softmodem"
-              chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /tmp/gnb.conf --rfsim --rfsimulator.serverport 4047 --telnetsrv --backhaul-mt-telnet-port 9192 --log_config.global_log_options level,nocolor,time &
+              chrt -f 80 /opt/oai-gnb/bin/nr-softmodem -O /tmp/gnb.conf --rfsim -E --rfsimulator.serverport 4047 --telnetsrv --backhaul-mt-telnet-port 0 --log_config.global_log_options level,nocolor,time &
               NR_PID=$$!
               while kill -0 $$NR_PID 2>/dev/null; do
                 sleep 5
@@ -1492,6 +2107,170 @@ services:
               done
               wait $$NR_PID 2>/dev/null
             done
+
+
+    # ── relay 直連 UE（UE17~24，2026-10-01 承載試驗用，profiles: relay-ue，預設不啟動）──────────────
+    # relay r（Node1~4）各帶 2 個 UE：UE(15+2r)、UE(16+2r)。容器在 PC1（與 relay 同機）。IMSI 尾碼 216~223、macvlan .176~.183。
+
+    rfsim5g-end-ue-17:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-17
+        profiles: ["relay-ue"]
+        restart: on-failure
+        privileged: true
+        networks:
+            public_net:
+                ipv4_address: 192.168.88.176
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001216 --rfsimulator.serveraddr 192.168.88.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001216 --rfsimulator.serveraddr 192.168.88.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
+
+    rfsim5g-end-ue-18:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-18
+        profiles: ["relay-ue"]
+        restart: on-failure
+        privileged: true
+        networks:
+            public_net:
+                ipv4_address: 192.168.88.177
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001217 --rfsimulator.serveraddr 192.168.88.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001217 --rfsimulator.serveraddr 192.168.88.150 --rfsimulator.serverport 4044 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
+
+    rfsim5g-end-ue-19:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-19
+        profiles: ["relay-ue"]
+        restart: on-failure
+        privileged: true
+        networks:
+            public_net:
+                ipv4_address: 192.168.88.178
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001218 --rfsimulator.serveraddr 192.168.88.151 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001218 --rfsimulator.serveraddr 192.168.88.151 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
+
+    rfsim5g-end-ue-20:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-20
+        profiles: ["relay-ue"]
+        restart: on-failure
+        privileged: true
+        networks:
+            public_net:
+                ipv4_address: 192.168.88.179
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001219 --rfsimulator.serveraddr 192.168.88.151 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001219 --rfsimulator.serveraddr 192.168.88.151 --rfsimulator.serverport 4045 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
+
+    rfsim5g-end-ue-21:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-21
+        profiles: ["relay-ue"]
+        restart: on-failure
+        privileged: true
+        networks:
+            public_net:
+                ipv4_address: 192.168.88.180
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001220 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001220 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
+
+    rfsim5g-end-ue-22:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-22
+        profiles: ["relay-ue"]
+        restart: on-failure
+        privileged: true
+        networks:
+            public_net:
+                ipv4_address: 192.168.88.181
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001221 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001221 --rfsimulator.serveraddr 192.168.88.152 --rfsimulator.serverport 4046 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
+
+    rfsim5g-end-ue-23:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-23
+        profiles: ["relay-ue"]
+        restart: on-failure
+        privileged: true
+        networks:
+            public_net:
+                ipv4_address: 192.168.88.182
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001222 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001222 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
+
+    rfsim5g-end-ue-24:
+        image: custom-oai-runtime:24.04
+        container_name: rfsim5g-end-ue-24
+        profiles: ["relay-ue"]
+        restart: on-failure
+        privileged: true
+        networks:
+            public_net:
+                ipv4_address: 192.168.88.183
+        devices:
+             - /dev/net/tun:/dev/net/tun
+        environment:
+            LD_LIBRARY_PATH: /usr/local/lib:/usr/local/lib/oai_libs
+            USE_ADDITIONAL_OPTIONS: --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001223 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time
+        volumes:
+             - ./conf/nrue.uicc.chanmod.conf:/opt/oai-nr-ue/etc/nr-ue.conf
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build:/usr/local/lib/oai_libs
+             - /home/lindor/openairinterface5g/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+        command: chrt -f 80 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.conf --rfsim -E -r 106 --numerology 1 -C 3319680000 --ssb 516 --uicc0.imsi 208990100001223 --rfsimulator.serveraddr 192.168.88.153 --rfsimulator.serverport 4047 --log_config.global_log_options level,nocolor,time --telnetsrv --telnetsrv.listenport 9301
 
 networks:
     public_net:

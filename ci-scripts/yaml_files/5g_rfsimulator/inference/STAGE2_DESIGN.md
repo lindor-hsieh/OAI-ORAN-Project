@@ -1,10 +1,20 @@
 # Stage 2 詳細設計文件（Local xApp + Local rApp + Global xApp + Global rApp）
 
-> **文件定位**：本檔案整合 Stage 2（`REWARD_MODE=throughput_only`、`MODEL_ARCH=mlp`、`FL_MODE=avg`）
-> 四個元件的現行設計與完整數學公式，以程式碼現況（2026-09-27，`DRL_CAP_MODE=relative`、
-> `DRL_DETERMINISTIC` 開關已上線）為準。除錯過程與歷史沿革見 `DRL_DESIGN.md`（Local xApp/rApp 的
-> GRU 分支、Lagrangian 限制式等非 Stage 2 現行路徑的完整推導過程）與 `HISTORY.md`；本檔案只保留
-> 現在式的架構事實與公式，不重複踩坑敘事。拓樸、IP/ID 對照見 `CLAUDE.md` 第 1 節。
+> **文件定位（2026-09-29 更新）**：§1、§2（Local xApp／Local rApp 設計）**已被
+> `LOCAL_DRL_V2_DESIGN.md` 取代**，以下保留原文只作歷史沿革／消融實驗參考，不再是現行路徑——
+> 舊設計（GRU/MLP＋連續 Dirichlet 動作空間，`DRL_CAP_MODE=relative`）從未在任何 Stage 真正贏過
+> PF baseline，2026-09-29 決定全面重新設計 Local 層（離線 BC 預訓練＋離散動作空間＋反事實
+> reward＋relational state），見 `LOCAL_DRL_V2_DESIGN.md` 與 `HISTORY.md` 續三十六。
+>
+> **2026-10-04**：Local 端現為 `LOCAL_DRL_V2_DESIGN.md` v3.4；FL 容器設定一致性修正與 Stage 2 現行流程見 §4.4。
+>
+> §3（Global xApp）、§4（Global rApp，`FL_MODE=avg`）**維持現行不變**——Stage 2 的 Global 層
+> 定案是標準 FedAvg（IAB/O-RAN FL 文獻裡最直接對應 GLOBECOM 2022 那篇），這次重新設計沒有理由
+> 改動；Stage 2 現在的完整定義 = `LOCAL_DRL_V2_DESIGN.md`（Local）＋本文件 §3/§4（Global）。
+>
+> 除錯過程與歷史沿革見 `DRL_DESIGN.md`（Local xApp/rApp 的 GRU 分支、Lagrangian 限制式等更早
+> 期的推導過程）與 `HISTORY.md`；本檔案只保留現在式的架構事實與公式，不重複踩坑敘事。拓樸、
+> IP/ID 對照見 `CLAUDE.md` 第 1 節。
 
 ---
 
@@ -38,7 +48,7 @@ flower-superlink + flower-supernode-node{1..12} + flower-scheduler（FL_MODE=avg
 
 ---
 
-## 1. Local xApp（C，`xapp_nodeN.c`，每節點獨立）
+## 1. 〔已被 `LOCAL_DRL_V2_DESIGN.md` 取代，僅供歷史參考〕Local xApp（C，`xapp_nodeN.c`，每節點獨立）
 
 ### 1.1 控制/觀測週期
 
@@ -88,7 +98,7 @@ $$\text{max\_rbSize}_i \leftarrow \begin{cases}
 
 ---
 
-## 2. Local rApp（Python，`inference_server.py` + `drl_agent.py`，每節點獨立容器）
+## 2. 〔已被 `LOCAL_DRL_V2_DESIGN.md` 取代，僅供歷史參考〕Local rApp（Python，`inference_server.py` + `drl_agent.py`，每節點獨立容器）
 
 ### 2.1 State Space（51 維，`STATE_DIM = MAX_UE_COUNT×3 + 3`，`MAX_UE_COUNT=16`）
 
@@ -296,9 +306,31 @@ $$W_{\text{global}} = \frac{\sum_{i=1}^{12} n_i \cdot W_i}{\sum_{i=1}^{12} n_i},
 `inference-nodeN` 的 `_reload_worker` 每 30 秒輪詢 `model_nodeN.pt` 的 mtime，偵測到變化即熱重
 載進記憶體——FL 聚合結果最多延遲 30 秒才反映到近即時推論，相對 180 秒的 FL 輪次週期可忽略。
 
-（`FL_MODE=cluster` 的 Soft/Weighted Clustered FedAvg 是 Stage 3 專用，公式與設計見
-`STAGE3_CLUSTER_FL_DESIGN.md`；`server_app.py` 的 `IABFedAvg`／`IABClusterFedAvg` 依環境變數
-擇一 instantiate，不影響 Stage 2 的路徑。）
+### 4.4 搭配 Local DRL v3.3 的現行設定（2026-10-04，24 UE 拓樸）
+
+- **Local 端**：與 Stage 1.5（`FL_MODE=none`）逐行相同——`LOCAL_DRL_V2_DESIGN.md` v3.4（子樹 α-fair reward α=0.2、兩段式動作、
+  6 檔遮罩、動作持續 5 秒、PPO γ=0.5＋3 步回報、Critic 暖身 600 步）；`inference-nodeN` 的本地訓練（每 60 秒 15 次更新）照常進行，
+  FL 是疊在上面的第二條更新路徑。Global xApp（`fairness_bias`）在 Stage 1.5 與 Stage 2 都開，兩者 state 相同。
+- **FL 容器的設定必須與 inference 一致**（2026-10-04 修正）：ClientApp 與 ServerApp 都會建 `DRLAgent`、ClientApp 經
+  `fetch_experiences()` 重算 α-fair reward 並併合動作持續的經驗，所以 `flower-supernode-nodeN`／`flower-superlink` 也要拿到
+  `DRL_ACTION_SPACE`、`DRL_MASK_TIERS`、`DRL_ALPHA`、`DRL_GAMMA_MLP`、`RFSIM_SPEED`、`DRL_ACTION_HOLD`、`DRL_NSTEP` 等（compose 已補）。
+  修正前 supernode 會用程式預設的 21 檔選單建出不同形狀的 `tier_head`（聚合直接失敗）、用 α=0.5 算 reward。
+- **聚合權重** $n_i$＝這一輪可更新 Actor 的「有競爭」**決策**經驗數（動作持續併合後計數）。
+- **為什麼 relay 與 access 共用一個全域模型合理**：兩層「該遮」的條件是同一個規律——同節點有 MCS 較高的子節點在積壓（relay：
+  子節點 MT；access：好通道 UE）時，遮 MCS 低的子節點；Actor 的每子節點特徵含 `is_iab_child`，可區分 MT。FedAvg 把 4 個 relay
+  與 8 個 access 遇到的稀有決策狀態合在一起學（每個 access 節點約 3% 的時間是 M 類，見 `LOCAL_DRL_V2_DESIGN.md` §9）。
+- **Stage 2 的兩個目標與對應量測**：
+  1. **以 FL 補資料量**：同樣 3 小時、同樣從零開始，比較 Stage 2 與 Stage 1.5 的策略分化（relay 該遮 vs 不該遮、access M vs N 的
+     介入機率，`iab/policy_prob.py`）與 90／180 分鐘實測（HS TCP、seed 20260930、只跑壅塞相位）。
+  2. **跨節點的資源分配**：relay 的 reward 是子樹（自己直連 UE＋下游 access UE）效用，state 含 parent 佇列 $\hat p$、children
+     需求 $\hat c$ 與 Global xApp 的 `fairness_bias`；relay 遮自己的邊緣 UE 讓 slot 給 backhaul（子節點 MT）就是跨節點的資源重新分配。
+     量測看熱點 branch 下游 access UE 的吞吐量相對 PF／Stage 1.5 的變化。
+- **流程**：`/home/lindor/s2_avgfl_20261004/run.sh`（同 Stage 1.5 腳本，只差 `FL_MODE=avg`、帶起 `stage2-fl` profile；實測期間停
+  `flower-scheduler`、模型凍結）。不用 `iab/run_stage2_fl.sh`（它會刪除 checkpoint 與經驗；本流程改名封存）。
+
+（`FL_MODE=capa`／`elastic` 分別是新 Stage 3（CAPA-Fed）／新 Stage 4（ERA-Fed）專用，公式與
+設計見 `STAGE4_CUSTOM_FL_DESIGN.md` §10／§11；`server_app.py` 依環境變數擇一 instantiate，
+不影響 Stage 2 的路徑。）
 
 ---
 
@@ -334,9 +366,11 @@ $$W_{\text{global}} = \frac{\sum_{i=1}^{12} n_i \cdot W_i}{\sum_{i=1}^{12} n_i},
 
 ## 6. 與其他設計文件的關係
 
-- `DRL_DESIGN.md`：Local xApp/rApp 的完整歷史沿革與 GRU／Lagrangian 分支的詳細推導（非 Stage 2
-  現行路徑，供之後改良版/消融實驗參考）。
-- `STAGE3_CLUSTER_FL_DESIGN.md`：Global rApp 的 Soft/Weighted Clustered FedAvg（`FL_MODE=cluster`）。
-- `STAGE4_CUSTOM_FL_DESIGN.md`：Stage 4 自訂聚合演算法草案。
-- `avgFL.md`：Stage 2 量測結果與動作對應設計問題的診斷、修正過程。
-- `HISTORY.md`：逐日除錯記錄。
+- **`LOCAL_DRL_V2_DESIGN.md`**：**現行 Local 層設計**（取代本文件 §1/§2），Stage 2~5 全程共用。
+- `DRL_DESIGN.md`：更早期的 GRU／Lagrangian 分支歷史推導（比 §1/§2 更舊，供之後改良版/消融
+  實驗參考，非現行路徑）。
+- `STAGE4_CUSTOM_FL_DESIGN.md`：新 Stage 3（Hierarchical FedAvg+Hedge）／新 Stage 4（HiRA-Fed）
+  的完整設計（§10/§11），CAPA-Fed／ERA-Fed 已移至該文件附錄，僅供歷史參考。
+- `avgFL.md`：**已刪除**（2026-09-29 全面重新設計時清理，舊 Local DRL 設計的量測結果已不適用，
+  過程見 `HISTORY.md` 續三十六）。
+- `HISTORY.md`：逐日除錯記錄；續三十六是本次全面重新設計的決策過程與文獻依據。

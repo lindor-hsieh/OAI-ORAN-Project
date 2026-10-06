@@ -92,7 +92,7 @@ echo -e "${GREEN} Stage 2+ 服務已就緒（REWARD_MODE=${REWARD_MODE}, FL_MODE
 echo -e "${GREEN}==================================================${NC}"
 echo -e "${YELLOW}下一步（2026-09-26 更新；量測前／訓練前務必先做，見 CLAUDE.md 第 3、6 節）：${NC}"
 echo "  1. bash scenarios/setup_iperf_servers.sh"
-echo "  2. bash iab/precheck_measure.sh（EXPECT_XAPP=12；13/13 E2、RestartCount、17 UE ping、iperf3 server、S）"
+echo "  2. bash iab/precheck_measure.sh（EXPECT_XAPP=12；13/13 E2、RestartCount、16 UE ping、iperf3 server、S）"
 echo "  3. 訓練：三台各跑 training_scenario_driver.sh（PC2/PC3；同一個 --epoch），並在 PC1 跑 training_watchdog.sh"
 echo "     （PC1 沒有 UE，不需要驅動器）；訓練場景 = 隨機化兩狀態 T（TR）+ 新版 R，TCP/UDP 混合"
 echo "  4. 量測（訓練完成後）：OUT_DIR=<dir> bash iab/run_stage_measure.sh {tcp,udp} <tag> → python3 iab/analyze_stage.py <dir> <tag>"

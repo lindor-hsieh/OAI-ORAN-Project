@@ -1,0 +1,19 @@
+% 英文摘要頁
+% TODO: This is a draft based on the System Model chapter. Add the main
+% experimental findings once Chapter 4 is complete.
+\begin{EnAbstract}
+    \begin{EnAbstractItems}
+        \noindent Researcher: \myEname \hfill Advisor: \advisorEname
+
+        \noindent \deptEname, \univEname
+
+        % 關鍵詞，多個關鍵字以逗號 "," 隔開
+        \noindent Keywords: O-RAN, integrated access and backhaul (IAB), PRB allocation, multi-agent reinforcement learning, hierarchical federated learning
+
+    \end{EnAbstractItems}
+
+    \begin{EnAbstractDescription}
+        Integrated access and backhaul (IAB) extends radio coverage by letting base stations relay traffic wirelessly over multiple hops, but the mobile termination (MT) and the distributed unit (DU) of each IAB node compete for the same radio resources, and congestion at one hop propagates to the whole subtree below it. This thesis studies downlink physical resource block (PRB) allocation in an O-RAN-controlled IAB network. A topology-agnostic system model is developed that represents a multi-hop IAB network of arbitrary depth as a rooted tree and captures the link rates, the MT--DU resource coupling through a backhaul-aware PRB budget, and multi-hop queue dynamics, from which a sum-throughput maximization problem is formulated. Because this problem has an exponentially large and temporally coupled action space and unknown channel and demand statistics, each IAB node is modelled as an agent that imposes per-child PRB caps on a proportional-fair scheduler and is trained with a factor-wise proximal policy optimization objective using permutation-equivariant policy and value networks. Knowledge is shared among agents through federated learning, progressing from flat FedAvg to a topology-hierarchical aggregation with Hedge weighting and divergence fallback, and finally to HiRA-Fed, which personalizes the broadcast model according to the role of each node. The complete framework is deployed as xApps and supporting services on an O-RAN testbed with twelve IAB nodes and sixteen user equipments. (Experimental results to be added.)
+    \end{EnAbstractDescription}
+
+\end{EnAbstract}

@@ -1,6 +1,0 @@
-status: PARTIAL: FINAL checkpoint 不一致( node3 node12)
-finished: 2026-09-27 05:29:37
-tcp: /home/lindor/stage2_run_20260926/measure/tcp_a2/analysis.txt  (42 行)
-udp: /home/lindor/stage2_run_20260926/measure/udp_a1/analysis.txt  (42 行)
-review: /home/lindor/stage2_run_20260926/logs/post/review.txt
-archive: /home/lindor/stage2_run_20260926/archive

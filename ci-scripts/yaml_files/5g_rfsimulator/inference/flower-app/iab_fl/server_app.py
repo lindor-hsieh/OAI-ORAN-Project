@@ -18,9 +18,11 @@ Stage 2 起套用於 12-node 拓樸（`FL_NUM_NODES=12`），程式邏輯本身�
     計算全網 Jain's Fairness Index 並記錄到這輪的 metrics——**目前僅供
     監控／log，尚未實作 JFI-guided 的聚合權重調整**（見 CLAUDE.md 第五階段
     待開發項目）。
-  - IABClusterFedAvg（FL_MODE=cluster，Stage 3）：Soft/Weighted Clustered
-    FedAvg，依每個節點的連續角色比例 ROLE_RATIO 算出 relay/access 兩個原型
-    模型後，依各節點自己的比例混合廣播，取代硬性二分群，見 CLAUDE.md 第 3 節。
+  - IABCapaFedAvg（FL_MODE=capa，新 Stage 3）／IABElasticFedAvg（FL_MODE=elastic，
+    新 Stage 4）：見各自 class docstring 與 inference/STAGE4_CUSTOM_FL_DESIGN.md
+    §10／§11。舊版 IABClusterFedAvg（cluster FL）與 IABCustomFedAvg（AW-FedAvg）
+    已於 2026-09-29 路線圖重新定案後整段移除（含程式碼與封存資料），不是需要
+    復原的架構，過程見 HISTORY.md。
   - 強制全部 NUM_NODES 個節點參與（min_train_nodes=min_available_nodes=NUM_NODES）。
   - 聚合完成後把最終權重寫回全部 NUM_NODES 個節點的 checkpoint（不只是送出
     initial_arrays 的那個節點），讓各節點的 InferenceServer._reload_worker
@@ -29,6 +31,7 @@ Stage 2 起套用於 12-node 拓樸（`FL_NUM_NODES=12`），程式邏輯本身�
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -39,6 +42,7 @@ sys.path.insert(0, os.environ.get("APP_ROOT", "/app"))
 
 import numpy as np  # noqa: E402
 import pymongo  # noqa: E402
+import torch  # noqa: E402
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord  # noqa: E402
 from flwr.serverapp import Grid, ServerApp  # noqa: E402
 from flwr.serverapp.strategy import FedAvg  # noqa: E402
@@ -51,31 +55,52 @@ JFI_LOOKBACK: int = 100  # 每節點取最近 N 筆 reward 算 JFI 代理值
 MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB: str = os.getenv("MONGO_DB", "iab_xapp")
 
-# Stage 3（2026-09-13 設計定案，見 CLAUDE.md 第 3 節）：FL_MODE=avg 是 Stage 2
-# 標準 FedAvg（預設值，維持既有行為不變）；FL_MODE=cluster 是 Soft/Weighted
-# Clustered FL——兩種聚合邏輯並存，用這個環境變數切換，比照 REWARD_MODE 的既有模式。
+# FL_MODE=avg 是 Stage 2 標準 FedAvg（預設值）；FL_MODE=capa／elastic 分別是新
+# Stage 3（CAPA-Fed）／新 Stage 4（ERA-Fed），見下方各自的常數區塊與 class docstring。
 FL_MODE: str = os.getenv("FL_MODE", "avg")
 
-# 2026-09-27（Stage 3 設計審查修正）：relay/access 兩個「原型」的加權平均若被單一節點壟斷
-# （現行拓樸下最常見的情況：Node1~3 結構性幾乎沒有壅塞樣本、num-examples≈0，relay 側加權平均
-# 幾乎完全由 Node4 一個節點決定），該原型會退化成「Node4 專屬模型」而非真正的 relay 群體共識，
-# 廣播回 Node1~3 後可能系統性劣於 Stage 2（Node1~3 在 avg FedAvg 下是拿到全體 12 節點的加權平均、
-# 樣本池遠大於單一節點）。用「有效樣本數」(ESS, effective sample size) 收縮：某一側的原型若只有
-# ~1 個有效貢獻者，就大幅退回全體 12 節點的加權平均（等同 Stage 2 IABFedAvg 的結果）；貢獻者
-# 越多元、越不被單一節點壟斷，才越信任該側自己的加權平均。見 STAGE3_CLUSTER_FL_DESIGN.md 第 10 節。
-CLUSTER_SHRINKAGE_C: float = float(os.getenv("CLUSTER_SHRINKAGE_C", "1.0"))
+# ── 新 Stage 3（2026-09-28 路線圖重新定案，CAPA-Fed：Critic-Aggregated,
+#    Personalized-Actor Federation，見 inference/STAGE4_CUSTOM_FL_DESIGN.md §10）──
+#
+# 取代舊版 soft/weighted cluster FL（IABClusterFedAvg，2026-09-29 已整段移除，含
+# 封存資料，過程見 HISTORY.md）。核心構想：Actor 與 Critic 用不同方式聚合——Critic
+# （價值估計）全域池化、同一份廣播給全部節點（沿用已驗證穩定的動量+學習率機制防
+# 過衝）；Actor（PRB 分配策略）不整份覆寫，改成每個節點依自己這輪的訓練樣本數
+# n_i（信心訊號）在「自己的本地權重」與「全體加權平均」之間做個人化混合，資料越
+# 充足的節點越信任自己、資料越稀疏的節點（尤其 relay）越依賴集體共識。
 
-# role_ratio_i = 直連 UE 數量 / (直連 UE 數量 + 透過下游 DU 節點間接服務的 UE 數量)。
-# 結構性常數，依現行 12-node 拓樸算出，不需即時量測：Node1~3 純 relay（下游都是
-# 其他有 DU 的節點）；Node4 混合（直連 UE17 + 經 Node11/12 服務的 UE13~16）；
-# Node5~12 純 access（下游都是純 UE）。混合節點的存在正是 Stage 3 從硬性二分群
-# 改為連續加權的動機，見 CLAUDE.md 第 3 節 Stage 3 段落。
-ROLE_RATIO: dict[int, float] = {
-    1: 0.0, 2: 0.0, 3: 0.0,
-    4: 0.2,  # UE17 直連(1) / (UE17(1) + 經 Node11,12 服務的 UE13~16(4)) = 1/5
-    5: 1.0, 6: 1.0, 7: 1.0, 8: 1.0,
-    9: 1.0, 10: 1.0, 11: 1.0, 12: 1.0,
-}
+# Actor 個人化混合係數 β_i 的下界／上界（clip 範圍）：β_min 確保資料再多也保留一點
+# 集體知識注入，β_max 確保資料再少也保留一點本地身份，不會完全退化成純全域廣播。
+CAPA_BETA_MIN: float = float(os.getenv("CAPA_BETA_MIN", "0.1"))
+CAPA_BETA_MAX: float = float(os.getenv("CAPA_BETA_MAX", "0.9"))
+
+# Critic 路徑沿用 AW-FedAvg v2 已通過 180 輪延長合成測試驗證過的動量+學習率參數
+# （同一個「伺服器端聚合如何避免過衝」的問題、同一組已驗證的解法，不重新調參）。
+CAPA_CRITIC_MOMENTUM: float = float(os.getenv("CAPA_CRITIC_MOMENTUM", "0.7"))
+CAPA_CRITIC_LR: float = float(os.getenv("CAPA_CRITIC_LR", "0.3"))
+
+# ── 新 Stage 4（2026-09-28 路線圖重新定案，ERA-Fed：Elastic Role-Aware Federation，
+#    見 inference/STAGE4_CUSTOM_FL_DESIGN.md §11）────────────────────────────────
+#
+# 在 CAPA-Fed 的結構上修正一個殘留問題：CAPA-Fed 的 Critic 路徑用動量+學習率只是把
+# 「收斂到群體共識」這件事在時間上拖慢，訓練輪數夠多最終還是會完全收斂、不會永久
+# 保留本地身份，跟 Actor 路徑「永遠保留 (1-β_i) 比例本地權重」性質不同。ERA-Fed 借鑑
+# Elastic Averaging SGD（Zhang, Choromanska, LeCun, NeurIPS 2015）的部分拉扯機制，
+# 把 Critic 也改成跟 Actor 同一種「彈性拉扯」（不是動量）：每輪只朝群體平均的方向
+# 移動一小步（彈性係數 ρ_i），節點自己在 checkpoint 裡累積的權重不會被整份覆寫，
+# Critic 的拉力係數用一個 >1 的倍率放大、確實比 Actor 更快同步，但兩者都永遠保留
+# 一部分本地身份，沒有任何子網路最終被完全覆寫。
+
+# 基礎彈性係數 ρ_i 的下界／上界（clip 範圍），語意與 CAPA_BETA_MIN/MAX 相同（沿用
+# 同一套「信心加權」構想，只是這裡套用在彈性拉扯框架而非直接混合）。
+ERA_RHO_MIN: float = float(os.getenv("ERA_RHO_MIN", "0.1"))
+ERA_RHO_MAX: float = float(os.getenv("ERA_RHO_MAX", "0.9"))
+
+# Critic 拉力放大倍率 κ：ρ_i^critic = clip(ρ_i·κ, 0, 1)，κ>1 讓 Critic 比 Actor 更快
+# 朝群體共識移動（呼應「Critic 該較快同步知識、Actor 該保留更多本地特化」的設計動機），
+# 但 clip 上限 1 之下仍是「當輪」彈性拉扯、不是「永久」覆寫——下一輪 θ_{i,own} 又會
+# 重新累積本地訓練，不像 CAPA-Fed 的動量會讓 Critic 最終完全趨同。
+ERA_CRITIC_KAPPA: float = float(os.getenv("ERA_CRITIC_KAPPA", "2.5"))
 
 app = ServerApp()
 
@@ -138,40 +163,6 @@ def _attach_global_jfi(db: pymongo.database.Database | None, metrics: MetricReco
         except Exception:
             jfi = 0.0
     metrics["global_jfi"] = jfi
-
-
-def _effective_sample_size(weights: list[float]) -> float:
-    """有效樣本數（inverse Simpson index）：Σw)²/Σw²。全部為 0 時回傳 0；單一節點壟斷時 ≈1；
-    n 個節點權重均等時 = n。用來偵測「這一側的加權平均是不是幾乎只由一個節點決定」。"""
-    positive = [w for w in weights if w > 0]
-    total = sum(positive)
-    if total <= 0:
-        return 0.0
-    return (total * total) / sum(w * w for w in positive)
-
-
-def _shrink_factor(ess: float, c: float = CLUSTER_SHRINKAGE_C) -> float:
-    """ESS → 收縮係數 α ∈ [0,1)。ESS≤1（無資料或被單一節點壟斷）→ α=0，完全退回全域加權平均；
-    ESS 越大（越多節點真正、獨立貢獻）→ α 越趨近 1，越信任這一側自己的加權平均。"""
-    extra = max(0.0, ess - 1.0)
-    return extra / (extra + c)
-
-
-def _mix_flat(primary: dict, fallback: dict, alpha: float) -> dict:
-    """逐 key 線性混合：alpha·primary + (1-alpha)·fallback。"""
-    return {k: alpha * primary[k] + (1.0 - alpha) * fallback[k] for k in primary}
-
-
-def _shrunk_prototype(raw: dict | None, ess: float, global_avg: dict | None) -> dict | None:
-    """把某一側的原始加權平均（raw）依 ESS 收縮回全域加權平均（global_avg），見模組上方常數說明。
-    raw 為 None（該側這輪權重總和為 0）時直接回傳 global_avg（可能也是 None）；global_avg 為
-    None（全體都沒有訊號，極端冷啟動）時直接回傳 raw，不做收縮（沒有可退回的對象）。"""
-    if raw is None:
-        return global_avg
-    if global_avg is None:
-        return raw
-    alpha = _shrink_factor(ess)
-    return _mix_flat(raw, global_avg, alpha)
 
 
 def _weighted_average_flat(items: list[tuple[dict, float]]) -> dict | None:
@@ -243,117 +234,238 @@ class IABFedAvg(FedAvg):
             return None
 
 
-class IABClusterFedAvg(IABFedAvg):
-    """Soft/Weighted Clustered FedAvg（Stage 3，2026-09-13 設計定案，見 CLAUDE.md 第 3 節）。
+class IABCapaFedAvg(IABFedAvg):
+    """CAPA-Fed（新 Stage 3，2026-09-28 路線圖重新定案，取代舊版 soft/weighted cluster FL，
+    見 inference/STAGE4_CUSTOM_FL_DESIGN.md §10）。
 
-    不是硬性把節點分兩群各自 FedAvg，而是依每個節點的連續角色比例 role_ratio_i
-    （見 ROLE_RATIO）算出 relay/access 兩個「原型」模型，再依每個節點自己的
-    role_ratio_i 混合廣播——硬性二分群是 role_ratio_i∈{0,1} 時的特例。
+    Actor 與 Critic 分軌處理：
+      - Critic（價值估計）：全域池化，標準樣本數加權平均後套用 AW-FedAvg v2 已驗證穩定的
+        動量+學習率機制防過衝，同一份廣播給全部節點（見 CAPA_CRITIC_MOMENTUM/CAPA_CRITIC_LR）。
+      - Actor（PRB 分配策略）：不整份覆寫，逐節點依這輪訓練樣本數 n_i 在「自己的本地權重」與
+        「全體加權平均」之間做信心加權個人化混合（見 CAPA_BETA_MIN/MAX）。
 
-    繼承 IABFedAvg 而非直接繼承 FedAvg：aggregate_evaluate()（跟分群無關的
-    診斷用 eval_loss 平均）直接沿用不用重寫；只覆寫 aggregate_train()。
-
-    `self._last_w_relay`/`self._last_w_access` 是這個 strategy 實例跟 main() 之間
-    的資料通道——Flower 的 Result 物件只能裝一個 ArrayRecord，裝不下「兩個原型」，
-    所以 aggregate_train() 算完直接存在 self 上，main() 在 strategy.start() 結束後
-    直接讀這兩個屬性做混合廣播，不透過 aggregate_train() 的回傳值。
+    跟 IABClusterFedAvg 一樣需要「每個節點拿到不同權重」，但軸線不同（這裡是逐節點連續的
+    β_i，不是 relay/access 兩個離散原型）——用 self._last_actor_per_node（dict[node_id,
+    actor_sd]）+ self._last_critic（單一 dict，全體共用）當 main() 廣播時的資料通道，
+    因為 Flower 的 Result 物件只能裝一個 ArrayRecord，裝不下「12 份不同的 Actor」。
     """
 
     def __init__(self, db: pymongo.database.Database | None, **kwargs) -> None:
         super().__init__(db=db, **kwargs)
-        self._last_w_relay: dict | None = None
-        self._last_w_access: dict | None = None
+        self._last_actor_per_node: dict[int, dict] = {}
+        self._last_critic: dict | None = None
 
     def aggregate_train(self, server_round, replies):
-        replies = list(replies)  # 要走訪計算 relay/access 兩組加權，必須先物化成 list
+        replies = list(replies)
 
-        relay_items: list[tuple[dict, float]] = []
-        access_items: list[tuple[dict, float]] = []
-        all_items: list[tuple[dict, float]] = []
+        entries: list[tuple[int, dict, dict, float]] = []  # (node_id, actor_sd, critic_sd, n_i)
         total_num_examples = 0
-
         for msg in replies:
             metrics = msg.content["metrics"]
             node_id = int(metrics["node_id"])
             num_examples = float(metrics["num-examples"])
             total_num_examples += int(num_examples)
-            role = ROLE_RATIO.get(node_id, 1.0)
             flat = msg.content["arrays"].to_torch_state_dict()
-            relay_items.append((flat, (1.0 - role) * num_examples))
-            access_items.append((flat, role * num_examples))
-            all_items.append((flat, num_examples))
+            actor_sd, critic_sd = _split_flat_state_dict(flat)
+            entries.append((node_id, actor_sd, critic_sd, num_examples))
 
-        # 2026-09-27：先算全體 12 節點的加權平均（等同 Stage 2 IABFedAvg 的結果）當收縮目標，
-        # 再用 ESS 決定 relay/access 兩側各自的原始加權平均要收縮多少回這個全域平均，見模組
-        # 上方常數區塊的說明與 STAGE3_CLUSTER_FL_DESIGN.md 第 10 節。
-        global_avg = _weighted_average_flat(all_items) if all_items else None
-        w_relay_raw = _weighted_average_flat(relay_items) if relay_items else None
-        w_access_raw = _weighted_average_flat(access_items) if access_items else None
-        relay_ess = _effective_sample_size([w for _, w in relay_items])
-        access_ess = _effective_sample_size([w for _, w in access_items])
-        w_relay = _shrunk_prototype(w_relay_raw, relay_ess, global_avg)
-        w_access = _shrunk_prototype(w_access_raw, access_ess, global_avg)
-        print(
-            f"[server_app] Round {server_round}: relay ESS={relay_ess:.2f} shrink_alpha="
-            f"{_shrink_factor(relay_ess):.2f}  access ESS={access_ess:.2f} shrink_alpha="
-            f"{_shrink_factor(access_ess):.2f}"
-        )
-
-        if w_relay is not None:
-            self._last_w_relay = w_relay
-        if w_access is not None:
-            self._last_w_access = w_access
-
-        if w_relay is None and w_access is None:
+        if not entries or total_num_examples <= 0:
             print(
                 f"[server_app] Round {server_round}: 全部節點 num-examples=0"
-                "（尚無足夠訓練資料），跳過本輪聚合（cluster 模式）"
+                "（尚無足夠訓練資料），跳過本輪聚合（capa 模式）"
             )
             arrays, metrics_out = None, MetricRecord({"num-examples": 0})
-        else:
-            # 這個 arrays 只是滿足 Flower 內部 Result.arrays 非空判斷用，main()
-            # 廣播時看的是 self._last_w_relay/_last_w_access，不是這個回傳值。
-            arrays = ArrayRecord(w_relay if w_relay is not None else w_access)
-            metrics_out = MetricRecord({"num-examples": total_num_examples})
+            _attach_global_jfi(self._db, metrics_out)
+            return arrays, metrics_out
 
+        # ── Critic：全域池化（標準加權平均）＋ 動量+學習率防過衝，同一份廣播給全部節點 ──
+        critic_items = [(critic_sd, n_i) for _, _, critic_sd, n_i in entries]
+        critic_avg = _weighted_average_flat(critic_items)
+        state = _load_capa_state(_capa_state_path()) or {}
+        v_prev_critic: dict = state.get("critic_momentum") or {}
+        theta_prev_critic = self._last_critic
+        if theta_prev_critic is None:
+            _, theta_prev_critic = _split_flat_state_dict(_load_current_global_flat())
+        v_new_critic: dict = {}
+        theta_new_critic: dict = {}
+        for k in critic_avg:
+            prev_v = v_prev_critic.get(k, torch.zeros_like(critic_avg[k]))
+            delta = critic_avg[k] - theta_prev_critic[k]
+            v_new_critic[k] = CAPA_CRITIC_MOMENTUM * prev_v + (1.0 - CAPA_CRITIC_MOMENTUM) * delta
+            theta_new_critic[k] = theta_prev_critic[k] + CAPA_CRITIC_LR * v_new_critic[k]
+        _save_capa_state(_capa_state_path(), {"critic_momentum": v_new_critic})
+        self._last_critic = theta_new_critic
+
+        # ── Actor：逐節點信心加權個人化混合（不整份覆寫）──
+        actor_items = [(actor_sd, n_i) for _, actor_sd, _, n_i in entries]
+        actor_avg = _weighted_average_flat(actor_items)
+        max_n = max(n_i for _, _, _, n_i in entries)
+        for node_id, actor_sd_own, _, n_i in entries:
+            beta_i = min(max(1.0 - n_i / (max_n + 1e-9), CAPA_BETA_MIN), CAPA_BETA_MAX)
+            mixed_actor = {
+                k: (1.0 - beta_i) * actor_sd_own[k] + beta_i * actor_avg[k] for k in actor_avg
+            }
+            self._last_actor_per_node[node_id] = mixed_actor
+
+        print(
+            f"[server_app] Round {server_round}: CAPA-Fed critic_momentum={CAPA_CRITIC_MOMENTUM} "
+            f"critic_lr={CAPA_CRITIC_LR} num_examples_total={total_num_examples} "
+            f"beta_range=[{CAPA_BETA_MIN},{CAPA_BETA_MAX}]"
+        )
+
+        # 只是滿足 Flower 內部 Result.arrays 非空判斷用，main() 真正廣播看的是
+        # self._last_actor_per_node/_last_critic，不是這個回傳值（同 IABClusterFedAvg 模式）。
+        arrays = ArrayRecord(_flatten_state_dicts(actor_avg, theta_new_critic))
+        metrics_out = MetricRecord({"num-examples": total_num_examples})
         _attach_global_jfi(self._db, metrics_out)
-
         return arrays, metrics_out
 
 
-def _broadcast_cluster_weights(w_relay: dict | None, w_access: dict | None) -> None:
-    """把 relay/access 兩個原型依每個節點的 role_ratio_i 混合後寫回各自 checkpoint。
+class IABElasticFedAvg(IABFedAvg):
+    """ERA-Fed（新 Stage 4，2026-09-28 路線圖重新定案，見
+    inference/STAGE4_CUSTOM_FL_DESIGN.md §11）。在 IABCapaFedAvg 的結構上修正一個殘留問題：
+    CAPA-Fed 的 Critic 路徑用動量+學習率，訓練輪數夠多最終仍會完全收斂到群體共識，跟 Actor
+    路徑「永遠保留一部分本地身份」的性質不同。ERA-Fed 把 Critic 也改成跟 Actor 同一種彈性
+    拉扯（Elastic Averaging SGD 精神，Zhang, Choromanska, LeCun, NeurIPS 2015）：兩者都是
+    「朝群體平均移動一小步，不整份覆寫」，差別只在 Critic 的拉力係數用 ERA_CRITIC_KAPPA
+    放大、確實比 Actor 更快同步。
 
-    W_i(廣播) = (1-role_ratio_i)·W_relay + role_ratio_i·W_access
-
-    任一原型為 None（該側這輪沒有新資料，見 _weighted_average_flat）時整段退化用
-    另一個原型；兩者皆 None 時全部節點這輪都不更新（等同 Stage 2 no-op 語意）。
+    因此不需要 IABCapaFedAvg 的動量狀態檔（_capa_state_path）——「記憶」直接就是每個節點
+    自己的 checkpoint 本身，彈性拉扯後存回，天然跨輪持久化，不需要額外的磁碟狀態。Actor 與
+    Critic 都是逐節點個人化（跟 CAPA-Fed 的「Critic 單一全域共用」不同），用
+    self._last_actor_per_node + self._last_critic_per_node 兩個 dict[node_id, sd] 當
+    main() 廣播時的資料通道。
     """
-    if w_relay is None and w_access is None:
-        print("[server_app] 本次執行沒有任何一輪成功聚合（cluster 模式，全程無訓練資料），跳過廣播")
-        return
 
+    def __init__(self, db: pymongo.database.Database | None, **kwargs) -> None:
+        super().__init__(db=db, **kwargs)
+        self._last_actor_per_node: dict[int, dict] = {}
+        self._last_critic_per_node: dict[int, dict] = {}
+
+    def aggregate_train(self, server_round, replies):
+        replies = list(replies)
+
+        entries: list[tuple[int, dict, dict, float]] = []  # (node_id, actor_sd, critic_sd, n_i)
+        total_num_examples = 0
+        for msg in replies:
+            metrics = msg.content["metrics"]
+            node_id = int(metrics["node_id"])
+            num_examples = float(metrics["num-examples"])
+            total_num_examples += int(num_examples)
+            flat = msg.content["arrays"].to_torch_state_dict()
+            actor_sd, critic_sd = _split_flat_state_dict(flat)
+            entries.append((node_id, actor_sd, critic_sd, num_examples))
+
+        if not entries or total_num_examples <= 0:
+            print(
+                f"[server_app] Round {server_round}: 全部節點 num-examples=0"
+                "（尚無足夠訓練資料），跳過本輪聚合（elastic 模式）"
+            )
+            arrays, metrics_out = None, MetricRecord({"num-examples": 0})
+            _attach_global_jfi(self._db, metrics_out)
+            return arrays, metrics_out
+
+        actor_avg = _weighted_average_flat([(a, n) for _, a, _, n in entries])
+        critic_avg = _weighted_average_flat([(c, n) for _, _, c, n in entries])
+        max_n = max(n_i for _, _, _, n_i in entries)
+
+        for node_id, actor_sd_own, critic_sd_own, n_i in entries:
+            rho_i = min(
+                max(ERA_RHO_MIN + (ERA_RHO_MAX - ERA_RHO_MIN) * (1.0 - n_i / (max_n + 1e-9)), ERA_RHO_MIN),
+                ERA_RHO_MAX,
+            )
+            # Critic 拉力係數用 κ>1 放大後可能超過 1，另外 clip 到 [0,1]（必要，不是選配）。
+            rho_i_critic = min(max(rho_i * ERA_CRITIC_KAPPA, 0.0), 1.0)
+
+            mixed_actor = {
+                k: (1.0 - rho_i) * actor_sd_own[k] + rho_i * actor_avg[k] for k in actor_avg
+            }
+            mixed_critic = {
+                k: (1.0 - rho_i_critic) * critic_sd_own[k] + rho_i_critic * critic_avg[k]
+                for k in critic_avg
+            }
+            self._last_actor_per_node[node_id] = mixed_actor
+            self._last_critic_per_node[node_id] = mixed_critic
+
+        print(
+            f"[server_app] Round {server_round}: ERA-Fed rho_range=[{ERA_RHO_MIN},{ERA_RHO_MAX}] "
+            f"critic_kappa={ERA_CRITIC_KAPPA} num_examples_total={total_num_examples}"
+        )
+
+        arrays = ArrayRecord(_flatten_state_dicts(actor_avg, critic_avg))
+        metrics_out = MetricRecord({"num-examples": total_num_examples})
+        _attach_global_jfi(self._db, metrics_out)
+        return arrays, metrics_out
+
+
+def _broadcast_capa_weights(strategy: "IABCapaFedAvg") -> None:
+    """把 IABCapaFedAvg 這輪算出的「逐節點個人化 Actor」＋「全域共用 Critic」寫回各自 checkpoint。"""
+    if not strategy._last_actor_per_node or strategy._last_critic is None:
+        print("[server_app] 本次執行沒有任何一輪成功聚合（capa 模式，全程無訓練資料），跳過廣播")
+        return
     for node_id in range(1, NUM_NODES + 1):
-        role = ROLE_RATIO.get(node_id, 1.0)
+        actor_sd = strategy._last_actor_per_node.get(node_id)
+        if actor_sd is None:
+            continue
         try:
-            if w_relay is None:
-                mixed = w_access
-            elif w_access is None:
-                mixed = w_relay
-            else:
-                mixed = {k: (1.0 - role) * w_relay[k] + role * w_access[k] for k in w_relay}
-            actor_sd, critic_sd = _split_flat_state_dict(mixed)
+            _apply_weights_to_node(node_id, actor_sd, strategy._last_critic)
+        except Exception as exc:
+            print(f"[server_app] 廣播聚合權重至 Node{node_id} 失敗（capa 模式）: {exc}")
+
+
+def _broadcast_elastic_weights(strategy: "IABElasticFedAvg") -> None:
+    """把 IABElasticFedAvg 這輪算出的「逐節點個人化 Actor＋Critic」寫回各自 checkpoint。"""
+    if not strategy._last_actor_per_node:
+        print("[server_app] 本次執行沒有任何一輪成功聚合（elastic 模式，全程無訓練資料），跳過廣播")
+        return
+    for node_id in range(1, NUM_NODES + 1):
+        actor_sd = strategy._last_actor_per_node.get(node_id)
+        critic_sd = strategy._last_critic_per_node.get(node_id)
+        if actor_sd is None or critic_sd is None:
+            continue
+        try:
             _apply_weights_to_node(node_id, actor_sd, critic_sd)
         except Exception as exc:
-            print(f"[server_app] 廣播聚合權重至 Node{node_id} 失敗（cluster 模式）: {exc}")
+            print(f"[server_app] 廣播聚合權重至 Node{node_id} 失敗（elastic 模式）: {exc}")
+
+
+def _capa_state_path() -> str:
+    """CAPA-Fed（新 Stage 3）的跨輪次狀態檔路徑（只需要 Critic 的動量緩衝——Actor 是逐節點
+    個人化混合，不需要動量；「記憶」就是每個節點自己的 checkpoint，見 IABCapaFedAvg）。"""
+    return os.path.join(_model_dir_for_node(1), "capa_fed_state.pt")
+
+
+def _load_capa_state(path: str) -> dict | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        return torch.load(path, map_location="cpu")
+    except Exception as exc:
+        print(f"[server_app] 讀取 CAPA-Fed 狀態失敗（視為冷啟動）: {exc}")
+        return None
+
+
+def _save_capa_state(path: str, state: dict) -> None:
+    tmp = path + ".tmp"
+    try:
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+    except Exception as exc:
+        print(f"[server_app] 儲存 CAPA-Fed 狀態失敗: {exc}")
+
+
+def _load_current_global_flat() -> dict:
+    """讀取「目前的全域模型」（用 Node1 checkpoint 代表）。Stage 2 廣播後全部節點權重相同，
+    Node1 的 checkpoint 可以代表目前的全域狀態。找不到檔案時回傳隨機初始化的權重，不例外
+    （冷啟動）。"""
+    agent = DRLAgent(node_id=1, model_dir=_model_dir_for_node(1))
+    agent.load()
+    return _flatten_state_dicts(agent.actor.state_dict(), agent.critic.state_dict())
 
 
 def _seed_initial_arrays() -> ArrayRecord:
     """啟動時嘗試載入 Node1 現有 checkpoint 當作第一輪的初始權重種子；沒有則隨機初始化。"""
-    agent = DRLAgent(node_id=1, model_dir=_model_dir_for_node(1))
-    agent.load()  # 找不到檔案時回傳 False，維持隨機初始化，不例外
-    flat = _flatten_state_dicts(agent.actor.state_dict(), agent.critic.state_dict())
-    return ArrayRecord(flat)
+    return ArrayRecord(_load_current_global_flat())
 
 
 def _broadcast_aggregated_weights(arrays: ArrayRecord) -> None:
@@ -395,7 +507,12 @@ def main(grid: Grid, context: Context) -> None:
     except pymongo.errors.PyMongoError:
         db = None
 
-    strategy_cls = IABClusterFedAvg if FL_MODE == "cluster" else IABFedAvg
+    if FL_MODE == "capa":
+        strategy_cls = IABCapaFedAvg  # 新 Stage 3
+    elif FL_MODE == "elastic":
+        strategy_cls = IABElasticFedAvg  # 新 Stage 4
+    else:
+        strategy_cls = IABFedAvg
     strategy = strategy_cls(
         db=db,
         fraction_train=1.0,
@@ -420,11 +537,14 @@ def main(grid: Grid, context: Context) -> None:
     # 否則每個節點的 agent.actor.load_state_dict() 會因缺 key 直接拋例外
     # （已在真實驗證中發生過一次）。沒有任何一輪真正聚合成功，代表這次
     # `flwr run` 完全沒有新東西可以分享，維持各節點目前的權重不變即可。
-    if FL_MODE == "cluster":
-        # cluster 模式的 result.arrays 只是滿足 Flower 內部非空判斷用（見
-        # IABClusterFedAvg.aggregate_train()），真正廣播看的是 strategy 實例上
-        # 存的兩個原型，不是 result.arrays。
-        _broadcast_cluster_weights(strategy._last_w_relay, strategy._last_w_access)
+    if FL_MODE == "capa":
+        # capa 模式同理：result.arrays 只是滿足非空判斷，真正廣播看的是
+        # strategy._last_actor_per_node（逐節點個人化）+ strategy._last_critic（全域共用）。
+        _broadcast_capa_weights(strategy)
+    elif FL_MODE == "elastic":
+        # elastic 模式同理：Actor/Critic 皆逐節點個人化，看
+        # strategy._last_actor_per_node + strategy._last_critic_per_node。
+        _broadcast_elastic_weights(strategy)
     elif result.arrays:
         _broadcast_aggregated_weights(result.arrays)
     else:

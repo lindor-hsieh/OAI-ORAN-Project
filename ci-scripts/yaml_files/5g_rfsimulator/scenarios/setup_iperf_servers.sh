@@ -5,11 +5,11 @@
 #   bash setup_iperf_servers.sh
 #
 # ext-dn 容器：rfsim5g-oai-ext-dn
-# 監聽 port 5201~5217，對應 UE1~UE17 的下行流量（一個 iperf3 server 同時支援
+# 監聽 port 5201~5224，對應 UE1~UE24 的下行流量（UE1~16 掛在 access 節點，UE17~24 為 relay 直連 UE，2026-10-01 起）（一個 iperf3 server 同時支援
 # TCP 與 UDP client，不需要為協定混合場景另外開 UDP-only server）
 
 CONTAINER="rfsim5g-oai-ext-dn"
-PORTS=($(seq 5201 5217))
+PORTS=($(seq 5201 ${IPERF_LAST_PORT:-5224}))  # RELAY_UES=0（16 UE 拓樸）時可設 IPERF_LAST_PORT=5216
 
 echo "[setup] 確認 ${CONTAINER} 容器狀態..."
 if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
@@ -25,9 +25,9 @@ echo "[setup] 停止舊的 iperf3 server 進程（含 while-loop）..."
 docker exec "${CONTAINER}" sh -c "pkill -9 -f iperf3 2>/dev/null; pkill -9 -f 'while true' 2>/dev/null; true"
 sleep 1
 
-echo "[setup] 啟動 iperf3 server，port 5201~5217（含自動重啟 loop）..."
+echo "[setup] 啟動 iperf3 server，port ${PORTS[0]}~${PORTS[-1]}（含自動重啟 loop）..."
 # 每個 server 包在 while loop 裡，用 -1（one-off）：服務完一個 client 連線就退出、1 秒後由 loop 重啟。
-# 不可再包 `timeout N`：17 個 server 幾乎同時啟動，每 N+1 秒會「同步」被砍一次，不管有沒有
+# 不可再包 `timeout N`：16 個 server 幾乎同時啟動，每 N+1 秒會「同步」被砍一次，不管有沒有
 # session 在跑——所有 UE 的 iperf3 client 會同一秒集體 rc=1（2026-09-26 查出，原 N=400）。
 # client 被停止（kill docker exec）時 TCP 連線關閉，server 端測試結束並退出，loop 立即重啟。
 for PORT in "${PORTS[@]}"; do

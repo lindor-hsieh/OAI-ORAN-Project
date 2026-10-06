@@ -132,6 +132,12 @@ def train(msg: Message, context: Context) -> Message:
         {
             "num-examples": num_examples,
             "mean_reward": float(metrics.get("mean_reward", 0.0)),
+            # Stage 4 AW-FedAvg（見 inference/STAGE4_CUSTOM_FL_DESIGN.md §3.1/§3.2）需要 advantage
+            # 而非原始 reward 當聚合權重的訊號來源（原始 reward 混雜「策略好壞」與「這輪流量大小」，
+            # advantage 已扣掉 Critic 基準線，跟流量大小無關）。這個值 train_on_batch_mlp() 早就算好、
+            # 原封不動留在 run_training_round() 回傳的 metrics 裡（見 training_pipeline.py），只是
+            # 先前沒有節點往上轉發——這裡只是多讀一個既有欄位，不是新增計算，不碰 Local rApp 任何邏輯。
+            "mean_adv": float(metrics.get("mean_adv", 0.0)),
             # Stage 3 soft clustering 需要在 server 端依 NODE_ID 查 role_ratio_i，
             # Flower 內部的 node id 跟本專案的 NODE_ID(1~12) 沒有已知對應關係，
             # 所以由 client 端自己在 metrics 帶出來（見 CLAUDE.md 第 3 節）。

@@ -42,7 +42,7 @@ import numpy as np
 import pymongo
 import zmq
 
-from drl_agent import DRLAgent, MAX_UE_COUNT
+from drl_agent import DRLAgent, MAX_BUF_INFO, MAX_UE_COUNT
 from reward_calculator import REWARD_MODE, compute_lagrangian_reward, compute_reward_breakdown
 from training_pipeline import TRAIN_FETCH_LIMIT, run_training_round
 
@@ -58,7 +58,8 @@ INFERENCE_WARN_MS: float = 4.0      # 推論延遲警告閾值（ms）
 TRAIN_INTERVAL_S: float = 60.0      # DRL 背景訓練間隔（秒）
 # 2026-09-27：DRL_TRAIN_ENABLED=0 → 不啟動背景訓練（凍結模型做量測；FL 服務也不要帶起）。預設 1。
 TRAIN_ENABLED: bool = os.getenv("DRL_TRAIN_ENABLED", "1").strip() not in ("0", "false", "False")
-TRAIN_EPOCHS_PER_ROUND: int = 10    # 每輪訓練的梯度更新次數
+TRAIN_EPOCHS_PER_ROUND: int = int(os.getenv("TRAIN_EPOCHS_PER_ROUND", "10"))
+TRAIN_THREAD_NICE: int = int(os.getenv("TRAIN_THREAD_NICE", "15"))   # 背景訓練執行緒的 nice 值（2026-10-03）    # 每輪訓練的梯度更新次數（v3 設 30）
 EXPLORE_PROB: float = 0.30          # 啟發式階段 Dirichlet 隨機探索的比例
 RELOAD_POLL_INTERVAL_S: float = 30.0  # 檢查磁碟 checkpoint 是否被 FL ClientApp 更新的輪詢間隔
 
@@ -73,6 +74,74 @@ RELOAD_POLL_INTERVAL_S: float = 30.0  # 檢查磁碟 checkpoint 是否被 FL Cli
 # alloc_map.get(rnti, 1) 找不到匹配的舊 RNTI 時會悄悄假設 PRB=1，產生一筆嫁接
 # 兩個不相關時間點的假經驗，混進訓練資料。
 STALE_PREV_UES_THRESHOLD_S: float = 5.0   # 控制週期是 ~1 秒（不是 100ms），2.0 只有 2 倍餘裕、會誤丟偶發的 >2 秒間隔；改 5.0
+
+# 2026-09-29 新增：PF-shadow 模式（Local DRL v2 離線 BC 預訓練用，見 LOCAL_DRL_V2_DESIGN.md §1.3）。
+# XAPP_MODE=shadow 時：完全不做 DRL 推論/訓練，只用來偷看 state 並記錄 PF 真實行為當監督標籤；
+# 回傳給 C xApp 的一律是「解除上限」控制，讓 MAC 排程器維持純 PF 行為不受干擾。
+XAPP_MODE: str = os.getenv("XAPP_MODE", "active").strip().lower()
+# 資料要跟 T/TH 雙軌框架的場景家族對應分開存（CLAUDE.md 第 3/8 節），由啟動腳本依當次跑的場景指定。
+PF_SHADOW_SCENARIO_TAG: str = os.getenv("PF_SHADOW_SCENARIO_TAG", "unknown").strip()
+# 2026-09-30 新增：XAPP_MODE=rule（試驗用固定規則，不是 DRL）。資料記錄同 shadow（存進 node{N}_pf_shadow，
+# 多一個 rule_caps 欄位），但回傳規則上限：同節點 ≥2 個活躍 UE 時，MCS ≤ RULE_BAD_MCS 且比同節點最好的 UE
+# 低至少 RULE_MCS_GAP 的 UE 限在 RULE_CAP 檔，其餘不設上限。用來驗證混合通道場景下「限制壞通道 UE」的增益
+# （/home/lindor/pf16_run_20260930/upper_bound/ 的離線模型預測約 +11%）。
+RULE_BAD_MCS: int = int(os.getenv("RULE_BAD_MCS", "5"))
+RULE_MCS_GAP: int = int(os.getenv("RULE_MCS_GAP", "3"))
+RULE_CAP: float = float(os.getenv("RULE_CAP", "0.3"))
+# 2026-10-01：頻域上限在這個平台無效（每 UE 每 TDD 週期約 5.3 次傳輸的 ACK 限制，壞 UE 少用的 RB 好 UE 用不到，
+# 見 HISTORY.md 續四十六），改試時域遮罩。RULE_KIND=cap（舊）或 mask：壞 UE 的 slot_mask = RULE_MASK（其餘全開、不設上限）。
+# 容器內 /tmp/rule_mask（十六進位字串）存在時覆寫 RULE_MASK，每 5 秒重讀一次——同一次重啟內可換遮罩樣式。
+RULE_KIND: str = os.getenv("RULE_KIND", "cap").strip().lower()
+RULE_PERSIST_S: int = int(os.getenv("RULE_PERSIST_S", "10"))
+RULE_MASK: int = int(os.getenv("RULE_MASK", "0x9292"), 16)
+RULE_MASK_FILE = "/tmp/rule_mask"
+FORCE_NODES_FILE = "/tmp/force_nodes"   # RULE_KIND=force：要強制遮壞 UE 的節點（機制對照用）
+FORCE_OBSERVE_S: int = int(os.getenv("FORCE_OBSERVE_S", "8"))
+FORCE_SKIP_S: int = int(os.getenv("FORCE_SKIP_S", "25"))   # 10 不夠：前一相位通道好時壞 UE 的 MCS 要 20 秒以上才降下來（Node5 實測）
+FORCE_MCS_GAP: float = float(os.getenv("FORCE_MCS_GAP", "2"))
+# 動作持續（action repeat，2026-10-04 v3.3）：DRL 每 ACTION_HOLD 個控制週期（每週期 1 秒牆鐘）才重新抽一次動作，期間沿用同一組遮罩；
+# 每一秒仍各寫一筆經驗（hold_id／hold_pos 標記），訓練讀取時由 training_pipeline.merge_action_holds() 併成一筆
+# 「決策」經驗（state＝決策當下、reward＝K 秒平均、next_state＝下一個決策當下）。1＝每秒重選（v3.2 以前）。
+ACTION_HOLD: int = max(1, int(os.getenv("DRL_ACTION_HOLD", "1")))
+RULE_MASK_REFRESH_S: float = float(os.getenv("RULE_MASK_REFRESH_S", "5.0"))
+RULE_NODES: set = {int(x) for x in os.getenv("RULE_NODES", "").split(",") if x.strip()}   # 空＝全部節點
+RULE_ACCESS_PHAT_MAX: float = float(os.getenv("RULE_ACCESS_PHAT_MAX", "0"))   # 重讀 /tmp/rule_mask 的間隔（2026-10-03 動作持續驗證設 0.5）
+# 每個節點最多同時遮幾個 UE（2026-10-01）：預設 1（access 節點 2-UE 配置的原行為）；relay 直連 UE 試驗（場景 PB）
+# 要同時遮 relay 下兩個壞通道 UE，設 2。永遠不遮當下 MCS 最高的子節點（relay 的子節點 MT 恆為 MCS 28，不會被遮）。
+RULE_MAX_MASKED: int = int(os.getenv("RULE_MAX_MASKED", "1"))
+# 2026-10-02：訓練暫停開關（學習曲線的定期實測用）。主機 /tmp 掛進容器，主機上 touch 這個檔＝12 個節點同時：
+# 不跑訓練回合、不寫 RL 經驗（量測用測試 seed，不能進訓練資料）；推論照常（用當下模型＝凍結評估）。刪檔即恢復。
+DRL_PAUSE_FILE: str = os.getenv("DRL_PAUSE_FILE", "/tmp/drl_pause")
+# 2026-10-02：RULE_KIND=dyn（動態規則，HS 等動態場景用；只用可觀測 state，不看場景標籤）。
+# 介入條件＝同節點有「好通道且積壓」的 UE（MCS ≥ RULE_DYN_GOOD_MCS、RLC 佇列 ≥ RULE_DYN_STARVE_BUF）
+# ＋「壞通道」的 UE（MCS ≤ RULE_DYN_BAD_MCS）持續 RULE_DYN_ON_S 秒 → 遮壞 UE（永不遮當下 MCS 最高者，relay 的 MT 因此不會被遮）；
+# 被遮期間壞 UE 的 MCS 會回升，用遲滯：MCS > RULE_DYN_RELEASE_MCS、或好 UE 不再積壓、或壞 UE 沒流量，持續 RULE_DYN_OFF_S 秒才解除。
+RULE_DYN_GOOD_MCS: int = int(os.getenv("RULE_DYN_GOOD_MCS", "20"))
+RULE_DYN_BAD_MCS: int = int(os.getenv("RULE_DYN_BAD_MCS", "9"))
+RULE_DYN_RELEASE_MCS: int = int(os.getenv("RULE_DYN_RELEASE_MCS", "14"))
+RULE_DYN_STARVE_BUF: float = float(os.getenv("RULE_DYN_STARVE_BUF", "100000"))
+RULE_DYN_ON_S: int = int(os.getenv("RULE_DYN_ON_S", "3"))
+RULE_DYN_OFF_S: int = int(os.getenv("RULE_DYN_OFF_S", "5"))
+# 2026-10-03：access 層的好 UE（L22）MCS 只有約 8（壞 UE L24 約 3），GOOD_MCS=20 永遠不成立。RULE_DYN_GAP>0 時另要求壞 UE 的 MCS
+# 比「積壓的好 UE」低至少 GAP（只看積壓、MCS≥GOOD_MCS 且與節點最高 MCS 差 ≤2 者）；預設 0＝原行為。access 試驗設 GOOD_MCS=6、GAP=4（場景 PA 實測）。
+RULE_DYN_GAP: int = int(os.getenv("RULE_DYN_GAP", "0"))
+SHADOW_LIKE_MODES = ("shadow", "rule")
+
+# 2026-09-30 新增：relational state 特徵 p̂／ĉ（LOCAL_DRL_V2_DESIGN.md §4.2）。
+# 靜態拓樸（CLAUDE.md 第 1 節）：relay=Node1~4（parent 是 Donor，Donor 沒有 MT/rApp → relay 的 p̂ 恆中性）；
+# access=Node5~12。（UE17 已於 2026-09-30 移除；原本是直連 Node4 的 UE，從來就不是 child 節點。）
+PARENT_OF: dict[int, int] = {5: 1, 6: 1, 7: 2, 8: 2, 9: 3, 10: 3, 11: 4, 12: 4}
+CHILDREN_OF: dict[int, tuple[int, ...]] = {1: (5, 6), 2: (7, 8), 3: (9, 10), 4: (11, 12)}
+# 取得方式：每個 Local rApp 約每秒把自己的 (bh_ratio, RLC 佇列總和) upsert 到共用 collection
+# `node_status`，同一個背景執行緒讀 parent/children 的最新值算好 p̂/ĉ 快取起來——推論路徑只讀快取，
+# 不碰 MongoDB（直接在推論裡查 MongoDB 會吃掉 xApp 的 5ms 逾時預算）。
+REL_POLL_S: float = 1.0          # 跟控制週期（~1 秒）同量級
+REL_STALE_S: float = 10.0        # 對方超過這麼久沒更新（容器掛了/重啟中）→ 視為沒有資料，退回中性值
+REL_TREND_EWMA: float = 0.3      # parent bh_ratio 的平滑係數；趨勢 = 最新值 − 平滑值（單步差分太吵）
+REL_TREND_GAIN: float = 5.0      # （2026-10-01 前的 p̂＝parent bh_ratio 趨勢用；p̂ 改義後不再使用）
+# 2026-10-01：p̂ 改為 parent DU 的 RLC 佇列總和（上游壅塞程度）＝ log1p(parent total_buf) / log1p(MAX_BUF_INFO × REL_PARENT_CHILDREN)。
+# backhaul 預算停用（SYSTEM_SPEC D3）後 bh_ratio 恆為 1，舊的 p̂ 恆為 0.5、不帶資訊。relay 的 parent 是 Donor（沒有 rApp）→ p̂＝0。
+REL_PARENT_CHILDREN: int = 4     # relay DU 的子節點數（2 個 access MT＋2 個 relay 直連 UE），作正規化上限
 
 
 # =============================================================================
@@ -106,6 +175,7 @@ class InferenceServer:
         self.zmq_endpoint = zmq_endpoint
         self.total_prb = total_prb
         self._running = False
+        self.xapp_mode = XAPP_MODE   # "active"（預設）或 "shadow"（PF-shadow 資料收集）
 
         # ZMQ
         self._zmq_ctx: Optional[zmq.Context] = None
@@ -141,6 +211,7 @@ class InferenceServer:
         # 的 BPTT 一次 epoch 就要數百毫秒，整段鎖住會讓 infer() 卡到數秒、
         # 遠超 ZMQ 的 5ms 回應預算（詳見 training_pipeline.py 的說明）。
         self._model_lock = threading.Lock()
+        self._shadow_agent: Optional[DRLAgent] = None   # 影子模型（背景訓練用，見 _run_training_round）
         self._last_ckpt_mtime: float = 0.0
         self._prev_behavior_logp: Optional[float] = None   # 上一步動作的行為策略 logπ（DRL 推論才有）
         self._bh_ratio: float = 1.0   # 最近一次 E2 回報的可用 PRB 比例，見 run() 的 payload 解析
@@ -152,6 +223,15 @@ class InferenceServer:
         self._prev_mask_vec: Optional[np.ndarray] = None
         self._prev_action_ratios: Optional[np.ndarray] = None
         self._prev_ts: Optional[float] = None   # 見 STALE_PREV_UES_THRESHOLD_S 說明
+        self._prev_macro: Optional[int] = None  # 上一步的宏動作（v2.1，存進經驗的 macro_action）
+        self._prev_factored: Optional[dict] = None  # 上一步的兩段式動作（v3.1，存進經驗的 factored_action）
+        # 動作持續（ACTION_HOLD>1）：目前沿用中的動作與剩餘秒數；_prev_hold＝上一步動作的 (hold_id, hold_pos)
+        self._hold_left: int = 0
+        self._hold_seq: int = 0
+        self._hold_cur: Optional[dict] = None
+        self._prev_hold: Optional[tuple[str, int]] = None
+        # 上一次回傳中被遮罩（slot_mask≠0xFFFF）的 RNTI（v2.1 state 的 was_masked 特徵；active／rule／shadow 都維護）
+        self._masked_rntis: set = set()
 
         # 統計計數器
         self._total_inferences: int = 0
@@ -167,6 +247,15 @@ class InferenceServer:
         self._fairness_bias: float = 1.0                    # 中性值，收到廣播前預設
         self._fairness_lock = threading.Lock()
         self._fairness_thread: Optional[threading.Thread] = None
+
+        # Relational state 特徵 p̂／ĉ（見 PARENT_OF/CHILDREN_OF 說明）：主迴圈寫 _my_status、
+        # 背景執行緒 _relational_worker 發佈自己的狀態並讀 parent/children 算 p̂/ĉ，推論只讀快取。
+        self._rel_lock = threading.Lock()
+        self._my_status: Optional[tuple[float, float]] = None   # (bh_ratio, 本節點 RLC 佇列總和 bytes)
+        self._p_hat: float = 0.0                                 # 無 parent/資料過期＝無上游壅塞
+        self._c_hat: float = 0.0                                 # 中性值（無 children/資料過期）
+        self._parent_bh_ewma: Optional[float] = None
+        self._rel_thread: Optional[threading.Thread] = None
 
         # 訓練保護：記錄上一輪訓練時的 MongoDB 筆數，無新資料則跳過
         self._last_train_mongo_count: int = 0
@@ -208,14 +297,23 @@ class InferenceServer:
             )
             self._mongo_client.server_info()
             db = self._mongo_client[self._mongo_db]
-            self._mongo_col = db[f"node{self.node_id}_experiences"]
-            # 建立查詢索引：時間戳（批次訓練讀取用）
-            self._mongo_col.create_index("timestamp")
-            # 建立複合索引：reward 欄位存在性（篩選完整 RL 經驗用）
-            self._mongo_col.create_index("reward")
+            if self.xapp_mode in SHADOW_LIKE_MODES:
+                # PF-shadow 資料跟一般 RL 經驗分開存（不同 schema：沒有 reward/action，
+                # 是 (state, PF 實際份額標籤) 配對，見 LOCAL_DRL_V2_DESIGN.md §1.3/§1.5）。
+                coll_name = f"node{self.node_id}_pf_shadow"
+                self._mongo_col = db[coll_name]
+                self._mongo_col.create_index("timestamp")
+                self._mongo_col.create_index("scenario_tag")
+            else:
+                coll_name = f"node{self.node_id}_experiences"
+                self._mongo_col = db[coll_name]
+                # 建立查詢索引：時間戳（批次訓練讀取用）
+                self._mongo_col.create_index("timestamp")
+                # 建立複合索引：reward 欄位存在性（篩選完整 RL 經驗用）
+                self._mongo_col.create_index("reward")
             self._log.info(
-                "MongoDB 已連線: %s/%s/node%d_experiences",
-                self._mongo_uri, self._mongo_db, self.node_id,
+                "MongoDB 已連線: %s/%s/%s",
+                self._mongo_uri, self._mongo_db, coll_name,
             )
         except pymongo.errors.PyMongoError as exc:
             self._log.warning("MongoDB 連線失敗 (%s)，資料將不會持久化", exc)
@@ -263,6 +361,85 @@ class InferenceServer:
             return self._fairness_bias
 
     # -------------------------------------------------------------------------
+    # Relational state 特徵 p̂／ĉ（2026-09-30，LOCAL_DRL_V2_DESIGN.md §4.2）
+    # -------------------------------------------------------------------------
+
+    def _current_relational(self) -> tuple[float, float]:
+        """回傳快取中的 (p̂, ĉ)，供 encode_state()/infer() 使用；只讀記憶體，不碰 MongoDB。"""
+        with self._rel_lock:
+            return self._p_hat, self._c_hat
+
+    def _encode_current_state(
+        self, ues: list[dict], fairness_bias: Optional[float] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """用目前的 fairness_bias／bh_ratio／p̂／ĉ 編碼 state；所有呼叫點共用，確保線上與 shadow 同一套特徵。"""
+        p_hat, c_hat = self._current_relational()
+        return self._agent.encode_state(
+            ues,
+            fairness_bias=self._current_fairness_bias() if fairness_bias is None else fairness_bias,
+            bh_ratio=self._bh_ratio,
+            parent_trend=p_hat,
+            children_demand=c_hat,
+            prev_masked=self._masked_rntis,
+        )
+
+    def _relational_worker(self) -> None:
+        """
+        背景執行緒（active/shadow 兩種模式都跑）：每 REL_POLL_S 秒
+          1. upsert 自己的 (bh_ratio, 佇列總和, 時間戳) 到 node_status
+          2. 讀 parent/children 的最新狀態，算 p̂（parent DU 的佇列總和＝上游壅塞）與 ĉ（children 佇列總和）
+        資料超過 REL_STALE_S 沒更新就退回中性值，避免拿死掉容器的舊數字當輸入。
+        """
+        if self._mongo_client is None:
+            self._log.warning("[Relational] 無 MongoDB 連線，p̂/ĉ 固定為中性值")
+            return
+        coll = self._mongo_client[self._mongo_db]["node_status"]
+        parent = PARENT_OF.get(self.node_id)
+        children = CHILDREN_OF.get(self.node_id, ())
+        peer_ids = ([parent] if parent is not None else []) + list(children)
+        self._log.info("[Relational] 啟動：parent=%s children=%s", parent, children)
+
+        while self._running:
+            time.sleep(REL_POLL_S)
+            try:
+                with self._rel_lock:
+                    my = self._my_status
+                now = time.time()   # 12 個 inference 容器都在 PC1，共用同一個系統時鐘
+                if my is not None:
+                    coll.update_one(
+                        {"_id": self.node_id},
+                        {"$set": {"bh_ratio": my[0], "total_buf": my[1], "ts": now}},
+                        upsert=True,
+                    )
+                if not peer_ids:
+                    continue
+                docs = {d["_id"]: d for d in coll.find({"_id": {"$in": peer_ids}})}
+
+                def fresh(nid: int) -> Optional[dict]:
+                    d = docs.get(nid)
+                    return d if d is not None and now - float(d.get("ts", 0.0)) <= REL_STALE_S else None
+
+                p_hat = 0.0
+                pd = fresh(parent) if parent is not None else None
+                if pd is not None:
+                    p_hat = float(np.clip(np.log1p(max(float(pd.get("total_buf", 0.0)), 0.0))
+                                          / np.log1p(MAX_BUF_INFO * REL_PARENT_CHILDREN), 0.0, 1.0))
+
+                c_hat = 0.0
+                if children:
+                    bufs = [float(cd.get("total_buf", 0.0)) for cd in (fresh(k) for k in children) if cd]
+                    if bufs:
+                        c_hat = float(np.clip(
+                            np.log1p(sum(bufs)) / np.log1p(MAX_BUF_INFO * len(children)), 0.0, 1.0))
+
+                with self._rel_lock:
+                    self._p_hat, self._c_hat = p_hat, c_hat
+            except pymongo.errors.PyMongoError as exc:
+                self._log.debug("[Relational] MongoDB 錯誤: %s", exc)
+            except Exception as exc:
+                self._log.warning("[Relational] 非預期錯誤: %s", exc)
+
+    # -------------------------------------------------------------------------
     # MongoDB 批次寫入（背景執行緒）
     # -------------------------------------------------------------------------
 
@@ -289,6 +466,8 @@ class InferenceServer:
 
     def _queue_experience(self, doc: dict[str, Any]) -> None:
         """將一筆文件放入寫入緩衝區（執行緒安全）。"""
+        if "reward" in doc and os.path.exists(DRL_PAUSE_FILE):
+            return   # 暫停期間（定期實測）不寫 RL 經驗
         with self._write_lock:
             self._write_buffer.append(doc)
 
@@ -308,9 +487,18 @@ class InferenceServer:
         if not TRAIN_ENABLED:
             self._log.info("DRL_TRAIN_ENABLED=0：背景訓練停用（模型凍結，只做推論）")
             return
+        # 2026-10-03：訓練執行緒調低優先權（只影響這條執行緒），12 個節點的推論與訓練共用 cpuset 12-15，讓推論先拿到 CPU
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), TRAIN_THREAD_NICE)
+            self._log.info("訓練執行緒 nice=%d", TRAIN_THREAD_NICE)
+        except (OSError, AttributeError) as exc:
+            self._log.warning("無法調整訓練執行緒優先權：%s", exc)
         time.sleep(TRAIN_INTERVAL_S + ((self.node_id - 1) % 12) * (TRAIN_INTERVAL_S / 12.0))
 
         while self._running:
+            if os.path.exists(DRL_PAUSE_FILE):
+                time.sleep(5.0)
+                continue
             try:
                 self._run_training_round()
             except Exception as exc:
@@ -343,16 +531,30 @@ class InferenceServer:
 
         # 訓練/評估委派給共用函式；lock 只包住實際碰觸權重的段落（MongoDB
         # 讀取在鎖外進行），確保不影響 ZMQ 主迴圈的 5ms 回應預算。
+        # 2026-10-03 影子模型訓練：舊版每次梯度更新都持有 _model_lock，推論在訓練期間被擋住（冒煙測試：有訓練時 ZMQ 逾時
+        # 175 次／15 分鐘，暫停訓練時 81 次，延遲尖峰到 35～240 ms）。改成在複本上訓練、全程不持鎖，只在開始複製與結束換回
+        # 權重時短暫持鎖（毫秒級）。訓練期間若 FL 熱重載了磁碟權重（_last_ckpt_mtime 變了），本輪結果作廢、保留 FL 權重。
+        with self._model_lock:
+            snapshot = self._agent.export_state()
+            mtime_before = self._last_ckpt_mtime
+        if self._shadow_agent is None:
+            self._shadow_agent = DRLAgent(node_id=self.node_id, model_dir=f"/tmp/shadow_node{self.node_id}")
+        self._shadow_agent.import_state(snapshot)
         metrics = run_training_round(
-            self._agent,
+            self._shadow_agent,
             self._mongo_col,
             epochs=TRAIN_EPOCHS_PER_ROUND,
             fetch_limit=TRAIN_FETCH_LIMIT,
             log=self._log,
-            lock=self._model_lock,
+            lock=None,
         )
         if not metrics:
             return
+        with self._model_lock:
+            if self._last_ckpt_mtime != mtime_before:
+                self._log.warning("訓練期間權重已被熱重載（FL），本輪本地訓練結果作廢")
+                return
+            self._agent.import_state(self._shadow_agent.export_state())
 
         self._save_unless_superseded()
 
@@ -523,7 +725,9 @@ class InferenceServer:
 
         return allocations, action_ratios
 
-    def _infer(self, ues: list[dict]) -> tuple[list[dict], np.ndarray, Optional[float]]:
+    def _infer(
+        self, ues: list[dict], feat_snap: tuple[float, float, float],
+    ) -> tuple[list[dict], np.ndarray, Optional[float]]:
         """
         執行推論並回傳 (allocations, action_ratios, behavior_logp)。behavior_logp 只有 DRL 推論才有（啟發式為 None）。
 
@@ -535,13 +739,21 @@ class InferenceServer:
 
         if use_drl:
             try:
-                fairness_bias = self._current_fairness_bias()
+                fairness_bias, p_hat, c_hat = feat_snap   # 呼叫端一次取好的快照，跟之後存進經驗的 state 同一份
                 with self._model_lock:
                     allocations, action_ratios, behavior_logp = self._agent.infer(
-                        ues, fairness_bias=fairness_bias, bh_ratio=self._bh_ratio)
+                        ues, fairness_bias=fairness_bias, bh_ratio=self._bh_ratio,
+                        parent_trend=p_hat, children_demand=c_hat, prev_masked=self._masked_rntis)
                 self._drl_inferences += 1
                 return allocations, action_ratios, behavior_logp
             except Exception as exc:
+                if self._agent.arch == "mlp":
+                    # Local DRL v2：失敗就退回 PF（全部不設上限），不用 BSR 啟發式——啟發式會設上限，
+                    # 且動作格式（份額）跟 v2 的檔位不同，混進經驗會污染訓練資料
+                    self._log.warning("DRL 推論失敗: %s，退回 PF（不設上限）", exc)
+                    allocations, tiers = self._agent.pf_action(ues)
+                    self._heuristic_inferences += 1
+                    return allocations, tiers, None
                 self._log.warning("DRL 推論失敗: %s，退回啟發式", exc)
 
         # 啟發式階段：以 EXPLORE_PROB 比例注入 Dirichlet 隨機探索
@@ -559,6 +771,9 @@ class InferenceServer:
         prev_action_ratios: np.ndarray,
         curr_ues: list[dict],
         prev_behavior_logp: Optional[float] = None,
+        prev_macro: Optional[int] = None,
+        prev_factored: Optional[dict] = None,
+        prev_hold: Optional[tuple[str, int]] = None,
     ) -> dict[str, Any]:
         """
         建構一筆完整的 RL 經驗文件 (S, A, R, S')。
@@ -573,7 +788,8 @@ class InferenceServer:
         # REWARD_MODE=throughput_only（五階段路線圖 Stage 2~4 用陽春版）時改用
         # 純 throughput 的 compute_reward_breakdown()，不含 JFI 限制式；
         # 預設 lagrangian 維持現行行為（見 reward_calculator.py）。
-        if REWARD_MODE == "throughput_only":
+        # alpha_fair（v3）：這裡先存純吞吐量當佔位，訓練讀取時由 training_pipeline 依子樹 α-fair 效用重算
+        if REWARD_MODE in ("throughput_only", "alpha_fair"):
             result = compute_reward_breakdown(
                 curr_ues, prev_allocations,
                 total_prb=self.total_prb,
@@ -588,9 +804,7 @@ class InferenceServer:
         is_idle = result["r_throughput"] < 1e-9
 
         # 編碼當前狀態 S_t（作為 S' ）
-        next_state_vec, next_mask_vec = self._agent.encode_state(
-            curr_ues, fairness_bias=self._current_fairness_bias(), bh_ratio=self._bh_ratio
-        )
+        next_state_vec, next_mask_vec = self._encode_current_state(curr_ues)
 
         doc: dict[str, Any] = {
             "node_id":       self.node_id,
@@ -601,7 +815,6 @@ class InferenceServer:
             # RL 訓練所需的向量格式
             "state_vec":     prev_state_vec.tolist(),
             "mask_vec":      prev_mask_vec.tolist(),
-            "action_ratios": prev_action_ratios.tolist(),
             "reward":        reward,
             "next_state_vec": next_state_vec.tolist(),
             "next_mask_vec":  next_mask_vec.tolist(),
@@ -617,6 +830,11 @@ class InferenceServer:
             # 推論模式（供事後分析）
             "used_drl":      self._agent.is_trained,
         }
+        # 動作：MLP（Local DRL v2）存每 UE 檔位 index（-1=非活躍）；GRU 舊分支存 Dirichlet 份額
+        if self._agent.arch == "mlp":
+            doc["action_tiers"] = prev_action_ratios.astype(int).tolist()
+        else:
+            doc["action_ratios"] = prev_action_ratios.tolist()
         # "lambda_applied" 只在 REWARD_MODE=lagrangian 時存在（見
         # compute_lagrangian_reward()）；compute_reward_breakdown()（throughput_only）
         # 不會回傳這個 key。刻意用「這個 key 是否存在」而非「值是否為 0」當作
@@ -627,7 +845,214 @@ class InferenceServer:
         # 行為策略 log π(a|s)：只有 DRL 推論產生的動作才有（啟發式階段沒有 → 不寫，訓練時該筆只用於 Critic）
         if prev_behavior_logp is not None:
             doc["behavior_logp"] = float(prev_behavior_logp)
+        if prev_macro is not None:
+            doc["macro_action"] = int(prev_macro)   # v2.1 宏動作（DRL_ACTION_SPACE=macro）
+        if prev_factored is not None:
+            doc["factored_action"] = prev_factored   # v3.1 兩段式動作（DRL_ACTION_SPACE=factored）
+        if prev_hold is not None:
+            doc["hold_id"], doc["hold_pos"] = prev_hold   # v3.3 動作持續：同一決策的第幾秒（0＝決策當下）
         return doc
+
+    # -------------------------------------------------------------------------
+    # PF-shadow 模式（2026-09-29 新增，見 LOCAL_DRL_V2_DESIGN.md §1.3/§1.5）
+    # -------------------------------------------------------------------------
+
+    def _rule_decide(self, ues: list[dict]) -> tuple[list[int], list[int]]:
+        """XAPP_MODE=rule 的試驗規則（場景 P 用，不是 DRL）：回傳每個 UE 的 (prb_abs, slot_mask)。shadow 模式一律全開。"""
+        caps = [self.total_prb] * len(ues)
+        masks = [0xFFFF] * len(ues)
+        if self.xapp_mode == "rule" and RULE_KIND == "force":
+            return caps, self._rule_force(ues)
+        if RULE_NODES and self.node_id not in RULE_NODES:   # 只讓指定節點套用規則（2026-10-04：分離 relay／access 的貢獻）
+            return caps, masks
+        # 「低 p̂ access 控制」（2026-10-04）：access 節點只在上游 parent 佇列（p̂，可觀測代理）低於門檻時才套用規則；
+        # p̂ 低≈上游未壅塞，不是熱點外的完美篩選，判別結果另行以場景真值統計。0＝不設。
+        if RULE_ACCESS_PHAT_MAX > 0 and self.node_id >= 5 and self._current_relational()[0] > RULE_ACCESS_PHAT_MAX:
+            return caps, masks
+        if self.xapp_mode == "rule" and RULE_KIND == "dyn" and len(ues) >= 2:
+            return caps, self._rule_dyn(ues)
+        if self.xapp_mode == "rule" and len(ues) >= 2:
+            mcs = [int(ue.get("wb_cqi", 0)) for ue in ues]
+            best = max(mcs)
+            # 2026-10-01：沒有流量的 UE（bsr=0）回報的 MCS 是 0，會被誤判成壞 UE 黏住（輕負載節點在流量開始前就被遮），
+            # 只考慮本視窗真的有送資料、MCS>0 的 UE。
+            active = [int(ue.get("bsr", 0)) > 0 and m > 0 for ue, m in zip(ues, mcs)]
+            best = max([m for m, a in zip(mcs, active) if a], default=0)
+            is_bad = [a and m <= RULE_BAD_MCS and best - m >= RULE_MCS_GAP for m, a in zip(mcs, active)]
+            # 2026-10-01：流量剛開始時 OAI 鏈路調適從低 MCS 往上爬（輕負載 UE 前幾秒 MCS 1~5，之後 28），會被誤判成壞 UE。
+            # 要求連續 RULE_PERSIST_S 秒（每秒一次請求）都符合條件才算壞 UE。
+            streak = self.__dict__.setdefault("_rule_bad_streak", {})
+            for ue, bad in zip(ues, is_bad):
+                r = int(ue["rnti"])
+                streak[r] = streak.get(r, 0) + 1 if bad else 0
+            is_bad = [streak[int(ue["rnti"])] >= RULE_PERSIST_S for ue in ues]
+            # 黏住（2026-10-01）：遮罩後壞 UE 被排程得少、MCS 會回升到 5~7，條件失效又解除遮罩，來回震盪
+            # （時域試驗第一輪約 25% 時間沒遮到）。一旦判定為壞 UE 就在這次執行期間一直套用。
+            # 2026-10-01 修正：只加不刪會把好 UE 也加進去（壞 UE 被遮後 MCS 回升到 8~9，好 UE MCS 短暫 ≤5 時
+            # 條件反轉），兩個 UE 都被遮。改成：本節點目前在線的 UE 已有被遮者就不再新增；新增時排除當下 MCS
+            # 最高的 UE → 每個節點永遠只遮一個 UE（試驗規則，只給場景 P 的 2-UE 配置用）。
+            if RULE_KIND == "mask":
+                sticky = self.__dict__.setdefault("_rule_bad_rntis", set())
+                rntis = [int(ue["rnti"]) for ue in ues]
+                n_masked = sum(r in sticky for r in rntis)
+                if n_masked < RULE_MAX_MASKED:
+                    top = rntis[max(range(len(mcs)), key=lambda i: (active[i], mcs[i]))]
+                    cand = sorted((m, r) for r, m, bad in zip(rntis, mcs, is_bad)
+                                  if bad and r != top and r not in sticky)
+                    for _, r in cand[:RULE_MAX_MASKED - n_masked]:
+                        sticky.add(r)
+                is_bad = [r in sticky for r in rntis]
+            if RULE_KIND == "mask":
+                rm = self._rule_mask()
+                masks = [rm if b else 0xFFFF for b in is_bad]
+            else:
+                caps = [max(1, round(RULE_CAP * self.total_prb)) if b else self.total_prb
+                        for b in is_bad]
+        return caps, masks
+
+    def _rule_dyn(self, ues: list[dict]) -> list[int]:
+        """RULE_KIND=dyn：依可觀測 state 動態遮罩（見 RULE_DYN_* 註解）。回傳每個 UE 的 slot_mask。"""
+        st = self.__dict__.setdefault("_dyn", {"on": {}, "off": {}, "masked": set()})
+        rntis = [int(ue["rnti"]) for ue in ues]
+        mcs = [int(ue.get("wb_cqi", 0)) for ue in ues]
+        buf = [max(float(ue.get("dl_buffer_info", 0)), 0.0) for ue in ues]
+        active = [(int(ue.get("bsr", 0)) > 0 or b > 0) and m > 0 for ue, m, b in zip(ues, mcs, buf)]
+        top_m = max((m for a, m in zip(active, mcs) if a), default=0)
+        # GAP>0 時只認「通道最好（與最高 MCS 差 ≤2）」的積壓 UE：relay 的細胞邊緣 UE 積壓時 MCS 也可到 7，不能當成被餓的好 UE
+        starv_mcs = [m for a, m, b in zip(active, mcs, buf) if a and m >= RULE_DYN_GOOD_MCS and b >= RULE_DYN_STARVE_BUF
+                     and (RULE_DYN_GAP <= 0 or m >= top_m - 2)]
+        starved = bool(starv_mcs)
+        gap_ok = (lambda m: m <= max(starv_mcs) - RULE_DYN_GAP) if starved else (lambda m: False)
+        top = rntis[max(range(len(ues)), key=lambda i: (active[i], mcs[i]))]
+        st["masked"] &= set(rntis)
+        for r, a, m in zip(rntis, active, mcs):
+            if r in st["masked"]:
+                release = (not starved) or (not a) or m > RULE_DYN_RELEASE_MCS or r == top
+                st["off"][r] = st["off"].get(r, 0) + 1 if release else 0
+                if st["off"][r] >= RULE_DYN_OFF_S:
+                    st["masked"].discard(r); st["on"][r] = 0
+            else:
+                cond = starved and a and m <= RULE_DYN_BAD_MCS and gap_ok(m) and r != top
+                st["on"][r] = st["on"].get(r, 0) + 1 if cond else 0
+                if st["on"][r] >= RULE_DYN_ON_S and len(st["masked"] & set(rntis)) < RULE_MAX_MASKED:
+                    st["masked"].add(r); st["off"][r] = 0
+        rm = self._rule_mask()
+        return [rm if r in st["masked"] else 0xFFFF for r in rntis]
+
+    def _rule_force(self, ues: list[dict]) -> list[int]:
+        """RULE_KIND=force（2026-10-04 機制對照，不是策略）：主機 /tmp/force_nodes（逗號列表，每秒重讀）列出的節點
+        遮「壞 UE」＝前 FORCE_OBSERVE_S 秒平均 MCS 較低的活躍 UE（選定後整段黏住）；節點不在列表時全開並重置。
+        要遮哪個節點由外部依場景真值指定，只用來驗證局部遮罩在完整拓樸下的效果。"""
+        st = self.__dict__.setdefault("_force", {"mcs": {}, "masked": None, "ts": -1e9, "nodes": set()})
+        now = time.monotonic()
+        if now - st["ts"] > 1.0:
+            st["ts"] = now
+            try:
+                with open(FORCE_NODES_FILE) as f:
+                    st["nodes"] = {int(x) for x in f.read().replace("\n", ",").split(",") if x.strip()}
+            except (OSError, ValueError):
+                st["nodes"] = set()
+        masks = [0xFFFF] * len(ues)
+        if self.node_id not in st["nodes"]:
+            if st["masked"] is not None or st["mcs"]:
+                self._log.info("[force] node%d 解除強制遮罩", self.node_id)
+            st["mcs"], st["masked"], st["n_seen"] = {}, None, 0
+            return masks
+        rntis = [int(ue["rnti"]) for ue in ues]
+        if self.node_id <= 4:
+            # relay（2026-10-05 修正）：relay 有兩個子節點 MT（is_iab_child=1）＋兩個直連 UE。舊版「遮 MCS 最高者以外」會遮到其中一個 MT
+            # （v3 實測相位 0 下游 43.5→32.4），兩個 MT 都在線時差距條件又永遠不成立。改為直接遮全部直連 UE（is_iab_child=0），
+            # 由外部依場景真值只在「relay UE 在邊緣」的相位把 relay 列進 /tmp/force_nodes。
+            if st["masked"] is None:
+                st["masked"] = True
+                self._log.info("[force] node%d 遮全部直連 UE", self.node_id)
+            rm = self._rule_mask()
+            return [rm if not int(ue.get("is_iab_child", 0)) else 0xFFFF for ue in ues]
+        if st["masked"] is None:
+            # 2026-10-05 修正：相位剛開始時鏈路調適還在爬升，前 5 秒平均會把好 UE 誤判成壞 UE（v2 實測 5 個相位錯 2 個）。
+            # 改為略過進入列表後的前 FORCE_SKIP_S 秒、再觀察 FORCE_OBSERVE_S 秒，且最低者須比次低者低 ≥ FORCE_MCS_GAP 才選定（否則繼續觀察）。
+            st["n_seen"] = st.get("n_seen", 0) + 1
+            if st["n_seen"] > FORCE_SKIP_S:
+                for ue, r in zip(ues, rntis):
+                    m = int(ue.get("wb_cqi", 0))
+                    if int(ue.get("bsr", 0)) > 0 and m > 0:
+                        st["mcs"].setdefault(r, []).append(m)
+            ready = {r: v[-FORCE_OBSERVE_S:] for r, v in st["mcs"].items() if r in rntis and len(v) >= FORCE_OBSERVE_S}
+            avg = {r: sum(v) / len(v) for r, v in ready.items()}
+            srt = sorted(avg.values())
+            gap = (srt[1] - srt[0]) if len(srt) >= 2 else 0
+            if len(ready) >= 2 and gap >= FORCE_MCS_GAP:
+                st["masked"] = frozenset([min(avg, key=avg.get)])   # access：只遮 MCS 最低者（relay 在上方另外處理）
+                self._log.info("[force] node%d 遮 rnti=%s（平均 MCS %s）", self.node_id, sorted(st["masked"]),
+                            {r: round(a, 1) for r, a in avg.items()})
+        if st["masked"] is not None:
+            rm = self._rule_mask()
+            masks = [rm if r in st["masked"] else 0xFFFF for r in rntis]
+        return masks
+
+    def _rule_mask(self) -> int:
+        """時域規則的遮罩：/tmp/rule_mask 存在時用它（每 5 秒重讀），否則用 RULE_MASK。"""
+        now = time.monotonic()
+        if now - getattr(self, "_rule_mask_ts", -1e9) > RULE_MASK_REFRESH_S:
+            self._rule_mask_ts = now
+            try:
+                with open(RULE_MASK_FILE) as f:
+                    self._rule_mask_val = int(f.read().strip(), 16) & 0xFFFF
+            except (OSError, ValueError):
+                self._rule_mask_val = RULE_MASK
+        return self._rule_mask_val
+
+    def _handle_shadow_request(self, ues: list[dict], t_recv: float,
+                               rule_caps: Optional[list[int]] = None,
+                               rule_masks: Optional[list[int]] = None) -> None:
+        """
+        記錄一筆 PF-shadow 資料，供 Critic 離線預訓練（pretrain_critic.py，LOCAL_DRL_V2_DESIGN.md §1）。
+
+        每一步都存（含閒置步：線上經驗也包含 reward=0 的閒置轉換，V(s) 要學到同樣的分佈）：
+          - state_vec/mask_vec：跟線上 Actor 完全相同的 _encode_current_state()（含 relational 特徵）
+          - ues：原始 UE 狀態（含 bsr）。reward 要用「下一步」的 bsr 算（同線上 _build_rl_experience()
+            的 R(A_{t-1}, S_t) 定義），由預訓練腳本把相鄰兩筆配對後以 compute_reward_breakdown() 算出
+          - pf_actual_rbs／pf_rb_share：PF 這一週期實際分給各 UE 的 RB 數與份額，供分析 PF 行為用
+            （不再當 Actor 的 BC 標籤——上限動作空間裡 PF 的動作就是全部不設上限，見 §1.5）
+
+        fairness_bias 用中性值 1.0：shadow 模式不啟動 _fairness_sub_worker，且 Global xApp 讀的是
+        node{N}_experiences、shadow 期間沒有資料可算；這一維在預訓練資料裡恆為中性。
+        """
+        if not ues:
+            return
+
+        state_vec, mask_vec = self._encode_current_state(ues, fairness_bias=1.0)
+
+        raw_rbs = [max(float(ue.get("pf_actual_rbs", 0)), 0.0) for ue in ues]
+        total_rbs = sum(raw_rbs)
+
+        doc: dict[str, Any] = {
+            "node_id":      self.node_id,
+            "timestamp":    datetime.now(timezone.utc),
+            "t_mono":       t_recv,          # 單調時鐘，預訓練配對相鄰兩筆時判斷是否中斷
+            "scenario_tag": PF_SHADOW_SCENARIO_TAG,
+            "state_vec":    state_vec.tolist(),
+            "mask_vec":     mask_vec.tolist(),
+            "ues":          ues,
+            "pf_actual_rbs": raw_rbs,
+            "pf_rb_share":  [r / total_rbs for r in raw_rbs] if total_rbs > 0 else None,
+        }
+        if rule_caps is not None:
+            doc["rule_caps"] = rule_caps     # 本步回傳的 prb_abs（XAPP_MODE=rule）；pf_actual_rbs 是上一個視窗的實際分配
+        if rule_masks is not None:
+            doc["rule_masks"] = rule_masks   # 本步回傳的 slot_mask（RULE_KIND=mask）
+            # v2.1 行為複製標籤：規則遮了幾個 UE → 宏動作（0＝不遮、2＝遮 1 個（0x1111）、3＝遮 2 個）
+            k = sum(1 for m in rule_masks if int(m) != 0xFFFF)
+            doc["rule_macro"] = 0 if k == 0 else (2 if k == 1 else 3)
+            doc["rule_masked_idx"] = [i for i, m in enumerate(rule_masks) if int(m) != 0xFFFF]
+        self._queue_experience(doc)
+
+        if self._total_inferences % 500 == 0:
+            self._log.info(
+                "PF-SHADOW[%d] scenario=%s n_ue=%d total_rbs=%.0f p̂=%.3f ĉ=%.3f",
+                self._total_inferences, PF_SHADOW_SCENARIO_TAG, len(ues), total_rbs,
+                *self._current_relational(),
+            )
 
     # -------------------------------------------------------------------------
     # 主迴圈
@@ -652,35 +1077,46 @@ class InferenceServer:
         )
         self._flush_thread.start()
 
-        # 背景執行緒 2：DRL 離線訓練
-        self._train_thread = threading.Thread(
-            target=self._train_worker,
+        # 背景執行緒：relational state 特徵 p̂/ĉ（active/shadow 兩種模式都需要，state 定義要一致）
+        self._rel_thread = threading.Thread(
+            target=self._relational_worker,
             daemon=True,
-            name=f"drl-train-node{self.node_id}",
+            name=f"relational-node{self.node_id}",
         )
-        self._train_thread.start()
+        self._rel_thread.start()
 
-        # 背景執行緒 3：磁碟 checkpoint 熱重載（Phase 5，接收 FL ClientApp 的聚合結果）
-        self._reload_thread = threading.Thread(
-            target=self._reload_worker,
-            daemon=True,
-            name=f"ckpt-reload-node{self.node_id}",
-        )
-        self._reload_thread.start()
-
-        # 背景執行緒 4：Global xApp 全域公平性廣播接收（全部 12 節點對稱）
-        if self._fairness_sub_sock is not None:
-            self._fairness_thread = threading.Thread(
-                target=self._fairness_sub_worker,
+        # 背景執行緒 2/3/4（DRL 訓練、checkpoint 熱重載、全域公平性廣播接收）：
+        # shadow 模式完全不做 DRL 推論/訓練，這三個執行緒沒有存在意義，略過啟動。
+        if self.xapp_mode not in SHADOW_LIKE_MODES:
+            self._train_thread = threading.Thread(
+                target=self._train_worker,
                 daemon=True,
-                name=f"fairness-sub-node{self.node_id}",
+                name=f"drl-train-node{self.node_id}",
             )
-            self._fairness_thread.start()
+            self._train_thread.start()
+
+            self._reload_thread = threading.Thread(
+                target=self._reload_worker,
+                daemon=True,
+                name=f"ckpt-reload-node{self.node_id}",
+            )
+            self._reload_thread.start()
+
+            if self._fairness_sub_sock is not None:
+                self._fairness_thread = threading.Thread(
+                    target=self._fairness_sub_worker,
+                    daemon=True,
+                    name=f"fairness-sub-node{self.node_id}",
+                )
+                self._fairness_thread.start()
 
         self._log.info(
-            "Node %d 推論伺服器啟動 | 初始模式: %s | 等待 C xApp 請求...",
+            "Node %d 推論伺服器啟動 | 模式: %s | 等待 C xApp 請求...",
             self.node_id,
-            "DRL" if self._agent.is_trained else "BSR 啟發式（收集資料中）",
+            f"PF-shadow（{PF_SHADOW_SCENARIO_TAG}）" if self.xapp_mode == "shadow"
+            else f"固定規則上限（{PF_SHADOW_SCENARIO_TAG}，MCS≤{RULE_BAD_MCS} 且落差≥{RULE_MCS_GAP} → {RULE_CAP}）"
+            if self.xapp_mode == "rule"
+            else ("DRL" if self._agent.is_trained else "BSR 啟發式（收集資料中）"),
         )
 
         assert self._zmq_sock is not None
@@ -700,12 +1136,45 @@ class InferenceServer:
                 try:
                     payload: dict[str, Any] = json.loads(raw)
                     ues: list[dict[str, Any]] = payload.get("ues", [])
+                    # 子節點類型（2026-10-01）：relay 節點 E2 回報的子節點依附著順序排列，access MT 一定先附著
+                    # （relay 直連 UE 由 start_relay_ues.sh 在 13/13 E2 之後才啟動），前 len(CHILDREN_OF) 個即 MT。
+                    n_iab = len(CHILDREN_OF.get(self.node_id, ()))
+                    for i_ue, u_ in enumerate(ues):
+                        u_["is_iab_child"] = 1 if i_ue < n_iab else 0
                     # Backhaul-aware 可用 PRB 比例（E2 回報，xApp 帶入 JSON 的 bh_ratio）；缺欄位/非法值→1.0（池子全開）
                     try:
                         bh = float(payload.get("bh_ratio", 1.0))
                         self._bh_ratio = min(1.0, max(0.0, bh)) if bh == bh else 1.0   # bh==bh 排除 NaN
                     except (TypeError, ValueError):
                         self._bh_ratio = 1.0
+
+                    # 發佈給 relational 背景執行緒（parent/children 節點會讀這兩個值算它們的 p̂/ĉ）
+                    total_buf = sum(max(float(u.get("dl_buffer_info", 0)), 0.0) for u in ues)
+                    with self._rel_lock:
+                        self._my_status = (self._bh_ratio, total_buf)
+
+                    # ── PF-shadow 模式：完全獨立的極簡分支，處理完直接 continue ──
+                    # 不做 DRL 推論/訓練/prev_* 狀態追蹤，只偷看 state 存起來，
+                    # 回傳「解除上限」讓 MAC 排程器維持純 PF 行為。見
+                    # LOCAL_DRL_V2_DESIGN.md §1.3。
+                    if self.xapp_mode in SHADOW_LIKE_MODES:
+                        caps, masks = self._rule_decide(ues)
+                        self._handle_shadow_request(ues, t_recv,
+                                                    rule_caps=caps if self.xapp_mode == "rule" else None,
+                                                    rule_masks=masks if self.xapp_mode == "rule" else None)
+                        self._masked_rntis = {int(ue["rnti"]) for ue, m in zip(ues, masks) if int(m) != 0xFFFF}
+                        response = json.dumps(
+                            {
+                                "allocations": [
+                                    {"rnti": int(ue["rnti"]), "prb_abs": int(c), "slot_mask": int(m)}
+                                    for ue, c, m in zip(ues, caps, masks)
+                                ]
+                            },
+                            separators=(",", ":"),
+                        )
+                        self._zmq_sock.send_string(response)
+                        self._total_inferences += 1
+                        continue
 
                     # ── 狀態 debug log（每 500 次）────────────────────────
                     if self._total_inferences % 500 == 0 and ues:
@@ -754,23 +1223,53 @@ class InferenceServer:
                             prev_action_ratios=self._prev_action_ratios,
                             curr_ues=ues,
                             prev_behavior_logp=self._prev_behavior_logp,
+                            prev_macro=self._prev_macro,
+                            prev_factored=self._prev_factored,
+                            prev_hold=self._prev_hold,
                         )
                         self._queue_experience(exp_doc)
 
                     # ── 執行推論 ──────────────────────────────────────────
-                    allocations, action_ratios, behavior_logp = self._infer(ues)
+                    feat_snap = (self._current_fairness_bias(), *self._current_relational())
+                    rnti_set = frozenset(int(u.get("rnti", 0)) for u in ues)
+                    hc = self._hold_cur
+                    if ACTION_HOLD > 1 and self._hold_left > 0 and hc is not None and hc["rntis"] == rnti_set:
+                        # 動作持續中：沿用決策當下的遮罩，不重新抽樣（behavior_logp 只記在決策那一步）
+                        allocations = [dict(a) for a in hc["allocs"]]
+                        action_ratios, behavior_logp = hc["ratios"], None
+                        self._hold_left -= 1
+                        hc["pos"] += 1
+                        cur_hold, cur_macro, cur_factored = (hc["id"], hc["pos"]), hc["macro"], hc["factored"]
+                    else:
+                        allocations, action_ratios, behavior_logp = self._infer(ues, feat_snap)
+                        cur_macro, cur_factored = self._agent.last_macro, self._agent.last_factored
+                        cur_hold = None
+                        self._hold_left, self._hold_cur = 0, None
+                        if ACTION_HOLD > 1 and behavior_logp is not None and allocations:
+                            self._hold_seq += 1
+                            hid = f"{self.node_id}-{int(time.time())}-{self._hold_seq}"
+                            self._hold_cur = {"id": hid, "pos": 0, "rntis": rnti_set, "ratios": action_ratios,
+                                              "allocs": [dict(a) for a in allocations],
+                                              "macro": cur_macro, "factored": cur_factored}
+                            self._hold_left = ACTION_HOLD - 1
+                            cur_hold = (hid, 0)
                     self._total_inferences += 1
 
                     # ── 暫存本步狀態（下一步計算獎勵用）─────────────────
                     if ues and allocations:
                         self._prev_ues = ues
                         self._prev_allocations = allocations
-                        self._prev_state_vec, self._prev_mask_vec = (
-                            self._agent.encode_state(
-                                ues, fairness_bias=self._current_fairness_bias(), bh_ratio=self._bh_ratio
-                            )
+                        # 用推論當下同一份特徵快照編碼（不能重新讀快取：背景執行緒可能已更新
+                        # fairness_bias/p̂/ĉ，存下的 state 就不是策略實際看到的 state，PPO 比例會錯）
+                        self._prev_state_vec, self._prev_mask_vec = self._agent.encode_state(
+                            ues, fairness_bias=feat_snap[0], bh_ratio=self._bh_ratio,
+                            parent_trend=feat_snap[1], children_demand=feat_snap[2],
+                            prev_masked=self._masked_rntis,
                         )
                         self._prev_action_ratios = action_ratios
+                        self._prev_macro = cur_macro
+                        self._prev_factored = cur_factored
+                        self._prev_hold = cur_hold
                         self._prev_behavior_logp = behavior_logp
                         self._prev_ts = t_recv
                     else:
@@ -788,6 +1287,9 @@ class InferenceServer:
                         {"allocations": allocations}, separators=(",", ":")
                     )
                     self._zmq_sock.send_string(response)
+                    # 下一步 state 的 was_masked（必須在本步 state 都編碼完之後才更新）
+                    self._masked_rntis = {int(a["rnti"]) for a in (allocations or [])
+                                          if int(a.get("slot_mask", 0xFFFF)) != 0xFFFF}
 
                     # ── 延遲監控 ──────────────────────────────────────────
                     elapsed_ms = (time.perf_counter() - t_recv) * 1000

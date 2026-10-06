@@ -1,5 +1,5 @@
 #!/bin/bash
-# PC 1: IAB Server Script (1 donor + 4 relay + 8 access + 17 UE 三主機版)
+# PC 1: IAB Server Script (1 donor + 4 relay + 8 access + 24 UE 三主機版；UE17~24 為 relay 直連 UE，由 run_local_pc1.sh 啟動)
 #
 # 2026-09-22 節點重分配：Node1~4(relay) 全部集中到 PC1（跟 Donor 同機），
 # 用來消除「跟 Donor 同主機的分支吞吐量系統性偏高」這個量測 confound（見
@@ -31,7 +31,8 @@ GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC
 # ==========================================
 echo -e "${CYAN}[1/6] Clean Up...${NC}"
 
-$DOCKER_COMPOSE -f $COMPOSE_FILE down 2>/dev/null
+# --profile relay-ue：一併移除 relay 直連 UE（UE17~24，2026-10-01 起；它們由 run_local_pc1.sh 的 Step 2.5 在 access MT 連上後才啟動）
+$DOCKER_COMPOSE -f $COMPOSE_FILE --profile relay-ue down 2>/dev/null
 
 sudo iptables -P INPUT ACCEPT
 sudo iptables -P FORWARD ACCEPT

@@ -39,6 +39,8 @@ COPY reward_calculator.py .
 COPY training_pipeline.py .
 COPY inference_server.py .
 COPY main.py .
+COPY pretrain_critic.py .
+COPY pretrain_v21.py .
 
 # Global xApp（全域公平性軟性廣播，見 global_xapp.py 檔頭說明）
 COPY global_xapp.py .

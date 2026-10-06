@@ -45,6 +45,7 @@ REWARD_MODE_ARG="throughput_only"
 MODEL_ARCH_ARG="mlp"
 FL_MODE_ARG="avg"
 PROTOCOL_ARG=""
+SCENARIO_FAMILY_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --epoch) EPOCH="$2"; shift 2 ;;
@@ -52,16 +53,21 @@ while [[ $# -gt 0 ]]; do
         --reward-mode) REWARD_MODE_ARG="$2"; shift 2 ;;
         --model-arch) MODEL_ARCH_ARG="$2"; shift 2 ;;
         --fl-mode) FL_MODE_ARG="$2"; shift 2 ;;
+        --scenario-family) SCENARIO_FAMILY_ARG="$2"; shift 2 ;;
         *) err "未知參數: $1"; exit 1 ;;
     esac
 done
 if [[ -z "$EPOCH" ]]; then
-    err "用法: $0 --epoch <unix_timestamp> [--reward-mode throughput_only] [--model-arch mlp] [--fl-mode avg] [--protocol {tcp,udp}]"
+    err "用法: $0 --epoch <unix_timestamp> [--reward-mode throughput_only] [--model-arch mlp] [--fl-mode avg] [--protocol {tcp,udp}] [--scenario-family {t,th,tm,tmh,hs,hsh}]"
     exit 1
 fi
 case "$PROTOCOL_ARG" in
     ""|tcp|udp) ;;
     *) err "--protocol 必須是 tcp 或 udp（收到: $PROTOCOL_ARG）"; exit 1 ;;
+esac
+case "$SCENARIO_FAMILY_ARG" in
+    ""|t|th|tm|tmh|hs|hsh|hsc|hshc|hsxc|hsx5c|hsbc|hscc|hsdc|hsec|hseo) ;;
+    *) err "--scenario-family 必須是 t、th、tm、tmh、hs、hsh、hsc 或 hshc（收到: $SCENARIO_FAMILY_ARG）"; exit 1 ;;
 esac
 
 cd "$COMPOSE_DIR" || { err "cd 到 $COMPOSE_DIR 失敗"; exit 1; }
@@ -75,7 +81,7 @@ cd "$COMPOSE_DIR" || { err "cd 到 $COMPOSE_DIR 失敗"; exit 1; }
 # shell 環境，並在收尾額外用 --force-recreate 重新蓋一次 inference-nodeN，
 # 確保不管 start_iab_server.sh 內部怎麼跑，最後狀態一定是正確的——不能只
 # 假設「應該不會被重設」，要主動覆蓋確認。
-log "本次收斂訓練的環境變數：REWARD_MODE=$REWARD_MODE_ARG MODEL_ARCH=$MODEL_ARCH_ARG FL_MODE=$FL_MODE_ARG"
+log "本次收斂訓練的環境變數：REWARD_MODE=$REWARD_MODE_ARG MODEL_ARCH=$MODEL_ARCH_ARG FL_MODE=$FL_MODE_ARG SCENARIO_FAMILY=${SCENARIO_FAMILY_ARG:-t（預設）}"
 
 # 只追蹤 PC1 本機的關鍵容器（donor-cu/donor-du/flexric）——這三個是崩潰鏈的
 # 起點（見上方說明），PC2/PC3 上的 DU 容器崩潰也會反映在這三者的 RestartCount
@@ -175,11 +181,19 @@ CRASH_COUNT=0
 EXT_DN_IP="192.168.72.135"
 UE_HEAL_FAIL_DETAIL=""
 declare -A UE_BASELINE
+# [2026-10-01] relay 直連 UE17~24 在 PC1（本機執行，不走 ssh）；RELAY_UES=0 時回到 16 UE 拓樸
+NUE=24; [[ "${RELAY_UES:-1}" == "0" ]] && NUE=16
+UE_HOSTS=(pc2 pc3); [[ $NUE -eq 24 ]] && UE_HOSTS=(pc1 pc2 pc3)
+# on_host <host> <command string>：pc1 在本機執行，其他主機走 ssh
+on_host() { local h=$1; shift; if [[ "$h" == "pc1" ]]; then bash -c "$*"; else ssh "$h" "$*"; fi; }
+ue_host() { if [[ $1 -gt 16 ]]; then echo pc1; elif [[ $1 -gt 8 ]]; then echo pc3; else echo pc2; fi; }
+host_ue_range() { case "$1" in pc1) echo "17 24";; pc2) echo "1 8";; pc3) echo "9 16";; esac; }
 
 ue_restart_counts() {
     local h
-    for h in pc2 pc3; do
-        ssh -o ConnectTimeout=5 "$h" 'for c in $(docker ps -a --format "{{.Names}}" | grep -E "^rfsim5g-end-ue-[0-9]+$"); do echo "${c##*-} $(docker inspect --format "{{.RestartCount}}/{{.State.StartedAt}}" $c)"; done' 2>/dev/null
+    local q='for c in $(docker ps -a --format "{{.Names}}" | grep -E "^rfsim5g-end-ue-[0-9]+$"); do echo "${c##*-} $(docker inspect --format "{{.RestartCount}}/{{.State.StartedAt}}" $c)"; done'
+    for h in "${UE_HOSTS[@]}"; do
+        if [[ "$h" == "pc1" ]]; then bash -c "$q" 2>/dev/null; else ssh -o ConnectTimeout=5 "$h" "$q" 2>/dev/null; fi
     done
 }
 
@@ -191,9 +205,7 @@ reset_ue_baseline() {
     done < <(ue_restart_counts)
 }
 reset_ue_baseline
-log "UE 容器 RestartCount 基準：$(for u in $(seq 1 17); do echo -n "UE$u=${UE_BASELINE[$u]:-?} "; done)"
-
-ue_host() { if [[ $1 -gt 8 ]]; then echo pc3; else echo pc2; fi; }
+log "UE 容器 RestartCount 基準：$(for u in $(seq 1 $NUE); do echo -n "UE$u=${UE_BASELINE[$u]:-?} "; done)"
 
 heal_one_ue() {
     local u="$1" host c attempt bind_ip n
@@ -203,22 +215,23 @@ heal_one_ue() {
         # 第 5 次仍不通：手動重啟該 UE 容器一次
         if [[ $attempt -eq 5 ]]; then
             warn "UE${u} 第 4 次修復仍不通，重啟該 UE 容器一次..."
-            ssh "$host" "docker restart $c" >/dev/null 2>&1
+            on_host "$host" "docker restart $c" >/dev/null 2>&1
             sleep 30
         fi
         # tunnel 介面還沒建立（UE 還在接入）就再等
-        ssh "$host" "docker exec $c ip link show oaitun_ue1" >/dev/null 2>&1 || continue
-        if [[ $u -eq 17 ]]; then
-            bind_ip=$(grep -oP '(?<=local_n_address = ")[0-9.]+' "$COMPOSE_DIR/conf/iab_du_node4.conf" 2>/dev/null)
-            [[ -n "$bind_ip" ]] && docker exec -u 0 rfsim5g-iab-mt-4 ip addr add "${bind_ip}/32" dev oaitun_ue1 2>/dev/null
-        fi
-        ssh "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
-        if ssh "$host" "docker exec $c ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss"; then
+        on_host "$host" "docker exec $c ip link show oaitun_ue1" >/dev/null 2>&1 || continue
+        # [UE17 已移除 2026-09-30] 以下原本替 UE17 補 DU4 F1-U 別名位址，整段註解保留
+        # if [[ $u -eq 17 ]]; then
+        #     bind_ip=$(grep -oP '(?<=local_n_address = ")[0-9.]+' "$COMPOSE_DIR/conf/iab_du_node4.conf" 2>/dev/null)
+        #     [[ -n "$bind_ip" ]] && docker exec -u 0 rfsim5g-iab-mt-4 ip addr add "${bind_ip}/32" dev oaitun_ue1 2>/dev/null
+        # fi
+        on_host "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
+        if on_host "$host" "docker exec $c ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss"; then
             # UE 崩潰時 ext-dn 上該 UE 的 iperf3 server（-s -1）常卡在「舊連線還在」狀態，新 client 會 rc=1
             # "server is busy running a test"、該 UE 沒流量。只殺 iperf3 行程本體（^ 錨定，不會比對到外層
             # while-loop 的 sh -c；殺到 loop 就不會自動重啟了），loop 1 秒後自動拉起乾淨的新 server。
             docker exec rfsim5g-oai-ext-dn pkill -f "^iperf3 -s -1 -p $((5200 + u)) " 2>/dev/null
-            n=$(ssh "$host" "docker inspect --format '{{.RestartCount}}/{{.State.StartedAt}}' $c" 2>/dev/null)
+            n=$(on_host "$host" "docker inspect --format '{{.RestartCount}}/{{.State.StartedAt}}' $c" 2>/dev/null)
             [[ -n "$n" ]] && UE_BASELINE[$u]=$n
             return 0
         fi
@@ -253,16 +266,16 @@ heal_restarted_ues() {
     local hosts="" h bad
     for u in $changed; do hosts="$hosts $(ue_host "$u")"; done
     for h in $(echo $hosts | tr ' ' '\n' | sort -u); do
-        local lo=1 hi=8; [[ "$h" == "pc3" ]] && { lo=9; hi=17; }
+        local lo hi; read -r lo hi <<< "$(host_ue_range "$h")"   # pc1=17~24（relay 直連）、pc2=1~8、pc3=9~16
         bad=""
         for v in $(seq $lo $hi); do
-            ssh "$h" "docker exec rfsim5g-end-ue-$v ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss" || bad="$bad $v"
+            on_host "$h" "docker exec rfsim5g-end-ue-$v ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss" || bad="$bad $v"
         done
         if [[ -n "$bad" ]]; then
             sleep 10
             local bad2=""
             for v in $bad; do
-                ssh "$h" "docker exec rfsim5g-end-ue-$v ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss" || bad2="$bad2 $v"
+                on_host "$h" "docker exec rfsim5g-end-ue-$v ping -c 2 -W 3 $EXT_DN_IP" 2>/dev/null | grep -q " 0% packet loss" || bad2="$bad2 $v"
             done
             bad="$bad2"
         fi
@@ -313,7 +326,7 @@ detect_crash_signal() {
 }
 
 stop_scenario_driver() {
-    log "停止 PC2/PC3（及 PC1 殘留）的 training_scenario_driver.sh..."
+    log "停止 PC1/PC2/PC3 的 training_scenario_driver.sh..."
     pkill -f training_scenario_driver.sh 2>/dev/null
     ssh pc2 "pkill -f training_scenario_driver.sh" 2>/dev/null
     ssh pc3 "pkill -f training_scenario_driver.sh" 2>/dev/null
@@ -321,24 +334,32 @@ stop_scenario_driver() {
 }
 
 start_scenario_driver() {
-    # 只在 PC2/PC3 啟動（PC1 沒有任何 UE 容器，2026-09-22 起；在 PC1 啟動場景行程會立刻因「沒有 UE」退出、驅動器空轉）
-    log "重新啟動 PC2/PC3 的 training_scenario_driver.sh（epoch=$EPOCH，自動接續到 wall clock 當下位置）..."
+    # PC2/PC3 控制 access UE；PC1 控制 relay 直連 UE17~24（2026-10-01 起，RELAY_UES=0 時不啟動）
+    log "重新啟動 ${UE_HOSTS[*]} 的 training_scenario_driver.sh（epoch=$EPOCH，自動接續到 wall clock 當下位置）..."
+    if [[ $NUE -eq 24 ]]; then
+        nohup bash iab/training_scenario_driver.sh --host pc1 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG}${SCENARIO_FAMILY_ARG:+ --scenario-family $SCENARIO_FAMILY_ARG} > /tmp/driver_stage_pc1.log 2>&1 < /dev/null &
+    fi
     # 2026-09-18 現場踩過的坑：`ssh host "cmd &"` 不可靠（SSH session 可能在背景行程 fork 完成前就關閉）；
     # 改用 `ssh -f`。
-    ssh -f pc2 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc2 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_pc2.log 2>&1 < /dev/null" 2>/dev/null
-    ssh -f pc3 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc3 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_pc3.log 2>&1 < /dev/null" 2>/dev/null
+    ssh -f pc2 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc2 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG}${SCENARIO_FAMILY_ARG:+ --scenario-family $SCENARIO_FAMILY_ARG} > /tmp/driver_stage_pc2.log 2>&1 < /dev/null" 2>/dev/null
+    ssh -f pc3 "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host pc3 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG}${SCENARIO_FAMILY_ARG:+ --scenario-family $SCENARIO_FAMILY_ARG} > /tmp/driver_stage_pc3.log 2>&1 < /dev/null" 2>/dev/null
     sleep 3
     local missing=""
+    [[ $NUE -eq 24 ]] && { pgrep -f training_scenario_driver.sh >/dev/null 2>&1 || missing="$missing pc1"; }
     ssh pc2 "pgrep -f training_scenario_driver.sh" >/dev/null 2>&1 || missing="$missing pc2"
     ssh pc3 "pgrep -f training_scenario_driver.sh" >/dev/null 2>&1 || missing="$missing pc3"
     if [[ -n "$missing" ]]; then
         err "場景驅動器沒有在這些主機上起來：$missing —— 重試一次"
         for h in $missing; do
-            ssh -f "$h" "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host $h --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG} > /tmp/driver_stage_${h}.log 2>&1 < /dev/null" 2>/dev/null
+            if [[ "$h" == "pc1" ]]; then
+                nohup bash iab/training_scenario_driver.sh --host pc1 --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG}${SCENARIO_FAMILY_ARG:+ --scenario-family $SCENARIO_FAMILY_ARG} > /tmp/driver_stage_pc1.log 2>&1 < /dev/null &
+                continue
+            fi
+            ssh -f "$h" "cd $COMPOSE_DIR && nohup bash iab/training_scenario_driver.sh --host $h --epoch $EPOCH${PROTOCOL_ARG:+ --protocol $PROTOCOL_ARG}${SCENARIO_FAMILY_ARG:+ --scenario-family $SCENARIO_FAMILY_ARG} > /tmp/driver_stage_${h}.log 2>&1 < /dev/null" 2>/dev/null
         done
         sleep 3
     fi
-    ok "場景驅動器已在 PC2/PC3 重新啟動"
+    ok "場景驅動器已在 ${UE_HOSTS[*]} 重新啟動"
 }
 
 full_recovery() {
@@ -419,6 +440,10 @@ full_recovery() {
 
     log "[4/4] 回 PC1：等待 13/13 E2、啟動 xApp（run_local_pc1.sh --skip-server）..."
     bash iab/run_local_pc1.sh --skip-server > "$ts_dir/pc1_xapp.log" 2>&1
+    if grep -q "重試 5 次後仍有 UE 連不通" "$ts_dir/pc1_xapp.log"; then
+        warn "relay 直連 UE 啟動後仍有連不通（軟性失敗，繼續往下走，見 $ts_dir/pc1_xapp.log）"
+        DEGRADED=$((DEGRADED + 1)); DEGRADED_DETAIL="$DEGRADED_DETAIL relay-ue"
+    fi
     E2=$(docker logs flexric 2>&1 | grep -c "E2 SETUP-REQUEST" 2>/dev/null || echo 0)
     if [[ "$E2" -lt 13 ]]; then
         warn "重啟後 E2 連線只有 ${E2}/13（軟性失敗，xApp 仍已對已連線節點啟動，見 $ts_dir/pc1_xapp.log）"
@@ -436,32 +461,33 @@ full_recovery() {
     # 2026-09-26 UE16 兩次出現，單獨重啟即恢復但預設路由會被清掉）。
     verify_and_heal_all_ues() {
         local ext_dn_ip="192.168.72.135" bad_final=""
-        for u in $(seq 1 17); do
-            local host=pc2; [[ $u -gt 8 ]] && host=pc3
+        for u in $(seq 1 $NUE); do   # UE1~16 access（PC2/PC3）、UE17~24 relay 直連（PC1）
+            local host; host=$(ue_host "$u")
             local c="rfsim5g-end-ue-$u" good=0
             for attempt in 1 2 3; do
-                if ssh "$host" "docker exec $c ping -c 2 -W 3 $ext_dn_ip" 2>/dev/null | grep -q " 0% packet loss"; then
+                if on_host "$host" "docker exec $c ping -c 2 -W 3 $ext_dn_ip" 2>/dev/null | grep -q " 0% packet loss"; then
                     good=1; break
                 fi
                 if [[ $attempt -eq 1 ]]; then
                     warn "UE${u} 第 1 次驗證失敗，重新斷言預設路由..."
-                    if [[ $u -eq 17 ]]; then
-                        local bind_ip
-                        bind_ip=$(grep -oP '(?<=local_n_address = ")[0-9.]+' "$COMPOSE_DIR/conf/iab_du_node4.conf" 2>/dev/null)
-                        [[ -n "$bind_ip" ]] && docker exec -u 0 rfsim5g-iab-mt-4 ip addr add "${bind_ip}/32" dev oaitun_ue1 2>/dev/null
-                    fi
-                    ssh "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
+                    # [UE17 已移除 2026-09-30] 以下原本替 UE17 補 DU4 F1-U 別名位址，整段註解保留
+                    # if [[ $u -eq 17 ]]; then
+                    #     local bind_ip
+                    #     bind_ip=$(grep -oP '(?<=local_n_address = ")[0-9.]+' "$COMPOSE_DIR/conf/iab_du_node4.conf" 2>/dev/null)
+                    #     [[ -n "$bind_ip" ]] && docker exec -u 0 rfsim5g-iab-mt-4 ip addr add "${bind_ip}/32" dev oaitun_ue1 2>/dev/null
+                    # fi
+                    on_host "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
                 elif [[ $attempt -eq 2 ]]; then
                     warn "UE${u} 第 2 次驗證仍失敗，重啟該 UE 容器並補預設路由..."
-                    ssh "$host" "docker restart $c" >/dev/null 2>&1
+                    on_host "$host" "docker restart $c" >/dev/null 2>&1
                     sleep 45
-                    ssh "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
+                    on_host "$host" "docker exec -u 0 $c ip route replace default via 12.1.1.1 dev oaitun_ue1" 2>/dev/null
                 fi
                 sleep 8
             done
             [[ $good -eq 1 ]] || bad_final="$bad_final UE$u"
         done
-        if [[ -z "$bad_final" ]]; then ok "17/17 UE 最終驗證通過"; return 0; fi
+        if [[ -z "$bad_final" ]]; then ok "$NUE/$NUE UE 最終驗證通過"; return 0; fi
         err "最終驗證仍失敗的 UE:$bad_final"
         return 1
     }
@@ -470,9 +496,9 @@ full_recovery() {
         DEGRADED=$((DEGRADED + 1)); DEGRADED_DETAIL="$DEGRADED_DETAIL ue-verify"
     fi
 
-    # 17 個 iperf3 server（每次乾淨重啟後必須重建；這是先前 full_recovery() 的已知缺口，見 CLAUDE.md 第 6 節）
-    log "重建 ext-dn 的 17 個 iperf3 server（scenarios/setup_iperf_servers.sh）..."
-    bash scenarios/setup_iperf_servers.sh > "$ts_dir/iperf_servers.log" 2>&1 \
+    # $NUE 個 iperf3 server（UE1~16 access、UE17~24 relay 直連；每次乾淨重啟後必須重建）
+    log "重建 ext-dn 的 $NUE 個 iperf3 server（scenarios/setup_iperf_servers.sh）..."
+    IPERF_LAST_PORT=$((5200 + NUE)) bash scenarios/setup_iperf_servers.sh > "$ts_dir/iperf_servers.log" 2>&1 \
         || { warn "setup_iperf_servers.sh 失敗（見 $ts_dir/iperf_servers.log）"; DEGRADED=$((DEGRADED + 1)); DEGRADED_DETAIL="$DEGRADED_DETAIL iperf-servers"; }
 
     log "確認 Stage 2+ 服務（inference-nodeN／global-xapp／flower-*）仍在跑..."
@@ -487,6 +513,9 @@ full_recovery() {
         REWARD_MODE="$REWARD_MODE_ARG" FL_MODE="$FL_MODE_ARG" MODEL_ARCH="$MODEL_ARCH_ARG" \
             $DC --profile stage2-fl up -d --force-recreate global-xapp flower-superlink flower-supernode-node{1..12} flower-scheduler \
             >> "$ts_dir/stage2_services.log" 2>&1
+    else
+        # Stage 1.5（FL_MODE=none，2026-10-04）：Global xApp 照常廣播 fairness_bias（state 須與 Stage 2 相同），只是不帶 FL 層
+        $DC --profile stage2-fl up -d --force-recreate global-xapp >> "$ts_dir/stage2_services.log" 2>&1
     fi
 
     # 上面的 plain `up -d`（無 --force-recreate）本身不該改變已存在容器的環境

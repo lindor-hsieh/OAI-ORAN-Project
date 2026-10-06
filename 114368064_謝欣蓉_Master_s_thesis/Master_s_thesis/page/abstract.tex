@@ -1,0 +1,22 @@
+% 中文摘要頁
+% TODO: 本摘要為依據系統模型章節撰寫之草稿，待實驗章節完成後補上主要結果。
+\begin{ZhAbstract}
+    \begin{ZhAbstractItems}
+        \noindent 論文名稱：\cTitle
+
+        \noindent 校院系：\univCname\ \deptCname \hfill 頁數：（請填）
+
+        \noindent 畢業時間：\cAcademicYear 學年度第\cGraduateSemester 學期 \hfill 學位：\degreeCname
+
+        \noindent 研究生：\myCname \hfill 指導教授：\advisorCname
+
+        % 關鍵詞，多個關鍵字以頓號(、)隔開
+        \noindent 關鍵詞：O-RAN、整合接取與回程（IAB）、PRB 資源分配、多智能體強化學習、階層式聯邦學習
+
+    \end{ZhAbstractItems}
+
+    \begin{ZhAbstractDescription}
+        整合接取與回程（IAB）透過多跳無線回程延伸網路覆蓋，然而每個 IAB 節點中的行動終端（MT）與分散單元（DU）必須共享無線資源，且任一跳的壅塞會向下影響整個子樹。本論文研究 O-RAN 控制下 IAB 網路之下行實體資源區塊（PRB）分配問題。本文首先建立與拓撲無關的系統模型，將任意深度的多跳 IAB 網路表示為有根樹，並描述鏈路速率、以回程感知 PRB 預算刻劃的 MT--DU 資源耦合，以及多跳佇列動態，進而定義總吞吐量最大化問題。由於該問題之動作空間呈指數成長、跨時間與跨跳耦合，且通道與需求統計未知，本文將每個 IAB 節點視為一個智能體，於比例公平排程器上施加各子節點之 PRB 上限，並以逐因子近端策略最佳化目標及具排列等變性之策略與價值網路進行訓練。智能體間透過聯邦學習共享知識，由平面 FedAvg 逐步發展為結合 Hedge 權重與發散回退機制之拓撲階層式聚合，最終提出依節點角色個人化廣播模型之 HiRA-Fed。整體架構以 xApp 及輔助服務部署於包含十二個 IAB 節點與十六個使用者設備之 O-RAN 實驗平台。（實驗結果待補。）
+    \end{ZhAbstractDescription}
+
+\end{ZhAbstract}

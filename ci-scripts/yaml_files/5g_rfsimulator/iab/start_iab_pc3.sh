@@ -1,5 +1,5 @@
 #!/bin/bash
-# PC 3: IAB Client Script — Node9,10,11,12 (access) + UE9~17
+# PC 3: IAB Client Script — Node9,10,11,12 (access) + UE9~16（UE17 已於 2026-09-30 移除）
 #
 # 2026-09-22 節點重分配（見 CLAUDE.md 第 1 節、HISTORY.md 對應條目）：
 #   Node1~4(relay，全部含 UE17 掛的 Node4) 現在全部集中到 PC1（跟 Donor 同
@@ -118,6 +118,29 @@ until ssh $SSH_OPTS ${PC1_USER}@${PC1_IP} \
 done
 echo -e "${GREEN}  PC1 relay Node3,4 檢查完成${NC}"
 
+# [2026-10-01 新增] F1-U 上行改走 MT 的無線 backhaul（符合 IAB：DU 的使用者面上行經由自己的 MT 回到 donor）。
+# 原本 DU 送往 CU（$SERVER_IP）的封包一律依 main table 走 internal bridge gateway → 主機實體網卡 → PC1，
+# 完全繞過 access MT 與 relay 的無線鏈路（下行才有走）。這裡只把 UDP（F1-U GTP）用 fwmark 導給同節點 MT 的
+# bridge IP，MT 再把從 eth0 進來的封包一律送進 oaitun_ue1（既有的 MASQUERADE -s DU_IP -o oaitun_ue1 會把來源改成
+# MT tunnel IP）。F1-C（SCTP）維持原路徑。可重複呼叫（冪等），容器重啟後由 reassert_mt_routes 重新套用。
+assert_f1u_uplink_via_mt() {
+    local MT_NAME=$1
+    local DU_NAME=$2
+    local DU_IP=$3
+    local PREFIX=${DU_IP%.*}
+    local MT_INTERNAL_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' $MT_NAME | grep "^${PREFIX}\." | head -n 1 | xargs)
+    [ -z "$MT_INTERNAL_IP" ] && { echo -e "   ${RED}[F1-U] 找不到 $MT_NAME 的 internal IP，略過${NC}"; return 1; }
+    docker exec -u 0 $DU_NAME iptables -t mangle -C OUTPUT -p udp -d $SERVER_IP -j MARK --set-mark 0x22 2>/dev/null \
+        || docker exec -u 0 $DU_NAME iptables -t mangle -A OUTPUT -p udp -d $SERVER_IP -j MARK --set-mark 0x22
+    docker exec -u 0 $DU_NAME sh -c "ip rule show | grep -q 'lookup 222' || ip rule add fwmark 0x22 lookup 222 pref 100"
+    # 網卡名稱依 IP 找（各容器的 eth0/eth1 順序不固定，例如 Node6 的 DU internal bridge 在 eth1）
+    local DU_IF=$(docker exec $DU_NAME ip -o -4 addr show | awk -v ip="$DU_IP" '$4 ~ "^"ip"/" {print $2}')
+    local MT_IF=$(docker exec $MT_NAME ip -o -4 addr show | awk -v ip="$MT_INTERNAL_IP" '$4 ~ "^"ip"/" {print $2}')
+    docker exec -u 0 $DU_NAME ip route replace $SERVER_IP via $MT_INTERNAL_IP dev $DU_IF table 222
+    docker exec -u 0 $MT_NAME sh -c "ip rule show | grep -q 'lookup 223' || ip rule add iif $MT_IF lookup 223 pref 100"
+    docker exec -u 0 $MT_NAME ip route replace default via 12.1.1.1 dev oaitun_ue1 table 223
+}
+
 configure_and_start_access_du() {
     local MT_NAME=$1
     local DU_NAME=$2
@@ -168,6 +191,7 @@ configure_and_start_access_du() {
     docker exec -u 0 $DU_NAME ip route replace $CN_SUBNET via $MT_INTERNAL_IP 2>/dev/null
     docker exec -u 0 $DU_NAME ip route replace $DN_SUBNET via $MT_INTERNAL_IP 2>/dev/null
     docker exec -u 0 $DU_NAME ip route replace $UE_SUBNET via $MT_INTERNAL_IP 2>/dev/null
+    assert_f1u_uplink_via_mt "$MT_NAME" "$DU_NAME" "$DU_DOCKER_IP"
 
     echo -e "${YELLOW} Waiting 10s for CU F1AP stability...${NC}"
     sleep 10
@@ -209,6 +233,7 @@ reassert_mt_routes() {
         docker exec -u 0 ${ACCESS_MT_NAME[$n]} ip route replace $DN_SUBNET via 12.1.1.1 dev oaitun_ue1 2>/dev/null
         docker exec -u 0 ${ACCESS_MT_NAME[$n]} ip route del default 2>/dev/null
         docker exec -u 0 ${ACCESS_MT_NAME[$n]} ip route add default via 12.1.1.1 dev oaitun_ue1 2>/dev/null
+        assert_f1u_uplink_via_mt "${ACCESS_MT_NAME[$n]}" "${ACCESS_DU_NAME[$n]}" "${ACCESS_DU_IP[$n]}" 2>/dev/null
     done
 }
 
@@ -325,20 +350,21 @@ echo -e "${CYAN}Finalizing Control Plane, waiting 15s...${NC}"
 sleep 15
 reapply_dnat_rules
 
-echo -e "\n${CYAN}[3/6] Launching End-UEs 9~17（UE17 直連 Node4(relay，現在在 PC1) 的 DU，
-不需要 access DU 設定，一個一個依序啟動）...${NC}"
-for i in 9 10 11 12 13 14 15 16 17; do
+# [UE17 已移除 2026-09-30] 原本 UE9~17，UE17（直連 Node4 relay DU）已從拓樸拿掉
+echo -e "\n${CYAN}[3/6] Launching End-UEs 9~16（一個一個依序啟動）...${NC}"
+for i in 9 10 11 12 13 14 15 16; do  # [UE17 已移除 2026-09-30] 原本含 17
     $DOCKER_COMPOSE -f $COMPOSE_FILE up -d "rfsim5g-end-ue-$i"
     wait_for_ue "rfsim5g-end-ue-$i"
 done
 
 reapply_dnat_rules
 
-# UE17 不在 verify_and_heal_ues() 的 ping 重試範圍內（機制跟 access 節點不同，
-# 直連 relay DU、沒有自己的 MT/DNAT 需要重新斷言），但一樣會遇到「預設路由
-# 消失」這個 UE 端通用問題（見 HISTORY.md 2026-09-18 條目），這裡單獨補一次，
-# 不影響 verify_and_heal_ues() 既有的範疇設計。
-fix_ue_default_routes 17
+# [UE17 已移除 2026-09-30] 以下原本單獨補 UE17 的預設路由，UE17 已拿掉，整段註解保留
+# # UE17 不在 verify_and_heal_ues() 的 ping 重試範圍內（機制跟 access 節點不同，
+# # 直連 relay DU、沒有自己的 MT/DNAT 需要重新斷言），但一樣會遇到「預設路由
+# # 消失」這個 UE 端通用問題（見 HISTORY.md 2026-09-18 條目），這裡單獨補一次，
+# # 不影響 verify_and_heal_ues() 既有的範疇設計。
+# fix_ue_default_routes 17
 
 echo -e "\n${CYAN}[6/6] 驗證 + 自我修復 UE9~16 連通性...${NC}"
 verify_and_heal_ues
@@ -351,4 +377,4 @@ else
     echo -e "${CYAN}$(echo -e "$CU_MAGIC_COMMANDS")${NC}"
 fi
 echo -e "${YELLOW}====================================================${NC}"
-echo -e "\n${GREEN}IAB PC3 - Node9,10,11,12(access) + UE9~17 Ready!${NC}"
+echo -e "\n${GREEN}IAB PC3 - Node9,10,11,12(access) + UE9~16 Ready!${NC}"

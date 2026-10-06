@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import random
 import os
 import threading
 from typing import Optional
@@ -33,7 +34,94 @@ from typing import Optional
 import numpy as np
 import pymongo
 
-from drl_agent import DRLAgent, MIN_TRAIN_EXPERIENCES, TRAIN_BATCH_SIZE, TRAIN_SEQ_LEN, TRAIN_SEQ_COUNT
+import bisect
+import math
+
+from drl_agent import (DRLAgent, MAX_BSR, MAX_UE_COUNT, MIN_TRAIN_EXPERIENCES, TRAIN_BATCH_SIZE, TRAIN_SEQ_COUNT,
+                       TRAIN_SEQ_LEN, UE_FEAT_DIM, PF_TIER as PF_TIER_IDX)
+from reward_calculator import REWARD_MODE
+
+# ── v3 reward：子樹 α-fair 效用（2026-10-03，REWARD_MODE=alpha_fair）──────────────────────────────
+# r_t = Σ_{u ∈ 本節點子樹的終端 UE} U_α(x_u)，x_u＝該 UE 在這個 1 秒視窗的下行吞吐量（模擬 Mbps）。
+# relay 的子樹＝自己的直連 UE＋下游兩個 access 節點的 UE（不含 MT，MT 的流量就是下游 UE 的流量）；access＝自己的 UE。
+# U_α(x)=x^(1−α)/(1−α)（α=1 時 log(x+ε)）：α=0 純吞吐量、α=1 比例公平（≈PF 的目標），文獻 Mo & Walrand 2000。
+# 平台實測（HISTORY 續五十九／六十）：α=0 使最佳動作恆為「全力遮」、α=1 恆為「不遮」，α=0.5 隨狀態改變。
+# 下游 UE 的吞吐量從子節點的經驗文件依時間戳對齊（±ALPHA_JOIN_TOL_S）；對不到的經驗丟棄（不用缺項的 reward）。
+# 訓練讀取時重算（線上寫入的 reward 只是佔位），本地訓練與 FL 客戶端都經 fetch_experiences()，定義一致。
+ALPHA_FAIR: float = float(os.getenv("DRL_ALPHA", "0.5"))
+ALPHA_EPS: float = 0.1
+SIM_SPEED: float = float(os.getenv("RFSIM_SPEED", "0.3"))     # 牆鐘→模擬時間：模擬 Mbps = 牆鐘 Mbps ÷ S
+ALPHA_JOIN_TOL_S: float = 1.5
+RELAY_CHILDREN: dict[int, tuple[int, int]] = {1: (5, 6), 2: (7, 8), 3: (9, 10), 4: (11, 12)}
+
+
+def alpha_utility(x: float, alpha: float = ALPHA_FAIR) -> float:
+    if abs(alpha - 1.0) < 1e-9:
+        return math.log(x + ALPHA_EPS)
+    return max(x, 0.0) ** (1.0 - alpha) / (1.0 - alpha)
+
+
+def end_ue_tput(next_state_vec: list, next_mask_vec: list) -> list[float]:
+    """由 S_t 的編碼還原活躍終端 UE（非 MT）的吞吐量（模擬 Mbps）：state 第 UE_FEAT_DIM·i 維＝log1p(bsr)/log1p(MAX_BSR)。"""
+    out = []
+    lmax = math.log1p(MAX_BSR)
+    for i in range(min(len(next_mask_vec), MAX_UE_COUNT)):
+        if not next_mask_vec[i] or next_state_vec[i * UE_FEAT_DIM + 3] > 0.5:
+            continue
+        bsr = math.expm1(next_state_vec[i * UE_FEAT_DIM] * lmax)
+        out.append(bsr * 8.0 / 1e6 / SIM_SPEED)
+    return out
+
+
+def apply_alpha_fair_reward(mongo_col: pymongo.collection.Collection, experiences: list[dict],
+                            log: Optional[logging.Logger] = None) -> list[dict]:
+    """把 experiences 的 reward 改成子樹 α-fair 效用；relay 的經驗對不到子節點文件者丟棄。回傳保留的經驗。"""
+    if not experiences:
+        return experiences
+    try:
+        node = int(mongo_col.name.split("_")[0][4:])
+    except ValueError:
+        return experiences
+    children = RELAY_CHILDREN.get(node, ())
+    child_idx: list[tuple[list, list]] = []
+    if children:
+        ts = [e["timestamp"] for e in experiences if e.get("timestamp") is not None]
+        if not ts:
+            return []
+        import datetime as _dt
+        lo, hi = min(ts) - _dt.timedelta(seconds=5), max(ts) + _dt.timedelta(seconds=5)
+        db = mongo_col.database
+        for c in children:
+            docs = list(db[f"node{c}_experiences"].find(
+                {"timestamp": {"$gte": lo, "$lte": hi}, "next_state_vec": {"$exists": True}},
+                {"_id": 0, "timestamp": 1, "next_state_vec": 1, "next_mask_vec": 1}).sort("timestamp", 1))
+            child_idx.append(([d["timestamp"].timestamp() for d in docs], docs))
+    kept, dropped = [], 0
+    for e in experiences:
+        xs = end_ue_tput(e["next_state_vec"], e["next_mask_vec"])
+        ok = True
+        if children:
+            t = e.get("timestamp")
+            if t is None:
+                ok = False
+            else:
+                t = t.timestamp()
+                for tl, docs in child_idx:
+                    k = bisect.bisect_left(tl, t)
+                    best = min((j for j in (k - 1, k) if 0 <= j < len(tl)), key=lambda j: abs(tl[j] - t), default=None)
+                    if best is None or abs(tl[best] - t) > ALPHA_JOIN_TOL_S:
+                        ok = False
+                        break
+                    xs += end_ue_tput(docs[best]["next_state_vec"], docs[best]["next_mask_vec"])
+        if not ok:
+            dropped += 1
+            continue
+        e["reward"] = float(sum(alpha_utility(x) for x in xs))
+        kept.append(e)
+    if log:
+        log.info("α-fair reward（α=%.2f，子樹＝%s）：保留 %d 筆、對不到子節點丟棄 %d 筆",
+                 ALPHA_FAIR, f"自己＋node{children}" if children else "自己", len(kept), dropped)
+    return kept
 
 # 回放緩衝區大小：每輪訓練讀取「最新」的這麼多筆經驗。每節點 ~1 筆/秒（控制週期 1 秒），5000 筆 ≈ 83 分鐘 ≈ 45 個
 # 110 秒相位，足以涵蓋多輪正常/壅塞交替（舊註解的「~10 筆/秒」是錯的）。2026-09-26 修正：舊版是 2000 筆且取的是「最舊的」2000 筆
@@ -46,9 +134,14 @@ TRAIN_EPOCHS_PER_ROUND: int = 10
 # r_throughput 用來排除閒置樣本不計入 JFI 平均，見 drl_agent.py 說明）
 _PROJECTION = {
     "state_vec": 1, "mask_vec": 1, "action_ratios": 1,
+    "action_tiers": 1,    # Local DRL v2（MLP）的每 UE 檔位動作；action_ratios 只剩 GRU 舊分支用
     "reward": 1, "next_state_vec": 1, "next_mask_vec": 1,
     "jfi_raw": 1, "r_throughput": 1, "is_idle": 1,
     "behavior_logp": 1,   # PPO 比例裁剪用的行為策略 log π(a|s)，見 drl_agent.py（缺欄位者只訓練 Critic）
+    "macro_action": 1,    # Local DRL v2.1 宏動作（2026-10-02；漏讀會讓 _filter_valid_experiences 把全部經驗濾掉）
+    "timestamp": 1,       # v3 α-fair reward 依時間戳對齊子節點
+    "factored_action": 1, # v3.1 兩段式動作（漏讀會讓 _filter_valid_experiences 把全部經驗濾掉）
+    "hold_id": 1, "hold_pos": 1,   # v3.3 動作持續（merge_action_holds）
     "_id": 0,
 }
 
@@ -102,7 +195,143 @@ def fetch_experiences(
 
     if log:
         log.info("讀取到 %d 筆原始經驗（最新 %d 筆內，打散抽樣，MLP）", len(experiences), fetch_limit)
-    return experiences
+    if REWARD_MODE == "alpha_fair":
+        experiences = apply_alpha_fair_reward(mongo_col, experiences, log)
+    online = attach_nstep_returns(merge_action_holds(experiences, log), log)
+    offline = load_offline_decisions(mongo_col, log)
+    if offline:
+        # 混入比例固定（2026-10-04 Codex 審查：原本整批接上，離線約佔八成）：離線筆數＝max(線上×比例, 下限)
+        k = min(len(offline), max(int(len(online) * OFFLINE_RATIO), OFFLINE_MIN))
+        offline = random.sample(offline, k)
+        if log:
+            log.info("離線資料混入 %d 筆（線上 %d 筆，比例 %.2f、下限 %d）", k, len(online), OFFLINE_RATIO, OFFLINE_MIN)
+    return [e for e in online + offline if _legal_action(e)]
+
+
+# offline-to-online（2026-10-04）：線上微調時持續混入事先整理好的離線探索資料（每節點一個 pickle，放在模型目錄），
+# 避免只用最近的線上資料把預訓練學到的東西洗掉。檔案不存在＝不混入。
+OFFLINE_DATA_DIR: str = os.getenv("DRL_OFFLINE_DATA_DIR", os.getenv("MODEL_DIR", "/app/models"))
+OFFLINE_RATIO: float = float(os.getenv("DRL_OFFLINE_RATIO", "1.0"))
+OFFLINE_MIN: int = int(os.getenv("DRL_OFFLINE_MIN", "256"))
+
+
+def _legal_action(e: dict) -> bool:
+    """排除現行動作集不允許的動作（遮 MT；舊 PPO 資料裡有）。只對有 factored_action 的經驗檢查。"""
+    fa = e.get("factored_action")
+    if not fa or int(fa.get("tier", -1)) == PF_TIER_IDX:
+        return True
+    sv, ap = e.get("state_vec", []), fa.get("apply", [])
+    for j, a in enumerate(ap[:MAX_UE_COUNT]):
+        if a == 1 and j * UE_FEAT_DIM + 3 < len(sv) and sv[j * UE_FEAT_DIM + 3] > 0.5:
+            return False
+    return True
+_OFFLINE_CACHE: dict = {}
+
+
+def load_offline_decisions(mongo_col, log: Optional[logging.Logger] = None) -> list[dict]:
+    try:
+        node = int(mongo_col.name.split("_")[0][4:])
+    except (ValueError, AttributeError):
+        return []
+    path = os.path.join(OFFLINE_DATA_DIR, f"offline_node{node}.pkl")
+    if not os.path.exists(path):
+        return []
+    mt = os.path.getmtime(path)
+    hit = _OFFLINE_CACHE.get(path)
+    if hit is None or hit[0] != mt:
+        import pickle
+        with open(path, "rb") as f:
+            hit = (mt, pickle.load(f))
+        _OFFLINE_CACHE[path] = hit
+        if log:
+            log.info("離線探索資料：載入 %d 筆決策（%s）", len(hit[1]), path)
+    return hit[1]
+
+
+# v3.4 n 步回報（2026-10-04）：一步 TD 的自舉項 γV(s') 在 relay「該遮」狀態被 Critic 嚴重低估（遮罩讓 MT 佇列消化後，Critic 把
+# 「佇列變短」當成「需求變低」，V(s') 比實際下降多約 3 倍），蓋掉遮罩的立即好處；改用前 n 個決策的實際 reward、只在第 n 步之後
+# 才用 Critic 自舉（A3C／PPO 的 n-step return）。DRL_NSTEP=1＝一步 TD（v3.3 以前）。
+NSTEP: int = max(1, int(os.getenv("DRL_NSTEP", "1")))
+HOLD_K: int = max(1, int(os.getenv("DRL_ACTION_HOLD", "1")))
+NSTEP_GAMMA: float = float(os.getenv("DRL_GAMMA_MLP", "0.5"))
+NSTEP_MAX_GAP_S: float = float(os.getenv("DRL_NSTEP_MAX_GAP_S", str(max(9, int(os.getenv("DRL_ACTION_HOLD", "1")) + 4))))   # 相鄰決策間隔超過此值（中斷）就截斷
+
+
+def _contiguous(prev: dict, nxt: dict) -> bool:
+    """前一個決策的 s′ 是否就是下一個決策的 s（比對每子節點特徵；2026-10-04 Codex 審查：原本只看時間間隔）。"""
+    a, b = prev.get("next_state_vec"), nxt.get("state_vec")
+    if a is None or b is None or prev.get("next_mask_vec") != nxt.get("mask_vec"):
+        return False
+    n = MAX_UE_COUNT * UE_FEAT_DIM
+    return max(abs(x - y) for x, y in zip(a[:n], b[:n])) < 1e-3
+
+
+def attach_nstep_returns(experiences: list[dict], log: Optional[logging.Logger] = None) -> list[dict]:
+    """把每筆（決策）經驗的 reward 改成 n 步折扣和、next_state 改成第 m 步之後的狀態、boot_discount＝γ^m（m≤n，
+    遇到時間中斷或資料尾端就截斷）。依時間戳排序；不改變經驗筆數。"""
+    if NSTEP <= 1 or not experiences:
+        return experiences
+    exps = sorted((e for e in experiences if e.get("timestamp") is not None), key=lambda e: e["timestamp"])
+    rest = [e for e in experiences if e.get("timestamp") is None]
+    r1 = [float(e["reward"]) for e in exps]
+    nxt = [(e["next_state_vec"], e["next_mask_vec"]) for e in exps]
+    ts = [e["timestamp"].timestamp() for e in exps]
+    out = []
+    msum = 0
+    for k, e in enumerate(exps):
+        g, m = r1[k], 1
+        while (m < NSTEP and k + m < len(exps) and ts[k + m] - ts[k + m - 1] <= NSTEP_MAX_GAP_S
+               and _contiguous(exps[k + m - 1], exps[k + m])):
+            g += (NSTEP_GAMMA ** m) * r1[k + m]
+            m += 1
+        f = dict(e)
+        f["reward1"] = r1[k]
+        f["reward"] = g
+        f["next_state_vec"], f["next_mask_vec"] = nxt[k + m - 1]
+        f["boot_discount"] = NSTEP_GAMMA ** m
+        msum += m
+        out.append(f)
+    if log:
+        log.info("n 步回報（n=%d，γ=%.2f）：%d 筆，平均實際步數 %.2f", NSTEP, NSTEP_GAMMA, len(out), msum / max(len(out), 1))
+    return out + rest
+
+
+def merge_action_holds(experiences: list[dict], log: Optional[logging.Logger] = None) -> list[dict]:
+    """v3.3 動作持續：把同一個 hold_id 的逐秒經驗（時間升序）併成一筆決策經驗——state／動作／behavior_logp 取決策當下
+    （hold_pos=0）那一筆，reward 取各秒 reward 平均，next_state 取最後一秒（＝下一個決策當下的狀態）。缺決策當下那一筆的
+    群組（被 fetch 上限截斷或 reward 對不到子節點而丟棄）整組捨棄。沒有 hold_id 的經驗原樣保留。"""
+    if not any(e.get("hold_id") for e in experiences):
+        return experiences
+    out: list[dict] = []
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for e in experiences:
+        h = e.get("hold_id")
+        if not h:
+            out.append(e)
+            continue
+        if h not in groups:
+            groups[h] = []
+            order.append(h)
+        groups[h].append(e)
+    dropped = 0
+    for h in order:
+        g = groups[h]
+        head = next((e for e in g if e.get("hold_pos") == 0), None)
+        # 只接受完整區段（位置 0..K−1 都在；2026-10-04 Codex 審查：原本只要有 hold_pos=0 就接受）
+        if head is None or (HOLD_K > 1 and sorted(e.get("hold_pos", -1) for e in g) != list(range(HOLD_K))):
+            dropped += 1
+            continue
+        g.sort(key=lambda e: e.get("hold_pos", 0))
+        m = dict(head)
+        m["reward"] = float(sum(e["reward"] for e in g) / len(g))
+        m["next_state_vec"], m["next_mask_vec"] = g[-1]["next_state_vec"], g[-1]["next_mask_vec"]
+        m["hold_n"] = len(g)
+        out.append(m)
+    if log:
+        log.info("動作持續：%d 筆逐秒經驗併成 %d 筆決策經驗（缺決策當下而捨棄 %d 組）",
+                 sum(len(groups[h]) for h in order), len(out), dropped)
+    return out
 
 
 def fetch_sequences(

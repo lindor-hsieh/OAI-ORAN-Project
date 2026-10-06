@@ -2,7 +2,7 @@
 """
 calibrate_fl_rate.py — Stage 3 後續調整方向：FL 經驗累積速率校準探測腳本
 
-背景（見 inference/STAGE3_CLUSTER_FL_DESIGN.md 第 8 節）：C xApp 的 Rate
+背景（舊版 Stage 3 cluster FL 設計文件已刪除，過程見 HISTORY.md）：C xApp 的 Rate
 Limiter 理論上限是每 100ms 一筆經驗（10 筆/秒），照這個理論值反推，跨過
 `drl_agent.py::MIN_TRAIN_EXPERIENCES=200` 只要 20 秒、跨過訓練真正需要的
 `TRAIN_SEQ_LEN*TRAIN_SEQ_COUNT=512` 筆也只要 ~51 秒。但實測

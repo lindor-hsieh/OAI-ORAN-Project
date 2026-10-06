@@ -1,0 +1,719 @@
+\begin{EnChapter}
+
+\chapter{System Model}
+\label{chap:system-model}
+
+This chapter develops a topology-agnostic downlink model of an O-RAN-controlled
+integrated access and backhaul (IAB) network. Section~\ref{subsec:topology}
+represents a multi-hop IAB network of arbitrary depth as a rooted tree.
+Sections~\ref{subsec:resource}--\ref{subsec:coupling} describe the radio resources,
+the link rates, and the scheduling of the distributed unit (DU) of each node; each
+IAB node also contains a mobile termination (MT) that connects it to its parent. Section~\ref{subsec:traffic} models multi-hop
+traffic and queues, and Section~\ref{subsec:problem} states the optimization
+problem. Section~\ref{subsec:marl} describes the multi-agent reinforcement learning
+(MARL) formulation used to approximate its solution, Section~\ref{subsec:fl}
+describes the hierarchical federated learning (FL) built on top of it, and
+Section~\ref{subsec:oran} maps each component to the O-RAN architecture.
+
+\section{Network Topology}
+\label{subsec:topology}
+
+Consider a downlink IAB network consisting of a single IAB donor, $N$ IAB nodes
+and $U$ user equipments (UEs). Let
+\begin{equation}
+  \Nset = \{n_1, \dots, n_N\}, \qquad \Uset = \{u_1, \dots, u_U\}
+\end{equation}
+be the sets of IAB nodes and UEs, where all $N+U$ elements are pairwise distinct,
+and let $0$ denote the donor, with $0 \notin \Nset \cup \Uset$. The network is
+represented by a rooted directed tree
+\begin{equation}
+  \mathbb{T} = (\Vset, \Eset), \qquad \Vset = \{0\} \cup \Nset \cup \Uset,
+\end{equation}
+where the union is disjoint. Throughout, $n,m$ denote generic elements of
+$\{0\} \cup \Nset$, $u$ a generic element of $\Uset$, and $v$ a generic element of
+$\Nset \cup \Uset$.
+
+\begin{definition}[Parent and children]
+\label{def:parent}
+The parent map $\parent : \Nset \cup \Uset \rightarrow \{0\} \cup \Nset$ assigns
+each IAB node and each UE to its serving node, i.e., the node whose DU the MT of the
+IAB node, or the UE, is attached to. The edge set is
+$\Eset = \{(\parent(v), v) : v \in \Nset \cup \Uset\}$, and each edge is a downlink
+radio link served by the DU of $\parent(v)$. For $n \in \{0\} \cup \Nset$, the set of
+children is
+\begin{equation}
+  \Cset_n = \Cset_n^{\mathrm{I}} \cup \Cset_n^{\mathrm{U}}, \quad
+  \Cset_n^{\mathrm{I}} = \{m \in \Nset : \parent(m) = n\}, \quad
+  \Cset_n^{\mathrm{U}} = \{u \in \Uset : \parent(u) = n\}.
+\end{equation}
+\end{definition}
+
+The model imposes no restriction on the shape of the topology. Any node may have
+both IAB children and UE children ($\Cset_n^{\mathrm{I}} \neq \emptyset$ and
+$\Cset_n^{\mathrm{U}} \neq \emptyset$), and both the fan-out and the depth are
+arbitrary. The only structural requirements are that $\mathbb{T}$ is a tree rooted
+at $0$, so that every node has exactly one path to the donor (the single-parent
+case of IAB), and that UEs are leaves.
+
+\paragraph{Depth, paths and subtrees.}
+The depth of a vertex is $h(0)=0$ and $h(v) = h(\parent(v)) + 1$. The maximum depth
+$H = \max_{u \in \Uset} h(u)$ is unrestricted, and the hop count of UE $u$ is
+$h(u)$. Let $\parent^{(j)}(\cdot)$ denote the $j$-th ancestor, with
+$\parent^{(0)}(v) = v$. The downlink path of UE $u$ is
+\begin{equation}
+  \mathcal{P}(u) = \bigl\{ (\parent^{(j+1)}(u), \parent^{(j)}(u)) : j = 0, \dots, h(u)-1 \bigr\}.
+\end{equation}
+Let $\Uset_v \subseteq \Uset$ be the UEs in the subtree rooted at $v$, with
+$\Uset_u = \{u\}$ for $u \in \Uset$, and let $\Nset_v$ be the IAB nodes in that
+subtree, including $v$ itself when $v \in \Nset$. The link $(\parent(v), v)$ carries
+exactly the downlink traffic destined to $\Uset_v$.
+
+\paragraph{Roles and branches.}
+Two topological attributes, used by the federated aggregation in
+Section~\ref{subsec:fl}, are defined from a node's position in the tree. For
+$n \in \Nset$,
+\begin{align}
+  \role(n) &=
+  \begin{cases}
+    \textsf{relay},  & \Cset_n^{\mathrm{I}} \neq \emptyset, \\
+    \textsf{access}, & \Cset_n^{\mathrm{I}} = \emptyset,
+  \end{cases}
+  \label{eq:role} \\
+  \br(n) &= \parent^{(h(n)-1)}(n) \in \Cset_0^{\mathrm{I}}.
+  \label{eq:branch}
+\end{align}
+A node is a relay if and only if it has downstream IAB nodes, independently of its
+depth, and a relay may also serve UEs directly. $\br(n)$ is the ancestor of $n$ at
+depth one. The set of branches is $\Bset = \Cset_0^{\mathrm{I}}$, and branch
+$b \in \Bset$ contains the IAB nodes $\Nset_b$.
+
+\paragraph{Node architecture.}
+Each IAB node $n \in \Nset$ consists of an MT and a DU. MT$_n$ attaches to
+DU$_{\parent(n)}$ as a regular UE to obtain backhaul, and DU$_n$ serves every child
+in $\Cset_n$. The donor consists of a central unit (CU) and DU$_0$ and is connected
+to the core network through a wired interface. From the viewpoint of the scheduler
+of DU$_n$, every child $v \in \Cset_n$ is one scheduling entity, whether it is a UE
+or the MT of a downstream IAB node.
+
+\begin{assumption}[Backhaul forwarding and queue structure]
+\label{ass:forwarding}
+The Backhaul Adaptation Protocol (BAP) defined for standard IAB in 3GPP TS 38.340~\cite{3gpp38340} is
+not used. Instead, each MT establishes a single protocol data unit (PDU) session
+with a single data radio bearer, and traffic is forwarded between hops by IP
+routing over that bearer. Consequently DU$_n$ maintains exactly one radio link
+control (RLC) queue per child $v \in \Cset_n$, and for an IAB child
+$m \in \Cset_n^{\mathrm{I}}$ this queue aggregates the traffic of all UEs in
+$\Uset_m$ in first-in-first-out order.
+\end{assumption}
+
+\begin{example}[Testbed topology]
+\label{ex:testbed}
+The testbed is the instance $N=12$, $U=16$, $H=3$ with
+\begin{itemize}
+  \item $\Cset_0^{\mathrm{I}} = \{n_1, n_2, n_3, n_4\}$ and
+        $\Cset_0^{\mathrm{U}} = \emptyset$;
+  \item for $i=1,\dots,4$: $\Cset_{n_i}^{\mathrm{I}} = \{n_{2i+3}, n_{2i+4}\}$ and
+        $\Cset_{n_i}^{\mathrm{U}} = \emptyset$, so $\role(n_i)=\textsf{relay}$;
+  \item for $i=5,\dots,12$: $\Cset_{n_i}^{\mathrm{I}} = \emptyset$ and
+        $\Cset_{n_i}^{\mathrm{U}} = \{u_{2i-9}, u_{2i-8}\}$, so
+        $\role(n_i)=\textsf{access}$;
+  \item $|\Bset| = 4$ and $\Nset_{n_i} = \{n_i, n_{2i+3}, n_{2i+4}\}$ for
+        $i=1,\dots,4$.
+\end{itemize}
+All UEs are three hops away from the donor. Other configurations allowed by the
+general model, such as a relay serving UEs directly, branches of unequal depth, or
+$H>3$, do not occur in this instance; the equations below apply to them without
+modification.
+\end{example}
+
+\section{Time Structure and Radio Resources}
+\label{subsec:resource}
+
+Time is slotted with index $t \in \{0,1,2,\dots\}$ and slot length
+$T_{\mathrm{slot}} = 2^{-\mu}$~ms, where $\mu$ is the numerology. Each DU$_n$ owns
+$B_n$ physical resource blocks (PRBs) of 12 subcarriers on its carrier. All carriers
+use time-division duplexing (TDD) with a common periodic pattern of $P$ slots, of
+which $P^{\mathrm{DL}}$ slots can carry downlink data and $P^{\mathrm{UL}}$ slots
+can carry uplink data. Let $\Tset^{\mathrm{DL}}$ denote the set of downlink-capable
+slots and
+\begin{equation}
+  \delta^{\mathrm{DL}} = \frac{P^{\mathrm{DL}}}{P}, \qquad
+  \delta^{\mathrm{UL}} = \frac{P^{\mathrm{UL}}}{P}
+\end{equation}
+the corresponding fractions of time. Control decisions are made per epoch. Epoch
+$k$ is the interval $[t_k, t_{k+1})$ of length $\Delta$ seconds and contains the
+slot set $\Tset_k$.
+
+\begin{assumption}[Out-of-band backhaul and orthogonal carriers]
+\label{ass:orthogonal}
+The backhaul and access links use separate frequency resources, i.e., the IAB nodes
+operate in out-of-band mode~\cite{topcu2025oranIAB,moro2023openIAB}, so the MT
+and the DU of a node can receive and transmit simultaneously. In addition, the DUs operate
+on non-overlapping carriers, so there is no co-channel interference between links.
+This lets the model focus on traffic aggregation and scheduling over multi-hop
+backhaul. In-band operation, in which the MT and the DU of a node share the same
+resources under a half-duplex constraint, is outside the scope of this work; it
+would enter the model through the available PRBs in~\eqref{eq:beta} and through
+co-channel links in the interference term $I_v(t)$ in~\eqref{eq:sinr}.
+\end{assumption}
+
+\section{Channel and Link Rate}
+\label{subsec:rate}
+
+The per-PRB signal-to-interference-plus-noise ratio (SINR) of link
+$(\parent(v), v)$ in slot $t$ is
+\begin{equation}
+  \gamma_v(t) = \frac{P_{\parent(v)}\, g_v(t)}{I_v(t) + \sigma^2},
+  \label{eq:sinr}
+\end{equation}
+where $P_{\parent(v)}$ is the per-PRB transmit power, $g_v(t)$ contains path loss
+and small-scale fading, $I_v(t)$ is the interference ($I_v \equiv 0$ under
+Assumption~\ref{ass:orthogonal}), and $\sigma^2$ is the noise power. The DU performs
+link adaptation on the reported channel quality and selects a modulation and coding
+scheme (MCS) index $q_v(t)$, which maps to a modulation order $Q_m(q)$ and a code
+rate $R(q)$ according to the MCS tables of 3GPP TS 38.214~\cite{3gpp38214}. The number of bits
+carried by one PRB in one downlink slot is
+\begin{equation}
+  \rho_v(t) = \nu_v\, Q_m\bigl(q_v(t)\bigr)\, R\bigl(q_v(t)\bigr)\, N_{\mathrm{sc}}^{\mathrm{RB}}\, N_{\mathrm{symb}}\, (1 - \mathrm{OH}),
+  \label{eq:rho}
+\end{equation}
+where $\nu_v$ is the number of MIMO layers, $N_{\mathrm{sc}}^{\mathrm{RB}}=12$,
+$N_{\mathrm{symb}}=14$ is the number of OFDM symbols per slot, and $\mathrm{OH}$ is
+the control and reference-signal overhead. If DU$_{\parent(v)}$ allocates
+$b_{\parent(v),v}(t)$ PRBs to $v$ in slot $t$, at most $b_{\parent(v),v}(t)\,\rho_v(t)$
+bits are delivered on the link in that slot.
+
+\paragraph{Peak rate.}
+Evaluating~\eqref{eq:rho} at the highest MCS on every symbol gives the approximate
+maximum data rate of 3GPP TS 38.306~\cite{3gpp38306},
+\begin{equation}
+  r^{\max}_n = 10^{-6}\, \nu\, Q_m^{\max}\, f\, R^{\max}\, \frac{12\, B_n}{T_{\mathrm{s}}^{\mu}}\, (1 - \mathrm{OH})
+  \ \ \text{[Mbps]}, \qquad
+  T_{\mathrm{s}}^{\mu} = \frac{10^{-3}}{14 \cdot 2^{\mu}}\ \text{s},
+  \label{eq:peak}
+\end{equation}
+where $f$ is the scaling factor. This expression assumes that every symbol carries
+downlink data; under TDD the downlink peak is approximately
+$\delta^{\mathrm{DL}}_{\mathrm{symb}}\, r^{\max}_n$, where
+$\delta^{\mathrm{DL}}_{\mathrm{symb}}$ is the fraction of downlink symbols. Both are
+upper bounds on the MAC-layer rate and are not attainable application-layer
+throughputs.
+
+\section{DU Scheduling}
+\label{subsec:coupling}
+
+\paragraph{DU resource constraint.}
+The numbers of PRBs $b_{n,v}(t) \in \mathbb{Z}_{\ge 0}$ that DU$_n$ allocates to its
+children in a downlink slot $t \in \Tset^{\mathrm{DL}}$ satisfy
+\begin{equation}
+  \sum_{v \in \Cset_n} b_{n,v}(t) \le \tilde B_n(t), \qquad \forall n \in \{0\} \cup \Nset,
+  \label{eq:du-budget}
+\end{equation}
+where $\tilde B_n(t) \le B_n$ is the number of PRBs available to DU$_n$ in that
+slot. For slots that cannot carry downlink data, $t \notin \Tset^{\mathrm{DL}}$, we
+set $b_{n,v}(t) = 0$ and $\tilde B_n(t) = 0$, so that all time averages below are
+taken over all slots. In downlink-capable slots,
+\begin{equation}
+  \tilde B_n(t) = \bigl\lfloor \beta_n(t)\, B_n \bigr\rfloor, \qquad
+  \beta_n(t) \in [0,1], \qquad t \in \Tset^{\mathrm{DL}},
+  \label{eq:beta}
+\end{equation}
+where $\beta_n(t)$ is the fraction of the PRBs of DU$_n$ that the resource
+configuration makes available. In an in-band IAB node, $\beta_n(t)$ would be set by
+the Hard/Soft/Not-Available (H/S/NA) configuration that keeps the DU off the
+resources used by its MT. Under Assumption~\ref{ass:orthogonal}, the MT and the DU
+do not share resources, so $\beta_n(t) \equiv 1$ and $\tilde B_n(t) = B_n$ for all
+$n \in \{0\} \cup \Nset$. The general form~\eqref{eq:beta} is kept so that the
+observation of Section~\ref{subsec:marl} is defined for both cases.
+
+\paragraph{Scheduling policy.}
+Within the budget~\eqref{eq:du-budget}, DU$_n$ schedules with proportional fair (PF)
+in every downlink slot. Child $v$ has priority $M_v(t) = \rho_v(t) / \bar R_v(t)$,
+where $\bar R_v$ is an exponentially smoothed average of its served rate. The
+scheduler allocates in decreasing priority, with at least $b_{\min}$ PRBs per
+scheduled entity, until $\tilde B_n(t)$ is exhausted or all queues are empty. The
+control variable of this work is a per-child PRB cap imposed on PF,
+\begin{equation}
+  b_{n,v}(t) \le \bar b_{n,v}(k) =
+  \begin{cases}
+    \max\bigl\{ \lfloor a_{n,v}(k)\, B_n \rfloor,\ 1 \bigr\}, & a_{n,v}(k) < 1, \\
+    B_n, & a_{n,v}(k) = 1,
+  \end{cases}
+  \qquad \forall t \in \Tset_k,
+  \label{eq:cap}
+\end{equation}
+where $a_{n,v}(k) \in \Aset = \{\alpha_1 < \alpha_2 < \dots < \alpha_L = 1\}$ is a
+discrete tier. The cap is held constant during epoch $k$, and PF still allocates
+within the caps. When $a_{n,v} = 1$ for all $v \in \Cset_n$, the caps are inactive
+and DU$_n$ behaves exactly as PF, so PF is a particular policy of the control space.
+A cap is active in slot $t$ when the allocation that PF would give to child $v$
+without the cap exceeds $\bar b_{n,v}(k)$; this can happen even when the total demand
+of the children is below $\tilde B_n(t)$. An active cap reduces the throughput of $v$
+if the demand of $v$ exceeds the rate supported by the cap, and otherwise only
+spreads its transmissions over more slots and increases its delay. Because $\Cset_n$ contains both UEs and downstream IAB nodes, the
+action of a relay also decides how its resources are split between directly
+attached UEs and backhaul links.
+
+\section{Multi-Hop Traffic and Queues}
+\label{subsec:traffic}
+
+\paragraph{Sources.}
+Each UE $u$ is associated with a downlink flow from the core network with a
+target (offered) rate $\lambda_u(k) \ge 0$ in epoch $k$. The bits injected into
+the donor in slot $t$, $A_u(t)$, are determined by the transport protocol. For a
+rate-limited TCP flow, the sender injects at most $\lambda_u(k)$ on average, and
+congestion control reduces the injection when end-to-end delivery is slower, so
+excess demand is not admitted into the network. For a UDP flow, $A_u(t)$ follows
+the target rate regardless of delivery, and excess traffic is dropped at finite
+buffers.
+
+\paragraph{Queue dynamics.}
+For each node $n \in \{0\} \cup \Nset$ and UE $u \in \Uset_n$, let $Q_n^{(u)}(t)$ be
+the bits of $u$ buffered at DU$_n$ and waiting for the next hop
+$\mathrm{nh}_n(u) \in \Cset_n$, i.e., the child of $n$ on $\mathcal{P}(u)$. Let
+$S_n^{(u)}(t)$ be the bits of $u$ sent by DU$_n$ in slot $t$ and $A_n^{(u)}(t)$ the
+bits of $u$ arriving at DU$_n$, with
+\begin{equation}
+  A_0^{(u)}(t) = A_u(t), \qquad
+  A_n^{(u)}(t) = S_{\parent(n)}^{(u)}(t - \tau_n), \quad n \in \Nset,
+  \label{eq:flow-conservation}
+\end{equation}
+where $\tau_n$ is the forwarding delay. Equation~\eqref{eq:flow-conservation} is
+per-hop flow conservation. By Assumption~\ref{ass:forwarding}, DU$_n$ keeps one
+finite buffer of capacity $Q^{\mathrm{buf}}$ per child $v \in \Cset_n$, holding the
+aggregated queue $Q_{n,v}(t) = \sum_{u \in \Uset_v} Q_n^{(u)}(t)$ with aggregated
+arrivals $A_{n,v}(t) = \sum_{u \in \Uset_v} A_n^{(u)}(t)$. The service, the buffer
+update and the dropped bits are
+\begin{align}
+  S_{n,v}(t) &= \min\bigl\{ b_{n,v}(t)\,\rho_v(t),\ Q_{n,v}(t) \bigr\}, \label{eq:queue-agg}\\
+  Q_{n,v}(t+1) &= \min\Bigl\{ Q^{\mathrm{buf}},\ \bigl[Q_{n,v}(t) - S_{n,v}(t)\bigr]^{+} + A_{n,v}(t) \Bigr\}, \label{eq:queue}\\
+  D_{n,v}(t) &= \Bigl[ \bigl[Q_{n,v}(t) - S_{n,v}(t)\bigr]^{+} + A_{n,v}(t) - Q^{\mathrm{buf}} \Bigr]^{+}, \label{eq:drop}
+\end{align}
+where $[\cdot]^{+} = \max\{\cdot, 0\}$; the inner projection is redundant
+under~\eqref{eq:queue-agg} but makes the recursion well defined for any service
+rule. Hence $0 \le Q_{n,v}(t) \le Q^{\mathrm{buf}}$ for all $t$. The buffer is served
+in first-in-first-out order and overflow is handled by tail drop: $S_{n,v}(t)$ is
+split among $\Uset_v$ in arrival order, and the dropped bits $D_{n,v}(t)$ are the
+most recently arrived ones. This defines the per-UE service $S_n^{(u)}(t)$ and drops
+$D_n^{(u)}(t)$, with $\sum_{u \in \Uset_v} D_n^{(u)}(t) = D_{n,v}(t)$, and
+\begin{equation}
+  Q_n^{(u)}(t+1) = Q_n^{(u)}(t) - S_n^{(u)}(t) + A_n^{(u)}(t) - D_n^{(u)}(t).
+\end{equation}
+The throughput of UE $u$ in epoch $k$ is what the last hop
+delivers,
+\begin{equation}
+  x_u(k) = \frac{1}{\Delta} \sum_{t \in \Tset_k} S_{\parent(u),u}(t).
+  \label{eq:ue-tput}
+\end{equation}
+
+\paragraph{Long-term feasible region.}
+Because excess demand is either not admitted (TCP) or dropped (UDP), the queues
+remain bounded even when the total demand exceeds the network capacity. The
+long-term average delivered throughputs $\bar x_u$ therefore always satisfy
+\begin{align}
+  \bar x_u &\le \bar\lambda_u, && \forall u \in \Uset, \label{eq:demand} \\
+  \sum_{u \in \Uset_v} \bar x_u &\le \frac{1}{T_{\mathrm{slot}}}\, \E\bigl[\, b_{\parent(v),v}(t)\, \rho_v(t) \,\bigr], && \forall (\parent(v),v) \in \Eset, \label{eq:link-cap} \\
+  \sum_{v \in \Cset_n} \E\bigl[\, b_{n,v}(t) \,\bigr] &\le \E\bigl[\, \tilde B_n(t) \,\bigr], && \forall n \in \{0\} \cup \Nset, \label{eq:node-cap}
+\end{align}
+where the expectations are time averages over all slots, with $b_{n,v}(t) = 0$ and
+$\tilde B_n(t) = 0$ outside $\Tset^{\mathrm{DL}}$. If the demand vector lies inside
+this region, there exists a scheduling policy capable of supporting it; a
+particular policy, for instance one with overly restrictive caps, may still fail to
+do so. If the demand lies outside the region, no policy can support it, and the
+policy determines which part of it is delivered.
+
+\section{Optimization Problem}
+\label{subsec:problem}
+
+A policy $\pi$ selects in every epoch the cap tiers of all nodes,
+$\bm a(k) = \{a_{n,v}(k)\}_{n \in \{0\}\cup\Nset,\, v \in \Cset_n}$. Over an
+evaluation horizon of $K$ epochs, the system objective is the average sum
+throughput:
+\begin{subequations}
+\label{eq:P1}
+\begin{align}
+  \textbf{(P1)}\quad \max_{\pi} \quad & \frac{1}{K} \sum_{k=0}^{K-1} \E_\pi\Bigl[ \sum_{u \in \Uset} x_u(k) \Bigr] \label{eq:P1-obj} \\
+  \text{s.t.} \quad
+  & a_{n,v}(k) \in \Aset, \quad \forall n, v \in \Cset_n, k, \label{eq:P1-action} \\
+  & \text{\eqref{eq:du-budget}--\eqref{eq:cap}} \quad \text{(resources and scheduling)}, \\
+  & \text{\eqref{eq:flow-conservation}--\eqref{eq:ue-tput}} \quad \text{(sources, queues and flow conservation)}, \\
+  & \textstyle \frac{1}{K}\sum_{k} J\bigl(\bm\sigma(k)\bigr) \ge J_{\min} \quad \text{(optional fairness constraint)}. \label{eq:P1-fair}
+\end{align}
+\end{subequations}
+The demand-satisfaction ratio and Jain's fairness index~\cite{jain1984fairness} are
+\begin{equation}
+  \sigma_u(k) = \min\Bigl\{ 1,\ \frac{x_u(k)}{\lambda_u(k)} \Bigr\}, \qquad
+  J(\bm y) = \frac{\bigl(\sum_{i} y_i\bigr)^2}{|\bm y| \sum_i y_i^2},
+  \label{eq:metrics}
+\end{equation}
+where $\bm\sigma(k)$ contains only the UEs with $\lambda_u(k) > 0$, and
+$J(\bm y) = 1$ by convention when $\bm y = \bm 0$.
+
+(P1) is the ideal centralized problem in which every DU, including DU$_0$, is
+controlled. The schemes of this work keep the donor on PF and therefore solve the
+restricted problem
+\begin{equation}
+  \textbf{(P1$'$)}\quad \text{(P1) with the additional constraint } a_{0,v}(k) = 1 \quad \forall v \in \Cset_0,\ \forall k .
+  \label{eq:P1r}
+\end{equation}
+
+\paragraph{Control schemes.}
+The schemes compared in this work are nested. Stage~1 is PF, i.e., $a_{n,v}(k) = 1$
+for all $n$ and $v$. Stages~2--4 control the IAB nodes with the MARL formulation of
+Section~\ref{subsec:marl}, use identical local learning, and differ only in the
+federated aggregation of Section~\ref{subsec:fl}; they do not
+enforce~\eqref{eq:P1-fair}. Stage~5 keeps the aggregation of Stage~4 and enforces a local surrogate of~\eqref{eq:P1-fair} by
+Lagrangian relaxation: each agent uses the reward
+\begin{equation}
+  r_n^{\mathrm{L}}(k) = r_n(k) + \lambda_n \bigl( J_n(k) - J_{\min} \bigr),
+  \label{eq:lagrangian}
+\end{equation}
+where $r_n(k)$ is the reward~\eqref{eq:reward} of Section~\ref{subsec:marl} and
+$J_n(k)$ is Jain's index of the normalized per-child throughputs
+$\min\{X_{n,v}(k)/X_{\max}, 1\}$, $v \in \Cset_n^{\act}(k)$. The multiplier is
+updated by projected dual ascent after each training batch,
+\begin{equation}
+  \lambda_n \leftarrow \min\Bigl\{ \lambda_{\max},\ \bigl[ \lambda_n + \eta_\lambda \bigl( J_{\min} - \bar J_n \bigr) \bigr]^{+} \Bigr\},
+  \label{eq:dual}
+\end{equation}
+where $\bar J_n$ is the batch average of $J_n(k)$ and $\lambda_n$ is initialized
+to zero.
+
+\paragraph{Why (P1) is not solved directly.}
+First, the joint action space has size $\prod_{n} L^{|\Cset_n|}$, which is
+exponential in the number of nodes and children. Second, actions are coupled across
+hops and across time: the action of node $n$ changes the arrivals of
+downstream nodes through~\eqref{eq:flow-conservation}, and queues carry these
+effects into later epochs. Third, the statistics of the
+channels and of the demands are unknown and non-stationary. Fourth, at the
+near-real-time scale each DU observes only its own children. This work therefore
+adopts a decentralized, learning-based approximation in which each node is an agent
+acting on local observations and knowledge is shared through federated learning.
+
+\section{Multi-Agent Reinforcement Learning Formulation}
+\label{subsec:marl}
+
+\paragraph{Game formulation.}
+Every IAB node $n \in \Nset$ is an agent; the donor keeps PF. The interaction is
+modelled as a partially observable stochastic game
+$\langle \Nset, \mathcal{S}, \{\mathcal{O}_n\}, \{\mathcal{A}_n\}, \mathcal{P}, \{r_n\} \rangle$,
+where the global state $s(k) \in \mathcal{S}$ contains all queues, channels and
+occupancies, agent $n$ receives an observation $o_n(k) \in \mathcal{O}_n$, selects
+$a_n(k) \in \mathcal{A}_n$, and receives a local reward $r_n(k)$. The system goal is
+the team objective (P1), but the agents are trained independently with the local
+surrogate rewards defined below. The extent to which the surrogate improves (P1) is
+evaluated empirically.
+
+\paragraph{Timeline.}
+At time $t_k$, the start of epoch $k$, agent $n$ forms $o_n(k)$ from measurements
+collected during epoch $k-1$ and from queue lengths sampled at $t_k$. It selects
+$a_n(k)$, which is applied as the caps~\eqref{eq:cap} throughout epoch $k$. The
+reward $r_n(k)$ is computed from measurements collected during epoch $k$ and becomes
+available at $t_{k+1}$, together with $o_n(k+1)$.
+
+\paragraph{Observation.}
+Let $\Cset_n^{\act}(k) \subseteq \Cset_n$ be the children connected at $t_k$, and let
+\begin{equation}
+  X_{n,v}(k) = \sum_{t \in \Tset_k} S_{n,v}(t)
+\end{equation}
+be the bits sent by DU$_n$ to child $v$ during epoch $k$. The observation consists of
+a set of per-child features and a node-level vector,
+\begin{equation}
+  o_n(k) = \Bigl( \bigl\{ \bm z_{n,v}(k) \bigr\}_{v \in \Cset_n^{\act}(k)},\ \bm g_n(k) \Bigr),
+\end{equation}
+with
+\begin{equation}
+  \bm z_{n,v}(k) = \Bigl( \tfrac{\log(1 + X_{n,v}(k-1))}{\log(1 + X_{\max})},\ \tfrac{q_v(t_k)}{q_{\max}},\ \tfrac{\log(1 + Q_{n,v}(t_k))}{\log(1 + Q_{\max})} \Bigr),
+\end{equation}
+i.e., the bits sent in the previous epoch (a throughput proxy), the most recently
+reported MCS (a channel-quality proxy) and the RLC queue length (a demand proxy).
+The node-level vector is
+\begin{equation}
+  \bm g_n(k) = \bigl( |\Cset_n^{\act}(k)| / C_{\max},\ \tilde\phi_n(k),\ \beta_n(t_k),\ \hat p_n(k),\ \hat c_n(k) \bigr),
+\end{equation}
+which contains the fraction of active children, the global fairness bias
+$\tilde\phi_n$ defined below, the available PRB fraction $\beta_n$ of~\eqref{eq:beta}, and two relational
+features,
+\begin{align}
+  \hat p_n(k) &= \clip\bigl( 0.5 + \kappa_p\,(\beta_{\parent(n)}(t_k) - \bar\beta_{\parent(n)}(t_k)),\ 0,\ 1 \bigr), \label{eq:phat}\\
+  \hat c_n(k) &= \frac{\log\bigl(1 + \sum_{m \in \Cset_n^{\mathrm{I}}} \sum_{v \in \Cset_m} Q_{m,v}(t_k)\bigr)}{\log\bigl(1 + |\Cset_n^{\mathrm{I}}|\, Q_{\max}\bigr)}. \label{eq:chat}
+\end{align}
+Here $\hat p_n$ is the deviation of the parent's available fraction from its
+exponentially smoothed value $\bar\beta_{\parent(n)}$, an early indicator of upstream
+congestion, and $\hat c_n$ is the total queue of the node's IAB children, i.e., the
+downstream demand. By convention $\hat p_n = 0.5$ when $\parent(n) = 0$ or when the
+parent's value is unavailable, and $\hat c_n = 0$ when $\Cset_n^{\mathrm{I}} = \emptyset$
+or when the children's values are unavailable. Both features require only the
+exchange of scalars between neighbours in the tree. Under
+Assumption~\ref{ass:orthogonal}, $\beta_n \equiv 1$ and hence $\hat p_n \equiv 0.5$;
+these two features are constant on the testbed and become informative only for
+in-band configurations, in which the available resources vary.
+
+The Global xApp computes the fairness bias by comparing each node with the nodes of
+the same role,
+\begin{equation}
+  \phi_n = \clip\Bigl( \frac{\bar X_{\role(n)}}{\bar X_n + \epsilon_0},\ \phi_{\min},\ \phi_{\max} \Bigr), \qquad
+  \tilde\phi_n = \frac{\phi_n - \phi_{\min}}{\phi_{\max} - \phi_{\min}},
+  \label{eq:fairness-bias}
+\end{equation}
+where $\bar X_n$ is the recent average throughput of node $n$ and
+$\bar X_{\role(n)}$ is the average over the nodes of the same role. The comparison is
+restricted to the same role because the throughput of a relay includes the backhaul
+traffic it forwards and is therefore of a different magnitude.
+
+\paragraph{Action.}
+If $|\Cset_n^{\act}(k)| \ge 2$, the action is
+$a_n(k) = \bigl( a_{n,v}(k) \bigr)_{v \in \Cset_n^{\act}(k)} \in \Aset^{|\Cset_n^{\act}(k)|}$,
+converted to caps by~\eqref{eq:cap}. If $|\Cset_n^{\act}(k)| \le 1$ there is no
+contention between children, a cap could only leave resources unused, and the node
+applies $a_{n,v}(k) = 1$ without querying the policy.
+
+\paragraph{Reward.}
+For $\Cset_n^{\act}(k) \neq \emptyset$,
+\begin{equation}
+  r_n(k) = \frac{1}{|\Cset_n^{\act}(k)|} \sum_{v \in \Cset_n^{\act}(k)} \min\Bigl\{ \frac{X_{n,v}(k)}{X_{\max}},\ 1 \Bigr\},
+  \label{eq:reward}
+\end{equation}
+i.e., the normalized throughput that DU$_n$ delivers to its children during the
+epoch in which the action is applied; epochs without active children are not used
+for training. This is a surrogate for (P1) and is not guaranteed to be aligned with
+it. For a relay, sending more backhaul traffic to a child increases the reward but
+does not necessarily increase the end-to-end throughput, because the traffic may
+only move into a downstream queue. In addition,
+the truncation and averaging in~\eqref{eq:reward} differ from the sum
+in~\eqref{eq:P1-obj}.
+
+\paragraph{Policy and value architecture.}
+Because $|\Cset_n^{\act}|$ differs across nodes and epochs and children have no
+natural order, the policy factorizes over children with a shared per-child network,
+\begin{align}
+  \pi_\theta\bigl(a_n \mid o_n\bigr) &= \prod_{v \in \Cset_n^{\act}} \pi_\theta\bigl( a_{n,v} \mid \bm\psi_{n,v} \bigr), \label{eq:actor}\\
+  \bm\psi_{n,v} &= \Bigl[ \bm z_{n,v},\ \bm g_n,\ \operatorname*{mean}_{v' \in \Cset_n^{\act} \setminus \{v\}} \bm z_{n,v'},\ \max_{v' \in \Cset_n^{\act} \setminus \{v\}} \bm z_{n,v'} \Bigr], \notag
+\end{align}
+where $\pi_\theta(\cdot \mid \bm\psi)$ is a categorical distribution over the $L$
+tiers and the element-wise leave-one-out pooling is over a non-empty set since
+$|\Cset_n^{\act}| \ge 2$. This form is equivariant to permutations of the children.
+The critic is permutation invariant,
+\begin{equation}
+  V_\vartheta(o_n) = \varrho_\vartheta\Bigl( \operatorname*{mean}_{v \in \Cset_n^{\act}} \varphi_\vartheta(\bm z_{n,v}),\ \max_{v \in \Cset_n^{\act}} \varphi_\vartheta(\bm z_{n,v}),\ \bm g_n \Bigr).
+  \label{eq:critic}
+\end{equation}
+With this structure, parameters of the same dimension apply to a node at any
+position in the tree with any number of children, which is required for averaging
+parameters across all nodes in Section~\ref{subsec:fl}.
+
+\paragraph{Initialization.}
+The policy is initialized so that $\pi_\theta(\alpha_L \mid \bm\psi) = p_0$ for every
+input, so the initial policy coincides with PF on each child with probability $p_0$,
+and learning acts as a residual correction to PF. The critic is pretrained by
+regression on $(o_n(k), r_n(k))$ samples collected while all nodes run PF.
+
+\paragraph{Learning objective.}
+This work uses a myopic objective: each agent maximizes the expected immediate
+reward $\E[r_n(k)]$, which corresponds to a discount factor of zero. This is a
+contextual-bandit-style approximation. It neglects the effects of an action on
+later epochs through queues and downstream arrivals, which
+are present in the system; the approximation is motivated by the fact that the cap
+of an epoch mainly affects the bits sent in that epoch. Let
+\begin{equation}
+  \xi_n(k) = \Ind\Bigl[ |\Cset_n^{\act}(k)| \ge 2 \ \wedge\ \max_{v \in \Cset_n^{\act}(k)} Q_{n,v}(t_k) \ge Q_{\mathrm{th}} \Bigr]
+  \label{eq:contended}
+\end{equation}
+indicate contention at decision time. A cap can reduce the throughput of a child
+only if the child needs more resources than the cap allows, which is most likely
+when several children are active and at least one of them has a large backlog; the
+indicator is a heuristic proxy for this condition and is evaluated before the
+action, so that it does not depend on the action. Let $\mathcal{K}_n$ be the set of pairs $(k,v)$ in a
+training batch with $\xi_n(k) = 1$ and $v \in \Cset_n^{\act}(k)$. The actor
+minimizes $-\mathcal{L}_n(\theta)$ with
+\begin{equation}
+  \mathcal{L}_n(\theta) = \frac{1}{|\mathcal{K}_n|} \sum_{(k,v) \in \mathcal{K}_n} \min\Bigl( \eta_{n,v}(k)\, \hat A_n(k),\ \clip\bigl(\eta_{n,v}(k), 1 - \epsilon_{\mathrm{clip}}, 1 + \epsilon_{\mathrm{clip}}\bigr)\, \hat A_n(k) \Bigr) + c_H\, \bar{\mathcal{H}}_n(\theta),
+  \label{eq:ppo}
+\end{equation}
+where
+$\eta_{n,v}(k) = \pi_\theta(a_{n,v}(k) \mid \bm\psi_{n,v}(k)) / \pi_{\theta_{\mathrm{old}}}(a_{n,v}(k) \mid \bm\psi_{n,v}(k))$
+is the per-child probability ratio with respect to the behaviour policy that
+generated the sample,
+$\hat A_n(k) = \clip\bigl( (r_n(k) - V_\vartheta(o_n(k)))/\hat\sigma_r,\ -3,\ 3 \bigr)$
+with $\hat\sigma_r$ a running standard deviation of the reward, and
+$\bar{\mathcal{H}}_n$ is the average per-child policy entropy. Uncontended samples
+are used only to train the critic. Since the joint policy~\eqref{eq:actor} is a
+product over children, the joint-action ratio of standard PPO would be
+$\prod_{v} \eta_{n,v}(k)$; \eqref{eq:ppo} instead clips each factor separately and
+shares the node-level advantage among the children, i.e., it is a factor-wise
+surrogate of the PPO objective~\cite{schulman2017ppo}.
+
+\section{Hierarchical Federated Learning}
+\label{subsec:fl}
+
+Each agent holds local parameters $\Theta_n = (\theta_n, \vartheta_n)$ and updates
+them on local data. Every $\Delta_{\mathrm{FL}}$ seconds a federated round $r$ takes
+place. Node $n$ reports $\Theta_n^{(r)}$ and the weight $w_n^{(r)} \ge 0$, the number
+of contended samples in its current training data that can update the actor. Let
+$\tilde\Theta_n^{(r-1)}$ be the parameters held by node $n$ at the end of round
+$r-1$, and $\Delta_n^{(r)} = \Theta_n^{(r)} - \tilde\Theta_n^{(r-1)}$ its local
+update. If $W^{(r)} = \sum_{n \in \Nset} w_n^{(r)} = 0$, the round is skipped and
+all parameters are left unchanged. Otherwise, one of the following aggregation
+rules is applied. Unless stated otherwise, every node, including those with
+$w_n^{(r)} = 0$, receives the broadcast.
+
+\paragraph{Stage 2: flat FedAvg.}
+The baseline is federated averaging (FedAvg)~\cite{mcmahan2017fedavg},
+\begin{equation}
+  \Theta_{\mathrm{glob}}^{(r)} = \sum_{n \in \Nset} \frac{w_n^{(r)}}{W^{(r)}}\, \Theta_n^{(r)}, \qquad \Theta_n \leftarrow \Theta_{\mathrm{glob}}^{(r)} \quad \forall n \in \Nset.
+  \label{eq:fedavg}
+\end{equation}
+
+\paragraph{Stage 3: topology-hierarchical FedAvg with Hedge.}
+The branches~\eqref{eq:branch} form the first level of aggregation.
+For branch $b$, let $\Nset_b^{+} = \{n \in \Nset_b : w_n^{(r)} > 0\}$ be its
+contributing members.
+
+\emph{Divergence fallback.} Following the idea of clustered federated
+learning~\cite{sattler2021cfl}, if $|\Nset_b^{+}| \ge 3$, the alignment of each member
+with the rest of its branch is
+\begin{equation}
+  \operatorname{sim}_n^{(r)} = \cos\Bigl( \Delta_n^{(r)},\ \sum_{n' \in \Nset_b^{+} \setminus \{n\}} w_{n'}^{(r)} \Delta_{n'}^{(r)} \Bigr), \qquad n \in \Nset_b^{+},
+  \label{eq:cfl}
+\end{equation}
+with $\cos(\cdot,\cdot) = 1$ by convention if either argument is the zero vector.
+The excluded set is $\mathcal{X}_b^{(r)} = \{ n \in \Nset_b^{+} : \operatorname{sim}_n^{(r)} < \tau_{\mathrm{CFL}} \}$
+if this set is a proper subset of $\Nset_b^{+}$, and $\mathcal{X}_b^{(r)} = \emptyset$
+otherwise or if $|\Nset_b^{+}| < 3$.
+
+\emph{Main groups.} The main group of branch $b$ is
+$G_b = \Nset_b^{+} \setminus \mathcal{X}_b^{(r)}$, which is non-empty whenever
+$\Nset_b^{+} \neq \emptyset$. Let $\Bset^{(r)} = \{ b \in \Bset : \Nset_b^{+} \neq \emptyset \}$.
+For $b \in \Bset^{(r)}$ the weight and the within-branch average are
+\begin{equation}
+  W_{G_b}^{(r)} = \sum_{n \in G_b} w_n^{(r)} > 0, \qquad
+  \bar\Theta_{G_b}^{(r)} = \sum_{n \in G_b} \frac{w_n^{(r)}}{W_{G_b}^{(r)}}\, \Theta_n^{(r)} .
+\end{equation}
+
+\emph{Hedge weights.} Following the Hedge algorithm~\cite{freund1997hedge}, each
+branch keeps a weight $\zeta_b > 0$, initialized to $\zeta_b^{(0)} = 1$. For every
+$b \in \Bset^{(r)}$,
+\begin{equation}
+  \zeta_b^{(r)} = \zeta_b^{(r-1)}\, e^{-\eta_H\, \ell_b^{(r)}},
+\end{equation}
+where $\ell_b^{(r)}$ is the mean squared error of the critic of
+$\bar\Theta_{G_b}^{(r)}$ on the contended samples of the members of $G_b$; the
+weights of the other branches are unchanged. The global parameters are
+\begin{equation}
+  \hat\zeta_b^{(r)} = \frac{W_{G_b}^{(r)}\, \zeta_b^{(r)}}{\sum_{b' \in \Bset^{(r)}} W_{G_{b'}}^{(r)}\, \zeta_{b'}^{(r)}}, \qquad
+  \Theta_{\mathrm{glob}}^{(r)} = \sum_{b \in \Bset^{(r)}} \hat\zeta_b^{(r)}\, \bar\Theta_{G_b}^{(r)} .
+  \label{eq:hedge}
+\end{equation}
+
+\emph{Broadcast.} Let $\mathcal{X}^{(r)} = \bigcup_{b} \mathcal{X}_b^{(r)}$. The nodes
+are updated as
+\begin{equation}
+  \Theta_n \leftarrow
+  \begin{cases}
+    \Theta_n^{(r)}, & n \in \mathcal{X}^{(r)}, \\
+    \Theta_{\mathrm{glob}}^{(r)}, & n \in \Nset \setminus \mathcal{X}^{(r)} .
+  \end{cases}
+  \label{eq:stage3-broadcast}
+\end{equation}
+An excluded node thus forms a singleton cluster for this round: its update does not
+enter $\Theta_{\mathrm{glob}}^{(r)}$, and it keeps its own parameters instead of
+being overwritten. The exclusion is re-evaluated in every round, so a node rejoins
+the global model as soon as its update is aligned with its branch again. Stage~3 is
+therefore the first scheme in which the parameters of different nodes may differ.
+For deeper trees the within-branch average can be applied recursively along
+subtrees; this work uses two levels.
+
+\paragraph{Nesting of the stages.}
+With $\tau_{\mathrm{CFL}} = -1$ no node is excluded, since
+$\operatorname{sim}_n^{(r)} \ge -1$, so every node receives
+$\Theta_{\mathrm{glob}}^{(r)}$. With $\eta_H = 0$ the Hedge weights remain equal.
+Then
+\begin{equation}
+  \Theta_{\mathrm{glob}}^{(r)} = \sum_{b \in \Bset^{(r)}} \frac{W_{G_b}^{(r)}}{W^{(r)}} \sum_{n \in G_b} \frac{w_n^{(r)}}{W_{G_b}^{(r)}}\, \Theta_n^{(r)} = \sum_{n \in \Nset} \frac{w_n^{(r)}}{W^{(r)}}\, \Theta_n^{(r)},
+\end{equation}
+which is Stage 2, because nodes with $w_n^{(r)} = 0$ contribute to neither side.
+
+\section{Mapping to the O-RAN Architecture}
+\label{subsec:oran}
+
+Table~\ref{tab:oran-mapping} maps the model components to their deployment. The
+testbed implements the E2 interface and a Near-RT RIC, but no Non-RT RIC, A1
+interface or service management and orchestration framework. The xApps are
+standard Near-RT RIC applications. The components called ``Local rApp'' and
+``Global rApp'' in this work are custom services and not rApps in the O-RAN sense,
+which reside in the Non-RT RIC. The Local rApp performs policy inference for the
+Local xApp over inter-process communication and trains the local model in the
+background; the Global rApp is the FL server. Both are co-located with the
+Near-RT RIC. Functionally, model training and federated aggregation correspond to
+non-real-time tasks. The periods in the table are update periods of the
+applications, not claims about the control-loop time scales defined by O-RAN.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Mapping of model components to their deployment and update periods.}
+\label{tab:oran-mapping}
+\begin{tabular}{@{}p{0.30\textwidth}p{0.38\textwidth}p{0.24\textwidth}@{}}
+\toprule
+Model component & Deployment & Period on the testbed \\
+\midrule
+PF scheduling within $\tilde B_n(t)$ & O-DU MAC (E2 node) & slot, 0.5 ms \\
+Reporting of per-child statistics & E2SM-MAC indication & 100 ms \\
+Observation $o_n(k)$ and cap enforcement & Local xApp (Near-RT RIC) & epoch $\Delta$ = 1 s \\
+Inference of $\pi_\theta$ & Local rApp (custom service) & epoch $\Delta$ = 1 s \\
+Local update~\eqref{eq:ppo} & Local rApp (custom service) & 60 s \\
+Fairness bias $\tilde\phi_n$ & Global xApp (Near-RT RIC) & 2 s \\
+Federated aggregation~\eqref{eq:fedavg}--\eqref{eq:stage3-broadcast} & Global rApp (custom FL server) & $\Delta_{\mathrm{FL}}$ = 180 s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Testbed parameters.}
+The testbed uses $\mu = 1$ ($T_{\mathrm{slot}} = 0.5$~ms), $B_n = 106$, $\nu = 1$,
+$Q_m^{\max} = 8$, $R^{\max} = 948/1024$, $f = 1$ and $\mathrm{OH} = 0.14$,
+for which~\eqref{eq:peak} gives $r^{\max} \approx 227$~Mbps. The TDD pattern has a
+period of $P = 10$ slots with 7 downlink slots, one special slot with 6 downlink and
+4 uplink symbols, and 2 uplink slots. Hence
+$\delta^{\mathrm{DL}}_{\mathrm{symb}} = 104/140$ and the downlink peak is about
+$169$~Mbps (about $159$~Mbps if only full downlink slots carry data). All DUs,
+including those serving backhaul links, use $B_n = 106$, and $\beta_n \equiv 1$. The cap tiers are $\Aset = \{0.3, 0.5, 0.7, 0.85, 1.0\}$, with
+$p_0 = 0.8$, $b_{\min} = 5$, $Q_{\mathrm{th}} = 10^5$ bytes and
+$\epsilon_{\mathrm{clip}} = 0.2$.
+
+\section{Notation}
+\label{subsec:notation}
+
+\begin{longtable}{@{}p{0.26\textwidth}p{0.68\textwidth}@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+\endhead
+$0$, $\Nset$, $\Uset$ & Donor; IAB nodes $\{n_1,\dots,n_N\}$; UEs $\{u_1,\dots,u_U\}$ \\
+$\parent(v)$, $\Cset_n$ & Parent; children $\Cset_n = \Cset_n^{\mathrm{I}} \cup \Cset_n^{\mathrm{U}}$ \\
+$h(v)$, $H$ & Depth (hop count); maximum depth \\
+$\Uset_v$, $\Nset_v$, $\mathcal{P}(u)$ & UEs and IAB nodes in the subtree of $v$; downlink path of UE $u$ \\
+$\role(n)$, $\br(n)$, $\Bset$ & Role of a node; its branch; set of branches \\
+$t$, $T_{\mathrm{slot}}$, $k$, $\Tset_k$, $\Delta$ & Slot; slot length; epoch; slots of epoch $k$; epoch length \\
+$\delta^{\mathrm{DL}}$, $\delta^{\mathrm{UL}}$ & Fractions of downlink- and uplink-capable slots \\
+$B_n$, $\tilde B_n(t)$ & Total PRBs of DU$_n$; PRBs available to DU$_n$ in slot $t$ \\
+$\beta_n(t)$ & Available fraction of the PRBs of DU$_n$ ($\equiv 1$ in out-of-band mode) \\
+$\gamma_v$, $q_v$, $\rho_v$ & SINR; MCS index; bits per PRB per downlink slot \\
+$b_{n,v}(t)$, $\bar b_{n,v}(k)$ & PRBs allocated by DU$_n$ to child $v$; cap \\
+$\Aset$, $a_{n,v}(k)$ & Set of cap tiers ($\alpha_L = 1$ is PF); selected tier \\
+$\lambda_u$, $A_u$ & Target rate of UE $u$; bits injected at the donor \\
+$Q_n^{(u)}$, $Q_{n,v}$, $S_{n,v}$, $D_{n,v}$ & Per-UE queue; aggregated queue towards child $v$; bits sent; bits dropped \\
+$Q^{\mathrm{buf}}$ & Buffer capacity per child \\
+$x_u(k)$, $\sigma_u(k)$, $J(\cdot)$ & Delivered throughput; demand-satisfaction ratio; Jain's index \\
+$\bar c_{\parent(n),n}$, $\bar c_n$, $F_n$ & Backhaul and access capacities of node $n$; traffic through $n$ \\
+$o_n$, $\bm z_{n,v}$, $\bm g_n$ & Observation; per-child feature; node-level feature \\
+$\hat p_n$, $\hat c_n$, $\tilde\phi_n$ & Parent trend; downstream demand; fairness bias \\
+$r_n$, $\xi_n$, $X_{n,v}$ & Local reward; contention indicator; bits sent per epoch \\
+$\theta_n$, $\vartheta_n$ & Actor and critic parameters \\
+$w_n^{(r)}$, $\Delta_n^{(r)}$ & FL weight; local update \\
+$G_b$, $\mathcal{X}_b^{(r)}$, $\tau_{\mathrm{CFL}}$ & Main group of branch $b$; excluded nodes; divergence threshold \\
+$\zeta_b$, $\eta_H$ & Hedge weight; Hedge learning rate \\
+$\lambda_n$, $J_{\min}$ & Lagrange multiplier of Stage 5; fairness target \\
+\bottomrule
+\end{longtable}
+
+\end{EnChapter}

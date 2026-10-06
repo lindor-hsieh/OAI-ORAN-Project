@@ -1204,3 +1204,1083 @@ memory（[[feedback-traditional-chinese]]、[[feedback-local-must-match-across-s
 節點缺乏訓練訊號、ESS_relay≈1 的問題依然存在、未解決；`STAGE3_DESIGN.md` §5.4 列出的三個候選方向
 （場景端讓 relay MT 通道真的被惡化、Global 端聚合公式調整、純診斷 A/B）都還沒做，且**未來任何修正
 都必須排除 Local 端改動這個選項**。已同步 PC2/PC3，**未 commit/push**。
+
+## 2026-09-28 續二十七：設計並實作 Stage 4（AW-FedAvg），尚未訓練
+
+**背景**：使用者要求設計 Stage 4 自訂聚合演算法，限制「Local 端須與 Stage 2/3 一樣，只能改
+Global 端，且必須是自創的 FL」，目標「吞吐量最大化為主，JFI 次要」。舊版 Stage 4 草稿「BAFA-Prox」
+（2026-09-25，q-FFL 公平性加權＋backhaul 緊繃度加權＋FedProx 近端正則化）不適用：方向是公平性
+優先（跟現在吞吐量優先相反），而且需要碰 Local 端（FedProx 改本地 loss、backhaul 緊繃度需新增
+C 語言 telnet 管道），論證資料也是舊拓樸/GRU 時期已作廢的。
+
+**設計過程**：先用 fork 彙整 Stage 1~3 現行（未作廢）文件裡對聚合演算法本身有意義的已證實缺失
+（`server_app.py` 只用 num-examples 加權、`mean_reward`/`eval_loss` 算了但沒用於聚合權重、
+relay/access 分群只對 Node4 有效、`FL_ROUND_INTERVAL_S` 未系統性掃描、沒有跨輪次穩定化機制），
+據此設計初版「Performance-Weighted Adaptive FedAvg」：效能加權（用原始 `mean_reward`，借鑑 q-FFL
+但方向反轉)＋ESS 信心閘門（重用 Stage 3 機制）＋伺服器端簡化動量（借鑑 FedAvgM）。
+
+**使用者要求「找最優解、不考慮工作難度」後的自我修正**：重新推導發現用原始 `mean_reward` 當表現
+指標有因果混淆——reward 同時反映「策略好不好」與「這輪流量大不大」，用它加權等於獎勵運氣好而非
+學得好。改用 `drl_agent.py` 訓練迴圈已經算好、但 `client_app.py` 沒有轉發的 `mean_adv`（advantage，
+已扣掉 Critic 基準線、跟流量大小無關），對應到已發表方法 Advantage-Weighted Regression（Peng et
+al. 2019）的核心構造，把 $\exp(A/\tau)$ 從單一 agent 樣本層級搬到聯邦客戶端層級——比第一版嚴謹、
+也更好引用。演算法更名為 **AW-FedAvg（Advantage-Weighted Adaptive FedAvg）**。
+
+**實作**（`server_app.py`／`client_app.py`，皆屬 Global rApp，Local 端零改動）：
+- `client_app.py::train()` 的 `reply_metrics` 多加一行 `mean_adv`（讀取 `run_training_round()`
+  已經算好、原本沒轉發的既有欄位）。
+- `server_app.py` 新增 `IABCustomFedAvg(IABFedAvg)`：計算 advantage 加權平均 $W^{perf}$（`w_i =
+  n_i·exp(mean_adv_i/τ)`，`AW_TEMPERATURE` 預設 2.0）與純樣本數加權平均 $W^{base}$（＝ Stage 2
+  這輪的結果），用 ESS 信心閘門（重用 `_effective_sample_size`／`_shrunk_prototype`，`_shrunk_prototype`
+  簽章加了可選 `c` 參數但預設值不變、Stage 3 呼叫端行為不受影響）在兩者間收縮混合成 $W^{blend}$，
+  再套一個伺服器端簡化動量（`AW_MOMENTUM` 預設 0.7，單一全域純量係數，跟留給 Stage 6 的
+  FedAdam/FedYogi 逐參數自適應版本刻意區隔）得到最終 $\theta_t$，廣播給全部 12 個節點（同一份
+  權重，不做 Stage 3 那種 role_ratio 個人化混合）。動量緩衝需要跨 `flwr run` 行程持久化（
+  `num-server-rounds=1`，每輪都是全新 Python 行程），重用 Node1 既有的模型 volume 掛載點存
+  `aw_fedavg_momentum.pt`，**沒有新增 docker volume**。`main()` 支援 `FL_MODE=custom`，廣播邏輯
+  直接沿用既有的 `elif result.arrays: _broadcast_aggregated_weights(...)` 分支，不需要像
+  `IABClusterFedAvg` 那樣另外走 `self._last_w_*` 通道（Stage 4 只有一份最終權重，不是兩個原型）。
+- 已在 `local-xapp-inference:latest` image 內用合成資料做單元測試：多輪聚合（含動量狀態真的
+  跨輪變化）、冷啟動邊界情況（全部節點 num-examples=0 正確跳過）、`_shrunk_prototype()` 簽章改動
+  對 Stage 3 既有呼叫方式的回歸測試（行為完全不變）——全部通過。
+
+**尚未做**：真實訓練與量測（清空 MongoDB 經驗＋checkpoint、`FL_MODE=custom` 啟動、TCP 凍結量測，
+比照 Stage 3 流程）；`docker-compose-iab-server.yaml` 尚未加上 `AW_TEMPERATURE`／`AW_SHRINKAGE_C`／
+`AW_MOMENTUM` 的環境變數覆寫（Python 端已有預設值，比照 `CLUSTER_SHRINKAGE_C` 慣例暫不寫進
+compose）。`STAGE4_CUSTOM_FL_DESIGN.md`／`CLAUDE.md` 已更新反映實作現況，已同步 PC2/PC3，
+**未 commit/push**。
+
+## 2026-09-28 續二十八：Stage 4 v1 從頭訓練結果劣於 PF，根因診斷與 v2 修正
+
+**v1 訓練與量測**：從頭訓練 3 小時（`FL_MODE=custom`／`REWARD_MODE=throughput_only`／`MODEL_ARCH=mlp`／
+`FL_ROUND_INTERVAL_S=60`，180 輪聚合），全程無人值守（`stage4_run_20260928/`，含清理環境→三台依序
+重啟→預檢查→每 20 分鐘存 checkpoint／healthcheck→完成後自動觸發 TCP 凍結量測，沿用 Stage 3 建立的
+自動化 pipeline）。中途遇到 UE16 precheck 失敗（容器存活但資料面斷線，非 CU NAT 問題），就地修復後
+用 `resume_after_precheck_fix.sh` 手動接續 daemon 派送（訓練實際起始 12:18:26）；第一次量測嘗試因
+UE1 崩潰被 CrashGuard 判定無效，`eval_run.sh` 自動重試第二次成功。
+
+結果：**TCP 4.81 Mbps，JFI 0.9859，壅塞滿足率 0.709，滿足率 JFI 0.9229，RTT 57.6ms**——對照 Stage3
+5.08／Stage2 5.02／PF 4.93，**吞吐量是四者最差，且劣於完全不做 FL/DRL 的 PF baseline**。判定為機制
+本身有設計缺陷（不是訓練資料品質問題），依使用者預先授權的條件指示（「假設量測結果沒有 stage4優於
+stage3優於stage2優於PF 那請找出問題點做修正 不要考慮工作難度 找最優」）啟動診斷與修正。
+
+**診斷（依序排除，全部用真實資料，非猜測）**：
+1. 抽查 node9 全部 checkpoint 的 actor+critic 總 L2 norm（12.61→12.74→12.87→12.96→13.14），漸進
+   成長、與 Stage3 健康 FINAL（14.72）同量級——**排除權重爆炸**。
+2. 比對 FINAL 下全部 12 節點與 node1 的 flat state_dict 差異 norm（0.06~0.09，相對總 norm ~13 極小）
+   ——12 節點確實收斂到近乎相同權重，設計上的「全域一致」有達成——**排除節點發散**。
+3. 理論推導＋1D 玩具模擬鎖定真因：v1 的伺服器動量公式 $\theta_t=\theta_{t-1}+v_t$、
+   $\Delta_t=W_{blend}-\theta_{t-1}$ **隱含伺服器學習率 η=1**（沒有獨立縮放係數）。玩具模擬
+   （固定 target=10、θ₀=0、μ=0.7）重現：round 1 幾乎衝到 target，動量累積後 round 3~4 衝過頭到
+   13~14，之後以振幅 3~4 來回震盪超過 10 輪才緩慢收斂——符合 Reddi et al.（*Adaptive Federated
+   Optimization*, ICLR 2021）記載的 FedAvgM 在 η 過大時的已知不穩定模式。次要放大因子：v1 直接用
+   單輪原始 `mean_adv`（每節點每輪僅 ~9~45 筆樣本）做指數加權，雜訊被放大進動量——與已撤銷的
+   relay 專用門檻實驗（續二十五、二十六）的「小樣本單輪訊號→不連貫行為」是同一類問題。真實訓練
+   期間 backhaul 池大小、流量場景、各節點資料品質持續變動，目標權重本身也在漂移，沒有 η 縮放的
+   動量在這種情境下持續追不上又用力過猛，與 v1 全程 4.81Mbps（非短暫偏低，是持續劣於 PF）吻合。
+
+**v2 修正**（`server_app.py::IABCustomFedAvg`）：
+- 新增 `AW_SERVER_LR`（預設 0.3）：`θ_t=θ_{t-1}+AW_SERVER_LR·v_t`，把隱含 η=1 換成可調小步長，
+  直接對應根因。
+- 新增 `AW_ADV_EMA_RHO`（預設 0.3）：`adv_ema_i←(1-ρ)·adv_ema_i+ρ·mean_adv_i`，加權時用 EMA 取代
+  單輪原始值，抑制小樣本雜訊；每節點 EMA 持久化在重新命名的狀態檔 `aw_fedavg_state.pt`（同時存
+  動量緩衝，因為 `num-server-rounds=1` 每輪都是全新 Python 行程，跨輪狀態只能靠磁碟序列化延續，
+  舊檔名 `aw_fedavg_momentum.pt`／輔助函式 `_load_momentum_state`／`_save_momentum_state` 已改名為
+  `_load_aw_state`／`_save_aw_state`）。
+- `AW_TEMPERATURE` 由 2.0 提高到 3.0，搭配 EMA 平滑進一步降低單節點波動主導聚合結果的風險。
+- `AW_MOMENTUM`（0.7）／`AW_SHRINKAGE_C`（1.0）維持原值，但 `AW_MOMENTUM` 語意已變（現在作用在
+  「每輪只走一小步」的更新上，不再是直接衝刺）。
+
+**v2 驗證**（合成資料，`local-xapp-inference:latest` image 內執行）：
+- **退化條件**：`AW_SERVER_LR=1, AW_MOMENTUM=0, AW_TEMPERATURE/AW_SHRINKAGE_C→∞` 應精確退化成
+  Stage2 純樣本數加權平均。原本想直接呼叫真正的 `IABFedAvg`/Flower `FedAvg` 基底類別比對，撞上
+  測試樁 `FakeMsg` 缺少 `Message.array_records` 等內部屬性的問題（`IABCustomFedAvg` 的正式路徑
+  從不呼叫 `super().aggregate_train()`，不受影響，是測試工具本身的深度限制）——改用手動計算
+  12 節點 sample-weighted average 直接比對，差異 norm=0.0000167（浮點精度範圍），驗證通過。
+- **穩定性**：原本 40 輪合成測試顯示 round 7→11 距離目標從 4.0 反彈到 27.5，疑似震盪/發散；
+  **延長到 180 輪（對應真實 3 小時訓練的輪數）後證實這只是動量法典型的暖機瞬態**——round 40 後
+  穩定收斂在窄殘差帶（round 121~180 範圍 0.30~1.29），持續到 180 輪未再發散；換成緩慢漂移 target
+  （模擬真實訓練中 local 策略持續變動）也穩定追蹤在窄帶內（範圍 2.92~3.12，未發散）；對照組
+  「無動量」（`AW_MOMENTUM=0`）的穩態範圍反而更寬（0.23~1.40），驗證動量確實有平滑效果、不是
+  不穩定來源。結論：v2 參數組合數學上穩定，可信任進行真實訓練。
+
+**部署**：Global 層（`server_app.py`／`client_app.py`／`flower-*` 容器）全部只跑在 PC1（見
+`CLAUDE.md` 第 1 節硬體配置表），此次修正**不需要同步 PC2/PC3**，只在 PC1 rebuild
+`local-xapp-inference:latest` image 即生效。`STAGE4_CUSTOM_FL_DESIGN.md` §9（新增）記錄完整診斷
+與修正過程；`CLAUDE.md` Stage 4 列已更新。v1 訓練資料（`checkpoints_archive/stage4_custom_tcp_20260928/`）
+保留供論文記錄對照，不刪除。Stage 2/3 官方封存模型全程不受影響。**下一步：v2 第二輪 3 小時從頭
+訓練＋TCP 量測（使用者已預先授權，沿用同一套自動化 pipeline）。未 commit/push。**
+
+## 2026-09-28 續二十九：Stage 4 v2 訓練與量測結果——比 v1 改善但仍未達單調遞增目標
+
+v2 修正（`AW_SERVER_LR=0.3`／advantage EMA／溫度調高，見續二十八）部署後，執行第二輪 3 小時從頭
+訓練（`stage4v2_run_20260928/`，17:01:17~20:01:17，全程無人值守，沿用 Stage 3/v1 建立的自動化
+pipeline）。訓練期間 UE7 崩潰一次、UE13 崩潰兩次，皆由 watchdog 就地修復成功（ping 0% 遺失確認）；
+CU/DU/FlexRIC/4 個 relay RestartCount 全程維持 0，訓練資料品質正常（12 節點 MongoDB 經驗終值
+9500~10050 筆，train_steps 終值 2900~3510）。訓練完成後 `post_measure.sh` 自動觸發 TCP 凍結量測
+（20:16:48~20:38:46）。
+
+**結果**：TCP 4.94 Mbps（對照 v1 4.81／Stage3 5.08／Stage2 5.02／PF 4.93）。JFI 整段 0.9911、
+壅塞相位滿足率 **0.783**（四者最高）、滿足率JFI 0.9360、RTT 整段 63.7ms（四者最差）。完整逐 UE
+數據與壅塞驗證見 `experiment_results/stage4_AWFedAvg.md`。
+
+**判讀**：v2 修正確實有效——吞吐量 4.81→4.94（+2.7%）、壅塞相位滿足率 0.709→0.783，不再劣於 PF，
+證實 v1→v2 的根因診斷（伺服器動量隱含 η=1 過衝）與修正方向正確。但**主要驗收指標（吞吐量）仍未
+達成單調遞增要求**：v2（4.94）僅比 PF（4.93）高 0.01 Mbps，在量測雜訊範圍內，且仍低於 Stage2
+（5.02）與 Stage3（5.08）。次要指標混合：壅塞滿足率與滿足率JFI 表現不錯（四者中數一數二），但
+RTT 是四者最差。
+
+**後續**：使用者在啟動 v1 訓練前已預先授權「假設未達標，診斷修正後重訓一次」，此授權已於本輪執行
+完畢。v2 仍未達標，**不自動啟動第三輪訓練**——依約定的授權範圍（只明確授權一次重試），停下來把
+結果誠實寫進文件，等使用者看過結果後決定下一步方向（可能選項：接受目前結果作為 Stage 4 初步結論、
+進一步調參、或重新設計聚合機制）。`experiment_results/stage4_AWFedAvg.md`（新增）、`CLAUDE.md`
+Stage 4 列、兩份 Stage4 memory 檔案皆已更新反映本輪結果。v1／v2 checkpoint 皆已封存
+（`checkpoints_archive/stage4_custom_tcp_20260928/`／`stage4v2_custom_tcp_20260928/`）。
+未 commit/push。
+
+## 2026-09-29 續三十：新 Stage 3（CAPA-Fed）從頭訓練與量測——吞吐量與 PF 打平，RTT 明顯改善
+
+路線圖重新定案後（見續二十九末段與 `STAGE4_CUSTOM_FL_DESIGN.md` §10~11），實作
+`IABCapaFedAvg`（`FL_MODE=capa`）取代舊版 soft/weighted cluster FL 成為新 Stage 3：Critic
+全域池化（沿用 AW-FedAvg v2 已驗證的動量+學習率防過衝）、Actor 逐節點依 `n_i` 信心加權個人化
+混合（不整份覆寫）。實作前用合成資料驗證退化條件（`CAPA_BETA_MIN=CAPA_BETA_MAX=1`＋
+`CAPA_CRITIC_MOMENTUM=0`／`CAPA_CRITIC_LR=1` 精確退化成 Stage 2，差異 norm=1.6e-5）。
+
+**訓練**：`stage3_capa_run_20260928/`，21:40:20 從頭訓練啟動（`FL_MODE=capa`／
+`REWARD_MODE=throughput_only`／`MODEL_ARCH=mlp`／TCP 場景），這是 `IABCapaFedAvg` 第一次
+在真實環境跑（先前只做過合成測試），現場驗證：全部 12 個 inference 容器＋CU/DU/FlexRIC
+RestartCount 全程 0，checkpoint 熱重載正常運作（node1 mtime 持續更新、與現在時間差僅 1 秒），
+確認 FL 聚合→廣播→Local rApp 撿到新權重的鏈路正常。另外直接比對存活 checkpoint 權重，確認
+Actor 確實逐節點分化（node4/node9 與 node1 有可測量差異），Critic 則如設計預期全域趨同；同時
+發現多數節點（尤其本地訓練樣本稀疏的 relay）即使有真實梯度更新，仍會收斂到與全域平均極接近的
+值——呼應已知的「節點間環境異質性偏低」平台特性。
+
+**提前結束**：使用者於 00:13（訓練進行 2h33min，離原訂 3h只剩 27 分鐘）表示「訓練差不多了」，
+確認後選擇「現在就手動停止，直接進入量測」而非等待自然結束。手動複製 `finish_3h.sh` 到期後
+的收尾邏輯（停 watchdog／驅動器→存 FINAL checkpoint→停 xApp/inference/FL 容器→touch
+TRAINING_DONE），訓練實際時長 **2 小時 37 分**（21:40:20~00:15:57），略短於完整 3 小時。
+`post_measure.sh` 常駐 daemon 於 60 秒內偵測到 TRAINING_DONE，自動觸發 TCP 凍結量測。
+
+**量測結果**（00:31:54~00:53:49）：TCP **4.92 Mbps**（對照 PF 4.93／Stage2 初步 5.02／舊
+Stage3 cluster 5.08，已淘汰／Stage4 v2 AW-FedAvg 4.94，已淘汰）。JFI 整段 0.9864、壅塞相位
+滿足率 **0.767（與 PF 完全一致）**、滿足率JFI 0.9378、RTT 整段 **54.1ms（五者最佳，明顯優於
+PF 59.3、Stage2 58.4）**。完整逐 UE 數據見 `experiment_results/stage3_capaFed.md`。
+
+**判讀**：吞吐量幾乎與 PF 完全打平，未超越 Stage2，也未達到舊版 cluster FL 的 5.08（但後者已
+淘汰不是比較目標）。RTT 是唯一明顯改善的指標。CAPA-Fed 的核心機制（Actor 個人化混合、Critic
+全域池化）已確認真實運作，不是「機制沒生效」，是「生效但吞吐量效果不明顯」。訓練只有 2h37min
+（非完整 3h）是這次結果的已知限制，但 Stage2 官方基準本身同樣只是 2 小時暖啟動，兩者在此限制
+上可比、不構成不公平比較。
+
+**後續**：依約定，不自動啟動 Stage 4（ERA-Fed）訓練，已將結果寫入文件並等待使用者下一步指示。
+`experiment_results/stage3_capaFed.md`（新增）、`CLAUDE.md` Stage 3 列（已改為現行 CAPA-Fed
+結果，舊版 cluster FL 段落標記已淘汰）皆已更新。checkpoint 封存於
+`checkpoints_archive/stage3_capa_tcp_20260928/FINAL_0016/`。未 commit/push。
+
+## 2026-09-29 續三十一：設計 Scenario TH（持久異質性訓練場景）＋清理舊 Stage3/4 全部殘留資料
+
+Stage 3 CAPA-Fed（4.92 Mbps，與 PF 打平）離線診斷發現：這次流量場景（Scenario T/TR）的設計是
+長期均勻輪替，每個節點長期下來經歷的流量×通道分布完全一樣，CAPA-Fed 這種依節點差異做個人化的
+機制因此沒有真正的異質性可以學（Actor 權重跟 12 節點平均比只偏離 <1%）。同時發現訓練步數落差：
+Stage2 官方模型 train_steps≈7000~7120，CAPA-Fed 這次只有 2500~3050（約 2.3 倍差距）——Stage2
+的暖啟動繼承了先前已訓練過的模型，不是單純「暖啟動有魔力」。
+
+**新增 Scenario TH**（`scenarios/traffic_scenario.py::scenario_th_heterogeneous()`）：結構、
+流量/通道檔位量級與 Scenario T 完全相同，只改「怎麼分配給每個 UE」——不用 T 的
+round-robin（長期均勻），改成每個 UE 先均勻抽一個基準 combo index，再依所屬節點的**持久化難度
+偏移**（`BRANCH_HARDSHIP`）朝「難」或「易」的方向推移。難度指派原本設計成 4 個 relay 分支對半分
+（binary），使用者認為太粗糙，改成**逐節點連續光譜、用固定結構性種子（`TH_HARDSHIP_SEED=
+999999999`，跟訓練 seed 無關）隨機導出**，9 個節點各自獨立難度值分布在 [-1,1]（實測範例：
+node10=+0.99 最難、node4=−0.59 最易）。離線驗證：300~5000 個 phase 下，難易節點的長期平均差距
+穩定維持在 5.2~5.4，不隨時間拉長而收斂消失（跟 T 的 round-robin 在數學結構上不同：hardship 是
+固定常數、每個 phase 都加同一個值，不會被稀釋）。**只用於訓練場景，不改動 Scenario T 本身**
+（跨 Stage 比較用的標準測試場景不受影響）。CLI 新增 `--scenario TH`，尚未接進
+`training_scenario_driver.sh` 的訓練輪替表（使用者要求先確認設計，此步驟待後續執行）。
+
+**路線圖決定（使用者，2026-09-29）**：測試也要加 Scenario TH（不只訓練）——否則異質性感知的
+聚合機制永遠沒機會在對稱測試環境下展現優勢。進一步定案：**每個階段（PF/Stage2/Stage3/Stage4/
+Stage5）都要分別在 T 與 TH 下訓練、並在 T 與 TH 下量測**，讓最終論文能回答「什麼場景該用哪個
+Stage 的策略」，不只是單一排名。使用者明確表示「成本不是重點，論文能越好就做」。
+
+**清理**：依使用者指示，舊版 Stage 3（soft/weighted cluster FL，官方 5.08 Mbps）與舊版 Stage 4
+（AW-FedAvg，v1 4.81／v2 4.94）已完全過時（Stage 3 已改為 CAPA-Fed、Stage 4 已改為 ERA-Fed
+設計），**全部相關資料整段刪除，不再保留供歷史對照**：
+- 刪除檔案：`experiment_results/clusterFL.md`、`experiment_results/stage4_AWFedAvg.md`、
+  `inference/STAGE3_DESIGN.md`、`inference/STAGE3_CLUSTER_FL_DESIGN.md`
+- `server_app.py` 移除 `IABClusterFedAvg`／`IABCustomFedAvg` 兩個 class、`_broadcast_cluster_weights`／
+  `_aw_state_path`／`_load_aw_state`／`_save_aw_state`／`_effective_sample_size`／`_shrink_factor`／
+  `_mix_flat`／`_shrunk_prototype` 等專屬輔助函式、`ROLE_RATIO`／`CLUSTER_SHRINKAGE_C`／
+  `AW_TEMPERATURE`／`AW_ADV_EMA_RHO`／`AW_SERVER_LR`／`AW_SHRINKAGE_C`／`AW_MOMENTUM` 等專屬常數、
+  `main()` 裡 `FL_MODE=="cluster"`／`"custom"` 的 dispatch 分支——移除後 image 重建、CAPA-Fed／
+  ERA-Fed 的合成回歸測試全部重跑通過（含退化條件，誤差維持 1.6e-5 量級，確認清理沒有破壞現行
+  程式碼）。
+- 刪除 memory：`project_stage3_training_run_20260927.md`、`project_stage4_design_20260928.md`、
+  `project_stage4_training_run_20260928.md`，`MEMORY.md` 索引已同步更新。
+- `CLAUDE.md` 全文搜尋清掉所有指向上述已刪除檔案／class 的引用（第 1、3、5 節共約 10 處），
+  Stage 3／Stage 4 路線圖表格改寫為現行 CAPA-Fed／ERA-Fed 現況，「Stage 3 分群設計」整段歷史
+  說明移除。
+
+已 `sync_pc23.sh --apply` 同步 PC2/PC3。**待辦**：把 TH 接進 `training_scenario_driver.sh`
+訓練輪替、決定 T/TH 雙軌框架的實際執行順序（PF 先做兩種量測當基準，再依序補齊 Stage2~5），
+CAPA-Fed 暖啟動續訓（目標 train_steps 追上 Stage2 的 ~7000 量級）尚未啟動。未 commit/push。
+
+## 2026-09-29 續三十二：TH 接進訓練驅動器＋watchdog；CAPA-Fed 重新從頭訓練滿 2.5h＋Scenario TH 交叉量測
+
+**接續續三十一的待辦**：
+
+1. **`training_scenario_driver.sh` 新增 `--scenario-family {t,th}`**：`SLOT_SCENARIO` 依家族切換
+   （`t`→`TR TR R TR TR R`，`th`→`TH TH R TH TH R`），新增 `TH_SEED_BASE=145000`／`TH_PHASE_S=110`
+   （與 T 家族一致），新增 `TH)` 場景分支。預設 `t`，不帶旗標時行為與過去完全相同。
+2. **`training_watchdog.sh` 新增 `--scenario-family` 透傳**：仿照既有 `--protocol`/`PROTOCOL_ARG`
+   模式（parsing／驗證／log／三處驅動器重啟指令皆帶上），避免 TH 家族訓練中途遇到崩潰復原時
+   watchdog 重啟驅動器會悄悄退回預設的 `t` 家族——這正是本專案反覆踩過的「悄悄退回預設值」
+   陷阱同一類問題，提前修掉。兩支腳本改完 `bash -n` 語法檢查通過、`sync_pc23.sh --apply` 同步
+   PC2/PC3（0 差異）。
+
+**使用者決定本輪不直接做 TH 訓練，而是先把 CAPA-Fed 在 Scenario T 家族下重新從頭訓練一次滿完整
+2.5 小時**（上一輪 2h37min 提前結束，這輪要補齊完整時長），**訓練完成後改用 Scenario TH 做兩份
+量測**（Stage3 DRL 凍結評估 + PF baseline），驗證同一個 T 訓練模型在異質性場景下的表現——這是
+T/TH 框架下的「交叉量測」案例，不是「TH 訓練→TH 量測」的對稱案例。使用者明確要求：xApp 開
+MLP+REWARD_MODE=throughput_only+CAPA-Fed、流量場景用 TCP、每 20 分鐘存一次 checkpoint、每 20
+分鐘健康檢查並回報終端機、不要讓 session 閒置太久、期間 ssh 可能斷線但要繼續跑。
+
+**執行**：
+
+- 先把上一輪（2026-09-28/29，2h37min）的 checkpoint 與 MongoDB 經驗完整封存
+  （`archive_stage_data.sh stage3_capa_tcp_20260928`——這次額外把之前漏封存的 MongoDB 經驗也補
+  上，之前只有 checkpoint 被封存過），確認清空前資料不會遺失。
+- 沿用 `stage3_capa_run_20260928` 的既有 run-directory 樣板（`env.sh`/`launch.sh`/
+  `checkpoint_saver.sh`/`healthcheck_stage2.sh`/`finish_train.sh`/`eval_run.sh`/`post_measure.sh`）
+  建新的 `stage3_capa_retrain2_th_20260929` run 目錄，`TRAIN_SECONDS=9000`（2.5h，非上次的
+  10800）；`eval_run.sh` 新增 `SCENARIO`（T/TH 選場景）與 `AI_LAYER`（1=帶起 xApp+inference+
+  Global xApp 做 DRL 凍結評估／0=PF baseline，RAN 起來後立刻停掉全部 12 個 xApp、完全不啟動
+  inference/Global 層）兩個環境變數，讓同一份 eval 腳本同時服務 DRL 與 PF 兩種量測模式；
+  `run_stage_measure.sh` 對應新增 `SCENARIO` 環境變數（預設 `T`，行為完全不變，只在指定時切到
+  TH）。`post_measure.sh` 改寫為訓練結束後依序自動觸發兩份量測（`stage3capa_TH` DRL 評估→
+  `PF_TH` baseline），不需人工觸發。
+- `setsid nohup bash launch.sh` 全背景執行（不受對話連線斷線影響）：`clean_env.sh`→三台依序
+  重啟→`run_stage2_fl.sh`（`FL_MODE=capa REWARD_MODE=throughput_only MODEL_ARCH=mlp`，從頭訓練，
+  清空 checkpoint/MongoDB）→`setup_iperf_servers.sh`→precheck（13/13 E2、12/12 xApp、17/17 UE
+  ping 0%、17 個 iperf3 port，全部通過）→02:17:22 啟動訓練長駐行程（`training_scenario_driver.sh
+  --protocol tcp --scenario-family t`，PC2/PC3 各一份；`training_watchdog.sh` 同樣參數，PC1）。
+- **訓練期間**（用 Monitor 工具背景輪詢 `healthcheck.log`/`post_measure.log`，每 20 分鐘一次
+  健檢、每次都推播回對話，包含一次因忘記清掉舊 Monitor 導致的重複通知，發現後立刻 `TaskStop`
+  修正）：train_steps 從 0 穩定累積到 ~2850、MongoDB 經驗終值 ~8700 筆/節點、FL 熱重載終值 412
+  次、Actor 在壅塞樣本上持續真實更新（node4/5/9/12 皆有 `Actor更新` 記錄，λ 全程恆 0 確認
+  throughput_only 模式正確）。UE9（02:20）、UE5（04:20）、UE13（04:23）各崩潰一次，watchdog
+  皆在 <25 秒內就地修復（重新斷言路由＋ping 驗證 0% 遺失），未影響訓練連續性；CU/DU/FlexRIC/4
+  relay RestartCount 全程維持 0；PC1 idle 一度瞬間掉到 2.2%（單一取樣尖峰，非持續，複查已回到
+  80%），三主機負載全程健康。
+- 訓練於 04:47:17 準時結束（`start_ts+9000`=02:17:16+9000=04:47:16，精確吻合；`finish_train.sh`
+  的收尾訊息印出「2h」是 `$((TRAIN_SECONDS/3600))` 整數除法無條件捨去 9000/3600→2 的顯示 bug，
+  不影響實際流程，僅供未來若再看到類似訊息時參考）。8 份 checkpoint 存檔（`ckpt_01`~`ckpt_07`+
+  `FINAL_0447`，各 12/12 節點齊全）封存於
+  `checkpoints_archive/stage3_capa_retrain2_tcp_20260929/`。
+
+**量測**：
+
+- `post_measure.sh` 偵測到 `TRAINING_DONE` 後自動接續。量測 1/2（`SCENARIO=TH AI_LAYER=1`，
+  Stage3 CAPA-Fed 凍結評估）第一次嘗試即成功；但分析階段炸掉——**發現並修好一個分析腳本 bug**：
+  `analyze_stage.py` 的相位狀態正則式寫死只匹配字面 `"Scenario T 相位狀態"`，Scenario TH 印出的
+  是 `"Scenario TH 相位狀態"`（T 後面接 H 而非空格），regex 對不上導致完全抓不到任何相位資料、
+  對空清單取平均直接丟 `StatisticsError` crash。**原始 CSV 資料完全正常、17 個 UE 都齊全**，
+  純粹是分析腳本字串比對疏漏；修正為 `Scenario (?:T|TH) 相位狀態`後重新對已收集的資料跑一次
+  分析即成功，不需要重新量測。已 `sync_pc23.sh --apply` 同步。
+- 量測 2/2（`SCENARIO=TH AI_LAYER=0`，PF baseline，不啟動 local/global 的 xapp/rapp）第一次嘗試
+  因量測期間 UE17/UE13 各崩潰一次（量測階段 watchdog 已停用、無法即時自癒）被 CrashGuard 判定
+  無效，`eval_run.sh` 內建的兩次重試機制自動觸發第二次嘗試（重新乾淨重啟＋預檢查＋量測）並成功，
+  全程無需人工介入——這正是這個機制原本設計要處理的情況。
+
+**結果（Scenario TH，TCP）**：
+
+| 指標 | CAPA-Fed（T訓練→TH量測） | PF baseline（TH） |
+|---|---|---|
+| 整段 JFI | 0.9526 | 0.9307 |
+| 平均吞吐量(Mbps) | 5.29 | 5.34 |
+| 平均RTT(ms) | 80.3 | 100.0 |
+| 壅塞相位滿足率 | 0.609 | 0.625 |
+| 壅塞相位滿足率JFI | 0.7546 | 0.8064 |
+| 壅塞相位RTT(ms) | 162.5 | 171.3 |
+| 正常相位滿足率 | 0.766 | 0.831 |
+| 正常相位滿足率JFI | 0.8333 | 0.8948 |
+| 正常相位RTT(ms) | 34.4 | 51.8 |
+
+CAPA-Fed 在吞吐量／滿足率／滿足率JFI 全部指標上都略遜於 PF baseline，唯獨 RTT（各項皆較低）與
+整段 JFI 較優——跟同一模型在 Scenario T 下的量測模式一致（RTT 佔優、吞吐量/滿足率不佔優），
+說明這不是 TH 場景特有的現象，而是這個 CAPA-Fed checkpoint 的一貫特徵。完整結果與判讀寫入
+`experiment_results/stage3_capaFed.md` 新章節，CLAUDE.md Stage 3 路線圖同步更新。
+
+**待辦**：這輪只做了「T 訓練→TH 量測」的交叉案例，**尚未做「TH 訓練→TH 量測」的對稱案例**——
+需要用 `training_scenario_driver.sh --scenario-family th` 重新訓練，才能回答 T/TH 框架的核心
+問題「給機制真正的異質性訊號後，優勢有沒有被放大」。Stage2/Stage4/Stage5 的 T/TH 雙軌訓練＋量測
+也都還沒開始。未 commit/push。
+
+**事後更正（同日）**：使用者原始指令實際要求的是「TH 訓練→TH 量測」（口述指令中 `TH` 被拆成
+兩截，「T」黏在「重新訓練Scenario」後面、「H」飄到後面變成「PF模式H」，是造成誤讀的來源），
+不是本條目記錄的「T 訓練→TH 量測」。使用者看到 CAPA-Fed 在 TH 量測下輸給 PF 的結果後追問
+「不是阿 我不是用TH 訓練→TH 量測嗎?」，才發現這個誤讀。**這輪訓練（含 checkpoint、MongoDB
+經驗、`stage3_capa_retrain2_th_20260929` 整個 run 目錄、`checkpoints_archive/
+stage3_capa_retrain2_tcp_20260929/`）已依使用者指示整個刪除，`experiment_results/
+stage3_capaFed.md` 與 `CLAUDE.md` 對應章節已還原成刪除前的版本**——上面這條「續三十二」條目
+本身保留供對照（記錄誤讀發生的過程），但條目內引用的所有數字/檔案皆已不存在，不可再引用或
+比對。真正的「TH 訓練→TH 量測」尚待重新執行。
+
+## 2026-09-29 續三十三：真正的 Scenario TH 訓練→TH 量測（T/TH 框架對稱案例）——CAPA-Fed 仍全面落後 PF
+
+延續續三十二事後更正，用正確的 `--scenario-family th` 重新從頭訓練 CAPA-Fed，跑滿完整 2.5 小時
+（10:20:51~12:50:45），訓練與量測都用 Scenario TH，是 T/TH 雙軌框架下第一個真正完成的「同場景
+訓練→同場景量測」對稱案例。run 目錄 `stage3_capa_th_train_20260929`，checkpoint 封存
+`checkpoints_archive/stage3_capa_th_tcp_20260929/FINAL_1251`。
+
+**訓練期間觀察**：Global xApp 的 node4 `fairness_bias` 穩定偏高（多筆健檢落在 1.05~1.85，其餘
+節點多在 0.8~1.1），確認 Scenario TH 的持久異質性訊號在訓練期間真的可被觀察到、不像 Scenario T
+長期會被輪替拉平——證明 TH 場景設計本身有達到目的。UE12（12:07）、UE5（12:20，前 3 次就地修復
+失敗、第 4 次改重啟容器才成功，是本專案目前最頑固的一次自癒案例，但仍在 <2 分鐘內自動排除）各
+崩潰一次，CU/DU/FlexRIC/4 relay RestartCount 全程維持 0。
+
+**新發現的資源問題**：訓練進行到 ~2 小時後，PC2/PC3 分別累積 443、530 個 `[iperf3] <defunct>`
+殭屍行程（zombie，`ps aux` 顯示 STAT=Z），對應時段兩台主機 CPU 使用率一度衝到 80~90%（load
+average 74/54，遠高於平常的 5~10），UE ping RTT 也明顯升高（~170ms，平常 30~100ms）。根因：
+`traffic_scenario.py` 每個相位（~110 秒一次）都會重啟 iperf3 client 行程，子行程結束後沒有被
+父行程正確 `wait()` 回收，長時間訓練下累積成大量殭屍。殭屍本身不佔 CPU，但同時觀察到的高 CPU
+使用率顯示系統資源確實吃緊；訓練仍準時完成，量測階段的 `clean_env.sh` 完整重啟會重置這個狀態，
+不會污染後續量測，但這是一個尚待修的真實 bug（子行程 reap 缺失），記錄供之後排查。
+
+**量測**：量測 1/2（Scenario TH，CAPA-Fed 凍結評估）第一次嘗試即成功。量測 2/2（Scenario TH，
+PF baseline）第一次嘗試因量測期間 UE8 崩潰（量測階段 watchdog 已停用、無法即時自癒）被
+CrashGuard 判定無效，`eval_run.sh` 內建的兩次重試機制自動觸發第二次嘗試並成功，全程無需人工
+介入——這是這套重試機制第三次在本專案派上用場（前兩次見續三十二），持續驗證有效。
+
+**結果（Scenario TH，TCP）**：
+
+| 指標 | CAPA-Fed（TH訓練→TH量測） | PF baseline（TH） |
+|---|---|---|
+| 整段 JFI | 0.9314 | 0.9504 |
+| 平均吞吐量(Mbps) | 5.25 | 5.47 |
+| 平均RTT(ms) | 94.3 | 102.5 |
+| 壅塞相位滿足率 | 0.651 | 0.662 |
+| 壅塞相位滿足率JFI | 0.8184 | 0.8481 |
+| 壅塞相位RTT(ms) | 170.7 | 187.8 |
+| 正常相位滿足率 | 0.756 | 0.796 |
+| 正常相位滿足率JFI | 0.8160 | 0.8609 |
+| 正常相位RTT(ms) | 48.3 | 39.8 |
+
+**判讀**：即使是真正在 TH 上訓練過的 CAPA-Fed，吞吐量、整段 JFI、壅塞/正常相位滿足率、滿足率
+JFI 全部指標仍然落後 PF baseline。唯一勝出的是整段 RTT 與壅塞相位 RTT，但正常相位 RTT 這次反而
+是 PF 較低——RTT 優勢本身也不是全面的。**T/TH 框架的核心假說（給機制真正的異質性訓練訊號後，
+個人化優勢會被放大）在這輪資料中沒有得到支持**：真正 TH 訓練的結果，並沒有比已刪除的「T訓練→
+TH量測」交叉案例（概略量級：吞吐量 ~5.29Mbps、壅塞滿足率 ~0.609）更接近或超越 PF，兩者都是全面
+落後而非追上。可能解釋（皆為假說、未驗證）：2.5h 訓練本身可能不足以讓個人化機制在異質性場景下
+充分收斂；訓練門檻/獎勵常數（例如 `CONTENDED_BUF_BYTES`）是針對 Scenario T 校準的，未必適合
+TH 的分佈；動作空間本身（每 UE PRB 上限，均分即退化成 PF）可能比場景異質性更根本地限制 DRL
+能贏過 PF 的空間——這個假說也能解釋 Stage 2/3/4 在 Scenario T 下同樣普遍卡在 PF±3% 以內的模式。
+
+完整數據、判讀寫入 `experiment_results/stage3_capaFed.md`「Scenario TH 訓練＋量測」章節；PF
+baseline 的 TH 官方基準另寫入 `experiment_results/PF.md`；`CLAUDE.md` Stage 3 路線圖同步更新。
+**待辦**：Stage2/Stage4/Stage5 的 TH 訓練→TH 量測全部尚未開始；上述三個假說（訓練時長／獎勵
+常數校準／動作空間限制）都還沒有專門設計的實驗去驗證，是否要投入資源驗證待使用者決定。未
+commit/push。
+
+## 2026-09-29 續三十四：診斷實驗——FL_MODE=none（純本地訓練，1h），驗證是不是 FL 平均拖累表現
+
+使用者看到 CAPA-Fed TH 訓練→TH 量測仍輸給 PF 後質疑：問題可能不在「哪種聯邦聚合演算法」，而是
+Local DRL 這一層本身（Stage 2~4 共用、從未改變過）——不管 Global 層怎麼換，只要 Local policy
+沒有實質比 PF 聰明，聯邦學習怎麼調都只是在幫平庸的 policy 做平均。選擇先做小規模診斷：關掉整個
+FL 層（不啟動 `flower-superlink`／`flower-supernode-nodeN`／`flower-scheduler`，Global xApp 照常
+運作提供 `fairness_bias`），12 節點各自純本地訓練，Scenario TH，先跑 1 小時看趨勢再決定要不要
+延長。run 目錄 `stage3_nofl_diag_20260929`。
+
+**執行**：`launch.sh` 第一次跑到預檢查時失敗——UE16 100% 封包遺失。診斷：MAC 層 harq 統計正常，
+UE 本身路由表也正確，判斷是 CU 端問題；重啟 UE16 容器＋重新斷言路由後恢復 0% 遺失，17/17 UE 確認
+正常後**手動接續 `launch.sh` 未執行完的步驟**（iperf3 server→預檢查→啟動訓練），不需要整套三台
+重啟，省了 ~10 分鐘。訓練 14:59:19 啟動，全程確認 0 個 `flower-*` 容器在跑（launch.sh 有內建
+`FLOWER_UP` 檢查、非 0 就 fail，此次確認通過）。UE12 訓練期間崩潰一次，watchdog 就地修復；
+CU/DU/FlexRIC/4 relay RestartCount 全程維持 0。
+
+**訓練期間觀察**：node4/node9 的 `mean_reward` 前 20~25 分鐘快速從 0 爬升（node4 到 ~0.15、node9
+到 ~0.10），之後明顯趨緩進入緩慢爬升平原——1 小時內沒看到持續快速上升。訓練 15:56:59 (1h) 準時
+結束，接續一次 Scenario TH 凍結評估量測（`FL_ON=0`），第一次嘗試即成功。
+
+**結果（Scenario TH，TCP）**：
+
+| 指標 | No-FL診斷(1h,純本地) | CAPA-Fed(2.5h,TH訓練+FL) | PF baseline |
+|---|---|---|---|
+| 平均吞吐量(Mbps) | 4.99 | 5.25 | 5.47 |
+| 整段JFI | 0.9261 | 0.9314 | 0.9504 |
+| 整段RTT(ms) | 73.6 | 94.3 | 102.5 |
+| 壅塞相位滿足率 | 0.642 | 0.651 | 0.662 |
+| 壅塞相位滿足率JFI | 0.7836 | 0.8184 | 0.8481 |
+| 壅塞相位RTT(ms) | 136.3 | 170.7 | 187.8 |
+
+**判讀**：這個實驗沒有乾淨地回答原始問題——No-FL 不只沒開 FL，訓練時長也只有 CAPA-Fed 的
+40%（1h vs 2.5h），兩個變數混在一起無法單獨歸因。表面上 No-FL(1h) 全部吞吐量/JFI/滿足率指標都
+比 CAPA-Fed(2.5h) 差，但更可能是訓練量不足（train_steps 遠低於 2.5h 的量級），不是拿掉 FL 本身
+造成的。**唯一有意義的方向性訊號**：若「FL 平均拖累表現」假說成立，拿掉 FL 應該讓結果變好，但
+實際上變差了——這個方向反而**弱化了「FL 是元兇」的假說**。RTT 全面最低（三者最好）但吞吐量/
+滿足率也全面最差，可能只是反映訓練量少、模型還沒學會產生延遲的複雜行為，不代表策略更好。
+
+完整數據見 `experiment_results/stage3_capaFed.md`「診斷實驗：FL_MODE=none」章節。**待辦**：要
+做時長匹配的乾淨比較（No-FL 也跑滿 2.5h，從現有 checkpoint 暖啟動續訓），才能真正回答「FL 本身
+有沒有拖累表現」，尚未執行，待使用者決定是否繼續投入。未 commit/push。
+
+## 2026-09-29 續三十五：找出真正瓶頸——Dirichlet 探索退火時間常數跟訓練預算嚴重不匹配，修正並重訓；ERA-Fed 文獻脈絡更新
+
+使用者質疑「訓練量不足」這個說法是否站得住腳（前一輪 reward 曲線明明看起來在收斂/趨緩，不是持續
+上升），逼著重新檢查證據而不是憑感覺回答。原本提出「動作空間只能重分配、不能創造吞吐量」的說法
+也站不住腳——PF 排程器（`coeff_ue = tbs/dl_thr_ue`，`gNB_scheduler_dlsch.c::pf_dl()`）本身是
+proportional fair，**會主動犧牲吞吐量換公平性**（歷史吃得少的 UE 優先於當下通道更好的 UE），
+所以理論上是有 headroom 的。
+
+**找到真正的瓶頸**：`drl_agent.py` 的 `DIRICHLET_K_ANNEAL_TAU=5000`（Dirichlet 採樣集中度 K
+的退火時間常數，K 越低訓練雜訊越大）。反推換算：CAPA-Fed 每次訓練最多只到 ~2800 steps（2.5h），
+只退火到 43%；No-FL 診斷（1h）只到 ~600 steps，只退火 11%——**平台目前為止的每一次訓練，全程
+都還停留在高探索雜訊的階段，從沒有真正進入低雜訊、可利用（exploit）已學到策略的階段**。反向
+驗證：Stage 2 那個唯一贏過 PF 的官方結果（`stage2v2_relative_20260927/FINAL_1405`），train_steps
+是 **6870~7120**（同一套 tau=5000 排程下已退火 75%，K≈39），是 CAPA-Fed 每次從頭訓練的 2.3~2.5
+倍——不是巧合，是同一個機制在兩邊都成立。
+
+**修正**：`DIRICHLET_K_ANNEAL_TAU` 從 5000 改成 800（改用 `DRL_DIRICHLET_K_ANNEAL_TAU` 環境變數
+可覆寫），驗證 2.5h（~2800 steps）可退火到 97%（舊排程同樣時長只有 43%）。重建
+`local-xapp-inference:latest` image、同步 PC2/PC3。啟動新一輪 CAPA-Fed TH 訓練
+（`stage3_capa_th_annealfix_20260929`），其餘設定與上一輪官方 TH 結果（5.25 Mbps）完全相同，
+只有這一個參數不同，可乾淨歸因。訓練中途多次拉健檢跟上一輪同 step 數比較：66分鐘（打平）→
+86分鐘（微幅偏正）→106分鐘（4/6節點正、node9+10.6%）→126分鐘（4/6節點正、node9+7.7%／
+node12+8.8%）——趨勢逐漸偏正但尚不到定論程度，最終凍結評估量測才算數。應使用者要求，訓練結束後
+只做一次 TH DRL 凍結評估量測，不重測 PF baseline（PF 不受這次改動影響，已有記錄的 5.47Mbps
+可直接比對）——已安全停掉並改寫 `post_measure.sh`（先 pkill 再改檔案再重啟，避免改到執行中的
+script）。
+
+**附帶修正 ERA-Fed（Stage 4，`STAGE4_CUSTOM_FL_DESIGN.md` §11）的文獻脈絡**：使用者質疑原本
+引用的 Elastic Averaging SGD（Zhang, Choromanska, LeCun, NeurIPS 2015）是否過時、有沒有更新的
+文獻。用 WebSearch 查證後確認 EASGD 是通用分散式 SGD 論文、非聯邦學習專屬，找到更貼切的
+**pFedMe**（T. Dinh, N. Tran, T. D. Nguyen, *"Personalized Federated Learning with Moreau
+Envelopes"*, NeurIPS 2020）——已有延伸到聯邦 actor-critic 強化學習、同時個人化 actor 與 critic
+的應用先例，跟 ERA-Fed 要解決的命題（CAPA-Fed 只個人化 Actor、Critic 沒有）幾乎是同一個問題。
+改以 pFedMe 為主要對標，EASGD 保留作為彈性拉扯數學形式（比例拉扯取代整份覆寫）的原始出處，不是
+誤引用、是補強文獻脈絡。已同步 PC2/PC3。
+
+**訓練結果（18:16~20:58，2.5h 準時完成，UE2/UE9 各崩潰一次已由 watchdog 修復）**：應使用者要求
+只做一次 TH DRL 凍結評估（不重測 PF baseline，已改寫並安全重啟 `post_measure.sh`），量測第一次
+嘗試即成功。訓練期間多次拉健檢跟舊排程同 step 數比較，66→86→106→126 分鐘的趨勢是逐漸偏正
+（node9/node12 一度 +7~11%），但**最後一筆（147分鐘，訓練結束前）反轉成 5/6 節點負向**——證實
+訓練曲線中途的單點比較不可靠、雜訊很大，不能拿來預測最終結果。
+
+**最終量測結果（Scenario TH，TCP，三方比較）**：
+
+| 指標 | 新版(tau=800) | 舊版(tau=5000) | PF baseline |
+|---|---|---|---|
+| 吞吐量(Mbps) | 5.32 | 5.25 | 5.47 |
+| 整段JFI | 0.9412 | 0.9314 | 0.9504 |
+| 整段RTT(ms) | 82.3 | 94.3 | 102.5 |
+| 壅塞相位滿足率 | 0.640 | 0.651 | 0.662 |
+| 壅塞相位滿足率JFI | 0.7813 | 0.8184 | 0.8481 |
+| 正常相位滿足率JFI | 0.8675 | 0.8160 | 0.8609 |
+
+**結果混合，不是單純變好**：吞吐量小升 1.3%、整段JFI/RTT全面改善、正常相位滿足率JFI 首次超過
+PF（本專案目前唯一一次 DRL 在滿足率指標上贏 PF）；**但壅塞相位滿足率／滿足率JFI（CLAUDE.md 判讀
+方法訂定的鑑別指標，不是整段JFI）反而退步**，吞吐量仍未贏過 PF。**核心驗收目標（吞吐量贏 PF）
+仍未達成，退火修正是真實但不完整的改善**。完整數據見 `experiment_results/stage3_capaFed.md`
+「Dirichlet 探索退火修正重訓」章節。
+
+**題外話的文獻檢索過程**：使用者要求把 IAB/O-RAN 領域文獻也納入相關研究定位（不要只鎖定通用個人化
+FL），用 WebSearch 查到兩批文獻：①聯邦DRL+O-RAN xApp（GLOBECOM 2022、F-ONRL、Meta-Hierarchical
+RL）②多智能體RL+IAB多跳（2022-2023 多篇）。診斷發現後者（多智能體RL for IAB）主要處理的是「單一
+agent 在多跳環境下的決策設計」，對應 Local 層而非 Global 聚合層；比對後指出本系統 Local 層的
+reward 設計（relay 節點只看自己DU送出多少，看不到下游UE最終體驗）跟典型 MARL-for-IAB 論文的
+「端到端 credit assignment」設計有結構性落差——是比「換聚合演算法」更根本、但工程量也大很多的
+方向，且會牴觸「Stage2~5 Local端必須完全相同」的硬性規則，等於開新實驗軸。使用者決定先看這次
+退火修正結果再決定要不要往這個方向走。已寫入 CLAUDE.md 第2節新增的「相關研究定位」章節。未
+commit/push。
+
+## 2026-09-29 續三十六：CAPA-Fed 修正後仍未贏 PF，使用者決定全面重來——Local DRL＋Stage3／4 Global
+FL 全部改成從 2022 年後 IAB/O-RAN 文獻重新設計；舊資料/模型/設計文件全部刪除
+
+**觸發原因**：續三十五的 tau=800 修正重訓結果仍然混合（吞吐量仍輸 PF），使用者的結論是「一直在做
+沒有意義的事」——與其繼續在同一個沒被文獻驗證過的 Local DRL 基礎上換 Global FL 聚合方式，不如先
+把 Local DRL 這個地基用文獻立論紮實，再往上疊 FL。明確要求：Local DRL 重新設計（目標吞吐量贏
+PF）；Stage 2（avg FL，Scenario T）維持不變；Stage 3 Global FL 換成 2022 年後 IAB/O-RAN 文獻裡
+真的被用過的 FL（Scenario TH 用）；Stage 4 Global FL 是自創但要結合 2022 年後 IAB/O-RAN 文獻的
+混合設計（T/TH 皆用）；Stage 5 是修正版 DRL；每個階段都要 T/TH 雙軌訓練+量測；不要管工作難度，
+要找出最好的論文方法論。
+
+**研究過程（4 輪並行/序列 fork，共約 12 個 subagent，涵蓋 WebSearch 網路文獻＋使用者本機論文庫
+34 篇＋2 輪引用真偽驗證）**：
+1. 三路並行網路文獻研究：① Local DRL 怎麼設計才可能贏 PF ② Stage3 用哪個 IAB/O-RAN 文獻裡真實
+   出現過的異質性 FL（給 Scenario TH）③ Stage4 怎麼結合文獻自創混合設計（給 T+TH）。
+2. 使用者提供本機論文庫（`~/thesis_papers/`，34 篇，Experimental/Project/Read/Unread 四個
+   子資料夾，經 Windows 筆電 scp 傳到 PC1）——fork 依相關度分級精讀，找到跟這個平台最貼近的
+   既有先例：**Experimental/02+03（Sever et al., arXiv:2501.05879，同一篇兩份copy）是在 OAI
+   平台上做的 DQN xApp**，用「Offline Training Block」（iperf 產生真實流量預訓練，不是分析
+   模擬器）＋離散化動作空間（10~90%，5%一檔）＋「離 PF 門檻多遠」的 reward，200 episode 收斂；
+   但誠實揭露：他們贏 PF 是贏在 QoS 達成率，不是總吞吐量，不能直接照搬「贏 PF」的宣稱。
+3. 兩輪引用真偽驗證（16 篇合計）：4/6（Local DRL）與 9/10（Stage3/4）驗證乾淨；抓到 2 個技術
+   細節誤描述需修正（MORPH 論文機制被誤稱為「Hybrid Reward Ensemble」，實際是融合 iPerf/MCS
+   分布/PHY 模擬三種吞吐量訊號；F-ONRL 被誤稱為「取代 FedAvg 聚合」，實際是平行跑的神經演化
+   優化器，跟聚合機制無關）、1 個引用完全對錯論文（arXiv:2509.14343「PPO贏TD3」的主張其實是
+   xSlice，內文沒有這個比較，整個砍掉不用）、1 個極新 preprint（2026-09-19 才掛）需加註「未經
+   同行評審」。**零篇是完全幻覺捏造**，失敗模式是「論文真的存在但細節被誤引」，不是憑空捏造。
+4. 使用者質疑「為什麼一定要用 FedAvg」，指出這個系統其實沒有真正隱私限制（12 個
+   `inference-nodeN` 容器＋MongoDB 全部同機在 PC1，原始經驗物理上本來就互通）。額外查證：
+   IAB/O-RAN 的 FL 資源分配這個小眾領域裡權重平均幾乎是通用做法（O-RANFed 的 Eq.(2)、EcoFL
+   的 Algorithm 1 都是實際打開 PDF 核對過的加權/純平均 FedAvg；O-RANFed 自己拿 FedAvg 對比
+   FedProx，FedProx 在 RIC 資源受限場景下反而更差）；唯一真正不同的機制（policy
+   distillation/reuse，如 arXiv:2309.07265 的 O-RAN slicing hybrid transfer learning，訓練
+   在 non-RT RIC、部署在 near-RT RIC，架構上意外貼近本系統的 Global/Local xApp 分層）存在於
+   更廣的「O-RAN DRL-xApp」文獻，但不在「FL 資源分配」這個小眾領域內。使用者最終定案：**Global
+   端的論文定位鎖定聯邦式學習，不接受跳出 FL 範式的方案**（即使技術分析顯示 distillation/集中式
+   訓練可能更強）——已存成硬性規則記憶 `feedback_global_must_stay_fl.md`。
+
+**最終定案的三個設計方向**（詳細數學公式與完整文獻依據將寫入設計文件，見下方「待辦」）：
+- **Local DRL 重新設計**：離線預訓練（用既有 PF baseline 量測 log 做 behavior cloning，而非
+  另寫簡化 Python PF/MAC 模擬器——理由：這個平台已經被「紙上合理、實際不一樣」咬過太多次，
+  Sever et al. 的 OAI 平台先例也是用真實平台流量預訓練，behavior cloning 是監督學習不需要
+  RL 等級的樣本量）；動作空間離散化（比照 Sever et al. 10~17 檔）；reward 改用相對 PF 的
+  反事實比較（MORPH 修正後的多來源吞吐量訊號融合概念）；state 加入 relational 特徵（parent
+  bh_ratio 趨勢、children 聚合需求）做局部多跳 credit assignment。需要新增「PF-shadow」模式
+  （xApp 照常算 state、強制不設上限、額外記錄每個 UE 在 PF 下實際拿到的 PRB 份額當 BC 標籤）
+  才能產生離線預訓練需要的 (state, PF行為) 配對資料——現有 PF baseline 量測 xApp 是關閉的，
+  沒有這個資料，需要另外收集。
+- **Stage 3（Scenario TH）**：兩層 Hierarchical FedAvg（branch 內先聚合 relay+2個access子節點，
+  再跨 4 個 branch）＋ Sattler CFL（cosine-similarity 分群）當 branch 內分歧過大時的 fallback；
+  跨 branch 加權比照 Read/14（Wang et al., ICC 2024，O-RAN 原生 Hierarchical FL）用 Hedge
+  演算法線上自適應加權取代單純樣本數加權。
+- **Stage 4（T+TH）**：HiRA-Fed（Hierarchical Role-Aware Federation）——聚合算平均用跟 Stage3
+  同樣的兩層 FedAvg 數學；但廣播回節點不整份覆寫，改用彈性拉扯個人化：Actor 用雙錨點插值
+  （branch 平均 + 全域平均，角色相關的固定混合比例）、Critic 用角色條件式彈性拉扯（relay 節點
+  拉力比 access 節點強），對標 pFedMe/EASGD/APFL，另外 Unread/07（LLM-hRIC，IAB場景驗證過）的
+  non-RT guider/near-RT implementer 兩層模式當第二個獨立文獻立足點。
+
+**舊資料/模型/設計文件清理**（使用者明確授權「既然我要重新設計 舊資料舊模型舊設計文件都刪掉」）：
+- 刪除 `experiment_results/avgFL.md`、`stage3_capaFed.md`（PF.md、backhaul_mechanism_verification.md
+  保留，不受 Local DRL/FL 重新設計影響）。
+- 刪除對應 raw 量測資料夾：`data_20260927_stage2_capmode_fix/`、`data_20260927_stage2_twostate/`、
+  `data_20260927_stage3_final/`、`data_20260928_stage3v3/`（`data_20260926_pf*` 保留，是 PF
+  baseline 的支持資料）。
+- 刪除 `checkpoints_archive/` 下的 `stage2v2_relative_20260927/`、`stage3_capa_tcp_20260928/`、
+  `stage3_capa_th_annealfix_tcp_20260929/`、`stage3_capa_th_tcp_20260929/`、
+  `stage3_nofl_diag_tcp_20260929/` 五個封存目錄。
+- 刪除 PC1 殘留的 11 個 run 目錄（`stage2_run_20260926`、`stage2v2_run_20260927`、
+  `stage3_run_20260927`、`stage3v2_run_20260927`、`stage3v3_run_20260928`、
+  `stage3_capa_run_20260928`、`stage3_capa_th_train_20260929`、
+  `stage3_capa_th_annealfix_20260929`、`stage3_nofl_diag_20260929`、`stage4_run_20260928`、
+  `stage4v2_run_20260928`）。
+- 清空 12 個 `iab-xapp-model-node{1..12}` docker volume 內容（舊 checkpoint，新設計 state/action
+  維度會改變，結構上不相容，留著也無法沿用）。
+- 清空 MongoDB `iab_xapp` 資料庫下全部 `node{1..12}_experiences*`（含即時與封存共 34 個
+  collection，舊 state schema 跟新設計不相容）。
+- `inference/STAGE2_DESIGN.md`（Local xApp/rApp 設計）、`inference/STAGE4_CUSTOM_FL_DESIGN.md`
+  §10/§11（CAPA-Fed/ERA-Fed）**尚未修改**，待下一步依上述三個定案方向重寫（§1~9 的 AW-FedAvg
+  失敗記錄、CAPA-Fed/ERA-Fed 本身的完整診斷過程繼續保留在文件內當論文方法論的失敗案例記錄，
+  不整段刪除，只是不再是「現行設計」）。
+
+**待辦**：把上述三個定案方向寫成完整設計文件（含數學公式、每個設計選擇的文獻依據與理由）；新增
+PF-shadow 資料收集機制；CLAUDE.md 第2、3節的 Local xApp/rApp 描述與五階段路線圖表格屆時需要
+同步改寫成新設計（但要等實作完成、不要在設計文件寫完前就把 CLAUDE.md 改成還沒實作的內容）。
+未 commit/push。
+
+## 2026-09-30 續三十七：Local DRL v2 實作前設計審查（修正三個方法論問題）＋ drl_agent.py／inference_server.py 實作
+
+**29 日晚的前置工作（接續續三十六）**：實作 PF-shadow 模式時查證發現設計文件原本要新增的 E2SM-MAC
+欄位 `dl_aggr_rbs` 其實早就存在（`mac_ue_stats_impl_t.dl_aggr_prb`，`ran_func_mac.c:119` 已填
+`UE->mac_stats.dl.total_rbs`，且 `mac_enc_plain.c`／`mac_dec_plain.c` 對整個 `ue_stats` 陣列整包
+`memcpy`，欄位本來就穿過 E2），不需要改 E2 訊息格式、不需要三台主機重編。12 個 `xapp_nodeN.c` 只加
+`compute_delta_prb()`＋JSON `pf_actual_rbs`（PC1 重編安裝）；`inference_server.py` 加 `XAPP_MODE=shadow`。
+另外發現待辦順序有誤：state 設計（§4）要先改完才能收 shadow 資料，否則資料是舊的 51 維格式，已調整。
+同日也查證了文獻：IAB/O-RAN 的 DRL xApp 幾乎全用 MLP（Sever et al.、PandORA、Yamin & Permuter 的
+Relational A2C 都是，後者的「relational」是特徵串接不是 GNN）；使用者質疑的 Zhang/Zhou/Erol-Kantarci
+（GLOBECOM 2022）讀全文確認是 **Vertical FRL**（兩個異質 xApp 的 Q-table 串接後餵第三個網路），不是
+橫向 FedAvg，`CLAUDE.md`「相關研究定位」把它寫成「本論文最直接對應的文獻」需要修正（尚未修）。
+
+**設計審查（使用者要求實作 §4 前先確認 DRL 設計有沒有問題）**，發現三個會影響論文方法論的問題，
+使用者全部同意修正：
+1. **BC 標籤跟動作空間對不上**：原 §1.5 用「PF 實際 RB 份額」當 Actor 的 BC 標籤，但動作是「每 UE
+   上限檔位」。在上限動作空間裡 PF 的動作就是「全部不設上限」；把份額換成檔位等於把 UE 鎖在平均份額，
+   PF 在個別 slot 給超過平均的量會被砍掉，BC 初始策略會比 PF 差。使用者問「一般都怎麼設計」——
+   文獻的兩條路（對 baseline 做 BC、residual policy learning 零修正初始化）在這個動作空間剛好是同一件
+   事：初始化成「全部選 1.0 檔」。改成輸出層 bias 閉式設定（80% 選 PF 檔、20% 探索），不需要資料。
+2. **反事實 PF reward 數學上多餘**：`R̂^PF(s)` 只跟 state 有關，γ=0 下會被 Critic baseline 完整吸收，
+   advantage 不變，原設計「訊噪比更高」的理由不成立。拿掉，reward 維持純吞吐量；PF-shadow 資料改拿來
+   預訓練 Critic（線上一開始策略≈PF、V(s)≈PF 表現，advantage 天然是「比 PF 好多少」）。附帶解掉
+   Stage 5 Lagrangian 不知道疊在哪的待辦。
+3. **Actor 頭按 slot 編號輸出、樣本效率差**：改成全部 UE 共用的小 MLP 頭（自己 3 維＋節點 5 維＋其他
+   UE 的 mean/max），排列等變。
+
+實作細節另外修掉：relational 特徵原設計在推論路徑讀 MongoDB（會爆 5ms），改成背景執行緒＋共用
+`node_status` collection＋記憶體快取；每次請求先取特徵快照，推論與存經驗用同一份（舊版 `fairness_bias`
+就有這個競態：兩次編碼之間背景執行緒更新快取，存下的 state 不是策略實際看到的，PPO 比例會錯）；
+單一 UE 直接選 PF 檔；MLP 推論失敗改退回 PF 而非 BSR 啟發式；MLP `is_trained` 恆為 True（策略一開始
+就合法，不再需要啟發式暖身）；shadow 資料改存原始 `ues`／`t_mono` 供預訓練配對算 reward。
+新增 `pretrain_critic.py`（Dockerfile 已加入）。
+
+**驗證**：離線單元測試 13 項全過——初始 PF 檔機率 0.800、排列等變、單 UE 不設上限、`behavior_logp`
+與訓練端 log π 完全一致、上限換算、合成環境（壓低 MCS UE 較好）下 200 輪後策略把低 MCS UE 設低上限
+的機率 0.10→0.995（學習方向正確）、Critic 預訓練 holdout MSE 0.0005 對「猜平均」0.028、checkpoint
+讀回、shadow 配對規則（跳過中斷、reward 用下一筆 bsr）。PC1 單執行緒推論延遲 p50≈0.3ms、p99≈0.6ms。
+設計文件 `LOCAL_DRL_V2_DESIGN.md` 已依審查結果重寫。**尚未**：重建 inference image、收 shadow 資料、
+預訓練、平台上驗證。未 commit/push。
+
+**同日第二輪審查（使用者問「一般 DRL 都這樣設計嗎」）**：逐項對照標準做法——IPPO（de Witt et al. 2020）、
+分解式 Categorical（MultiDiscrete）、DeepSets／mean-field 集合輸入、residual RL、離線資料暖啟動 Critic
+（AWAC／Cal-QL）都是標準；另外找到 2 個真問題並修正：①Actor 的壅塞樣本篩選條件含結果狀態 s′（09-26
+舊設計就有），s′ 受動作影響（設上限→佇列變長→過門檻），「哪些樣本拿來學」取決於動作，policy gradient
+有選擇偏差、方向是把 Actor 拉回 PF → 改成只看決策前 s；②Critic 仍是扁平 53 維 MLP、跟排列等變的 Actor
+不一致 → 改 DeepSets（共用 per-UE 編碼＋mean/max pooling）。單元測試原本的 Critic 預訓練項用了只看
+slot 0 的合成 reward（排列不變的 Critic 本來就不該學到），改成對稱 reward；新增「Critic 排列不變」、
+「壅塞遮罩只看 s」兩項，15 項全過。偏離標準但有理由的兩點（γ=0、PPO 搭配 83 分鐘回放緩衝區）寫進設計
+文件 §6 已知限制。100k 門檻原本用「s 或 s′」校準，收真實資料後要確認 `contended=xx%` 是否仍合理。
+
+## 2026-09-30 續三十八：移除 UE17（拓樸改為 16 UE、四條分支完全對稱）
+
+使用者決定拿掉 UE17（原本直接掛在 relay Node4 的 DU、2-hop、容器在 PC3，是全拓樸唯一的例外：Node4 比其他
+relay 多一個 UE、需要跨主機 telnet 覆寫與 DU4 F1-U 別名修復）。依要求**全部以註解保留、不刪除**，標記
+`[UE17 已移除 2026-09-30]`：`docker-compose-iab-pc3.yaml`（UE17 服務整段）、`start_iab_pc3.sh`（啟動迴圈
+與單獨補路由）、`training_watchdog.sh`（UE 迴圈 17→16、兩處 DU4 別名修復區塊）、`precheck_measure.sh`
+（16 UE、16 個 iperf3 port）、`analyze_stage.py`（UE1~16）、`setup_iperf_servers.sh`（port 5201~5216）、
+`traffic_scenario.py`（iperf port 對照、`NODE_CONFIG[4]` 改空清單、`UE_HOST_OVERRIDE`／
+`NODE_TELNET_HOST_OVERRIDE` 清空、Scenario TH 的 `BRANCH_HARDSHIP` 拿掉 Node4、`T_RANDOM_NUM_UES`
+17→16）。**Scenario TR 的洗牌陣列長度原本寫成 `T_RANDOM_NUM_UES+1`（17 UE 時剛好 18＝9 種組合×2）**，直接
+改成 16 會變 17 份、不平衡且讓 UE1~16 的隨機序列全部改變，改成固定 `2×9=18`，UE1~16 的場景序列與移除前完全
+相同；TH 各節點難度由 (seed, node_id) 獨立導出，拿掉 Node4 不影響 Node5~12。驗證：PC3 compose 服務清單 8 個
+UE、`build_ue_list()` pc2/pc3 各 8 個、iperf port 到 5216、所有修改過的腳本語法檢查通過。CLAUDE.md 第 1、3、5、
+6、8 節同步改成 16 UE；設計文件（LOCAL_DRL_V2、STAGE4 §10.2）一併更新。**影響**：2026-09-30 前的 PF baseline
+與各 Stage 量測都是 17 UE，之後結果不可直接比較，PF baseline（T/TH）要在 16 UE 下重測。IMSI 216 仍註冊在
+DB（無害）；PC1 compose 的 Node4 telnet 9092 對外綁定保留（無害）。未 commit/push。
+
+## 2026-09-30 續三十九：16 UE PF baseline 重測（T、TH，TCP）＋修正 TH 量測的兩個 bug
+
+使用者要求 UE17 移除後重量 PF（T、TH 各一次，只量 TCP），並刪除 17 UE 的舊 PF 資料（`data_20260926_pf*`、`PF.md`
+舊內容；舊內容可從 git 找回）。自動化腳本 `/home/lindor/pf16_run_20260930/run.sh`：每次量測前 clean_env → 三台依序
+重啟 → 13/13 E2 → 停 12 個 inference 容器（PF 不需要）→ 16 個 iperf3 server → 預檢查（UE 不通自動修一次）→ 量 1230 秒，
+無效自動重試一次。
+
+**T（13:34）**：一次成功。4.87 Mbps／JFI 0.9874／RTT 45.5 ms、壅塞相位滿足率 0.762（JFI 0.9314）。UE7 最後 3 個相位
+被分到最差通道（L≈24）後資料面卡住，iperf 重啟兩次都沒救回，3/176 個 UE×相位沒有樣本（被排除，UE7 平均略偏樂觀）。
+使用者問「16 UE 平均吞吐量 4.87 比 17 UE 的 4.93 低」：兩者差 1.2%，平均目標同時差 1.0%（5.83→5.77，PC3 從 9 個 UE
+變 8 個使輪替少用一種組合），達成/目標 0.846 對 0.844 幾乎相同；壅塞瓶頸是各 access 節點自己的容量，UE17 直掛 Node4、
+不跟任何 UE 共用 access 節點，拿掉不會釋出容量。使用者追問「TCP 怎會有要求量」：iperf3 對 TCP 也用 `-b` 限速，正常相位
+送達 68＝目標 68 可證；並說明為什麼不用 full buffer（會讓「贏 PF 吞吐量」退化成 max C/I、平台是 CPU 瓶頸會被壓垮、
+沒有正常/壅塞對照、RTT 失去意義）。
+
+**TH（13:59，作廢）**：分析發現兩個 bug——①`run_stage_measure.sh` 沒傳 `--seed`，兩台主機各自抽隨機 seed，每次 TH 量測的
+流量分配都不同，PF 與各 Stage 無法配對比較（09-29 CAPA-Fed TH 對 PF TH 的比較也是這樣）；②`analyze_stage.py` 的每 UE
+目標寫死 T 的輪替公式 `TIER_COMBOS[(i+pi)%9]`，TH 的目標全錯（正常相位出現「送達 90 > 目標 62」），滿足率與過載比例
+不可信（09-29 起所有 TH 滿足率都受影響；吞吐量／整段 JFI／RTT 不用目標、不受影響）。修正：`run_stage_measure.sh` 對 TH
+傳固定 `--seed $MEASURE_SEED`（預設 20260930）；`analyze_stage.py` 改為直接呼叫 `scenario_t_tiered()`／
+`scenario_th_heterogeneous()`（seed 從場景 log 讀）算目標。T 用新邏輯重算，結果逐字相同。
+
+**TH 正式基準（14:55，seed=20260930）**：一次成功（預檢查時 UE16 不通，重設路由無效、重啟容器後恢復）。5.87 Mbps／
+JFI 0.9449／RTT 106.7 ms、壅塞相位滿足率 0.671（JFI 0.9067），正常相位 0.941。這組 seed 下 TH 要求量比 T 大（正常 92 對 68、
+壅塞 149 對 118）。限制：UE11 壅塞相位 ping 大量無回應（76/206 筆無 RTT，吞吐量完整）；PC2 側正常相位 RTT ~80 ms、PC3 側
+~30 ms（seed 把較重的流量分給 PC2 側）。16 UE 的 UDP 基準尚未量。未 commit/push。
+
+## 2026-09-30 續四十：TH 改版——總負載與 T 一致，重量 TH 的 PF 基準
+
+使用者問「TH 要求量比 T 大，那 T 也可以給較高要求量」：解釋要求量是設計參數、調高會讓所有方法一起上升不影響勝負，
+T 的檔位受平台 CPU 容量與「正常相位要能送完」限制；並指出舊版 TH 的問題——`scenario_th_heterogeneous()` 把每個 UE 的
+組合編號平移 round(hardship×4) 格，8 個節點難度平均 +0.375 且 PC2 的 Node5/6/7 偏高，總負載明顯比 T 重（seed 20260930
+下壅塞相位總目標 149 對 118），T/TH 同時差異質性與總負載，無法把差異歸因到異質性。使用者選擇修正後重量。
+
+**新版 TH**：每台主機、每個相位先取 T 會用的同一批組合（由易到難排序），每個 UE 的排序分數＝節點難度＋均勻隨機
+±0.5（`TH_RANK_NOISE`，由 (seed, global_id, phase_index) 導出），分數低的拿較易的組合。離線驗證：2 主機 × 3000 相位
+組合集合跟 T 0 個不一致；全體平均需求同為 5.848；節點長期平均需求 1.2~9.6（標準差 ≈2.96，99~4950 相位穩定，不會平均掉）。
+異質性相當強：Node8、Node11 幾乎總拿最輕的組合，壅塞樣本會較少；如需緩和可調大 `TH_RANK_NOISE`。
+
+**TH 重量（16:17，seed 20260930）**：一次成功，每相位總目標跟 T 逐一相同。4.98 Mbps／整段 JFI 0.8057（刻意異質造成）／
+RTT 48.5 ms、壅塞相位滿足率 0.796（滿足率 JFI 0.9394），正常相位 0.888。UE10~12 壅塞相位 ping 無回應（吞吐量完整）。
+14:55 那次舊版指派的 TH（0.671）作廢。
+
+**另外更正**：先前多處引用的「PF 重測雜訊約 10%」只來自 09-13／09-19 舊平台（USB2.0、通道惡化未生效、17 UE、Scenario R）
+的兩次量測比較，不是現行平台的雜訊估計；使用者表示開發階段每條件只量一次、定案後再重複量。現行平台的雜訊要用同條件
+PF 重複量測（每次重開機）實測。PF-shadow 資料收集 16:40 起自動開始（T、TH 家族各 2 小時，TCP，訓練驅動器）。未 commit/push。
+
+## 2026-09-30 續四十一：論文 System Model 審查——MT–DU 節流上限推導更正
+
+使用者請人審查 `thesis/system_model.tex`（英文、Overleaf 直接編譯、不含註解），指出 8 大項＋數個細節問題，全部成立並已修正。
+對平台事實有影響的一項：
+
+- **MT 忙碌度的分母**：`nr_mac_gNB_backhaul_poll.c` 為 `2 × 106 × 2000 × 輪詢間隔`，分子是 MT 的 DL+UL RB 累計——
+  每個 slot 同時算一份滿載 DL 與一份滿載 UL。平台是 TDD（`donor_du.conf`／`iab_du_node*.conf`：週期 5 ms，
+  7 DL slot＋1 special（6 DL/4 UL symbol）＋2 UL slot），所以 MT 下行滿載時 busy 只有 ε_DL = (DL slot 比例)/2 ≈ 0.35~0.40。
+- **舊推導錯誤**：CLAUDE.md 原本把 busy 當成「MT 用掉的下行 PRB 比例」，得到 T ≤ 227−T → 113.5 Mbps（峰值一半），
+  且 227 Mbps 沒扣 TDD。正確為 T ≤ min(f·c, (1−ε_DL·f)·c) → c/(1+ε_DL)；c 取 TDD 下行峰值 159~169 Mbps，
+  每節點上限 ≈118~121 Mbps。此上限只是必要條件（未計兄弟節點共用、parent 的 β、上行），不是可達速率。
+- **機制本身不改**：壓縮力道比名目弱，但 PF baseline 已在此機制下量測，維持原樣、論文如實描述。
+
+其他修正（只影響論文寫法，不影響程式）：IAB/UE 編號改為互不相交集合；MT–DU 耦合明寫為平台人為施加的容量代理
+（rfsim 各載波獨立、無共用 RF）；聚合佇列的原因改為「每個 MT 只有一個 PDU session／DRB」而非「沒有 BAP」；local
+reward 降級為 surrogate（relay 多送 backhaul 會壓縮子節點 DU 預算，不保證端到端吞吐量上升）；γ=0 改稱 myopic／
+contextual-bandit 近似，形式化改為 POSG；補上 TCP 來源端控制與 UDP 有限 buffer 丟包；時間線（觀測用前一 epoch、
+reward 用動作生效的 epoch）；PPO 明寫為逐 UE 裁剪、平均的 factor-wise surrogate（`drl_agent.py:860`）；O-RAN 對照
+表說明 Local/Global rApp 是自訂服務、不是 Non-RT RIC 的 rApp。
+
+**Stage 3 邊界情況（論文先定義，實作時要照這版寫進 `STAGE4_CUSTOM_FL_DESIGN.md` §10）**：全部 w=0 跳過本輪；
+branch 無貢獻成員則不參與第二層；CFL 改為「每個成員 vs 同 branch 其他成員加權更新和」的 leave-one-out cosine
+（原設計是兩兩最小 cosine，無法決定誰是分歧節點），只在 ≥3 個貢獻成員時啟用，零向量 cosine 定為 1，全部都低於門檻
+時不排除；被排除的節點自成一組、沿用所屬 branch 的 Hedge 權重。Stage 3 退化成 Stage 2 只需 η_H=0 且 τ_CFL=−1，
+不必把網路改成單一 branch。
+
+## 2026-09-30 續四十二：System Model 第二輪審查——Stage 3 分歧機制無效、Stage 4 待重新設計
+
+論文檔已移到 `114368064_謝欣蓉_Master_s_thesis/Master_s_thesis/chapter/chapter3-system-model.tex`（使用者加了 `\cite`，Overleaf 編譯）。
+第二輪審查意見全部成立並已修正：
+
+- **Stage 3 分歧 fallback 原本無效**：被排除的節點自成一組、但沿用所屬 branch 的 Hedge 權重與原樣本數，展開後
+  Θ_glob ∝ Σ_b ζ_b Σ_{n∈N_b⁺} w_n Θ_n，跟不排除一模一樣（原設計文件 §10 就有這個問題）。討論三種修法後，**使用者選
+  「被排除節點不參與全域平均、也不被覆寫，保留自己的模型」**（最接近 Sattler CFL 原意），接受 Stage 3 因此提前有個人化，
+  **Stage 4（原 HiRA-Fed）改為待重新設計**。
+- cap 生效條件：PF 原本要給的 PRB 超過上限就生效（跟總需求無關），需求超過上限對應速率才降吞吐量，否則只增加延遲。
+- 可行域內只保證「存在」可支撐需求的排程，不是每個 policy 都能。
+- TDD：期望值改為對所有 slot 取平均、非下行 slot 定義 b=0。
+- P1 為理想集中式問題，實作求 P1′（donor 固定 PF）。
+- 佇列：明確定義 Q(t+1)=min{Q_buf, [Q−S]⁺+A}、tail drop。
+- MT–DU 代理：寫明除以 2 來自實作、未經量測或敏感度驗證；118~121 Mbps 是此代理在本平台隱含的上限，不是一般 IAB 上限。
+- Stage 5 補上定義（R = R_tp + λ(J − J_min)，λ 投影對偶上升），與程式一致。
+
+`STAGE4_CUSTOM_FL_DESIGN.md` §10/§11 開頭加了修訂說明；CLAUDE.md 路線圖同步。第 1 章 `chapter1-introduction.tex` 第 26 行仍提到 HiRA-Fed，未改（使用者自己的文字）。
+
+## 2026-09-30 續四十三：T／TH 理論上限（PF-shadow 資料＋線性規劃）
+
+腳本與結果在 `/home/lindor/pf16_run_20260930/upper_bound/`（`eff.py` 估效率、`ub.py` 吞吐量上限、`ub2.py` 滿足率上限）。
+- **每 RB 效率**（TH 家族 shadow 資料，依 driver log 的每 UE 通道檔位對齊，bytes/RB 中位數）：L=3/10 → 91（MCS 28）；
+  L=18 → 32（MCS 13）；L=22 → 19（MCS 8）；L=23 → 12.5（MCS 5）；L=24 → 8.8（MCS 3）。relay→MT 鏈路 91.3。
+  MAC bytes／應用層需求 ≈1.08（正常相位、確定滿足的 UE）。
+- **模型**：每相位一個 LP，變數為各 UE 應用層吞吐量，限制＝需求上限、access DU 預算（含 MT–DU 代理耦合）、relay DU 預算（同）、
+  donor DU 預算；每 DU 每牆鐘秒 67,840 RB（106 × 8 個可下行 slot／10 × 800 slot/s）；忽略上行、EWMA、PRB 整數化；
+  另一版加上平台 CPU 總量 ≤100 模擬 Mbps。
+- **結果（壅塞相位平均，模擬 Mbps）**：T 需求 120／吞吐量上限 92.1（CPU 限制版 90.3）／PF 實測約 88（16 UE 的相位）；
+  TH 需求 120／上限 92.9（92.6）／PF 91.2。**吞吐量可改進空間只有約 2～3%（TH 約 1.5%），而且小於模型誤差**
+  （TH pi=4 的 PF 實測 97.6 高於模型上限 89.7）。正常相位上限＝需求＝PF，沒有空間。
+- **滿足率上限**（改成最大化平均滿足率）：T 0.832（PF 0.762）、TH 0.848（PF 0.796），相對空間約 9% 與 6.5%。
+- **解讀**：壅塞相位的通道檔位都是 L=22~24（MCS 3~8），同節點 UE 的效率接近，重新分配 RB 能多拿的吞吐量很少；
+  瓶頸主要是 DU 預算與 relay 的 backhaul。以「總吞吐量」當 Stage 2~5 主指標，在現行場景下幾乎不可能量出顯著差異。
+
+## 2026-09-30 續四十四：新場景（混合通道壅塞）離線模型與調參
+
+`/home/lindor/pf16_run_20260930/upper_bound/`：`pfmodel.py`（離線 PF 預測：各 DU 以有需求上限的等 RB 分配近似 PF；
+多跳、MT–DU 代理耦合、TCP 端到端降速／UDP 逐跳按比例丟包；可加 PRB 上限檔位）、`capopt.py`（上限檔位座標下降，
+= DRL 動作空間可實現的最佳解）、`search1.py`（參數網格）、`eval2.py`（候選評估，結果 `eval2_result.txt`）。
+- **校準**：模型對 16 UE PF 實測的壅塞相位總送達，平均誤差約 4%、最大 11%（TH pi=4）。
+- **現行 T／TH**：上限檔位可實現的最佳解只比 PF 多 +1.5%／+1.0%（TCP、UDP 相同）→ 沒有空間。
+- **候選（壅塞相位，每個 branch 一個「混合節點」＋一個「輕節點」）**：混合節點＝好 UE（L=22、需求 22）＋壞 UE（L=24、需求 6），
+  輕節點＝兩個 UE（L=10、需求 1），總需求 120（同 T）。模型：PF 74.4（TCP）／71.6（UDP）；只把壞 UE 限在 0.3 檔 →
+  82.7／79.6（**+11%**），平均滿足率 0.847→0.813、JFI 0.948→0.946（公平性幾乎不變）。需求 18/6、輕節點 2 的版本 +10%。
+- 待辦：模型對「效率差異大的配對」沒驗證過 → 先在平台做短時間試驗（PF vs 靜態 0.3 上限）確認增益真的存在，再改場景。
+
+## 2026-09-30 續四十五：PF 雜訊實測（Scenario T，16 UE，TCP，同條件 3 次、每次乾淨重啟）
+
+`/home/lindor/pf16_run_20260930/noise_summary.txt`；rep2（21:10）、rep3（21:41）每個相位都是 16 UE、無 invalid。
+平均吞吐量 4.87/4.89/4.91（標準差 0.02，CV 0.4%）；壅塞相位滿足率 0.762/0.762/0.761（標準差 0.0006）；
+壅塞相位滿足率 JFI 0.931/0.937/0.948（標準差 0.009）；壅塞相位 RTT 79.5/87.6/82.2 ms（CV 5%）；正常相位滿足率標準差 0.017。
+**平台重現性遠比預期好**：之前引用的「~10%」完全不適用。只有 3 次，標準差估計本身不精確，但吞吐量／滿足率的差距
+超過約 1～2% 就已明顯大於雜訊；RTT 與滿足率 JFI 雜訊較大，需要差距 >~10 ms／>~0.02 才下結論。
+
+## 2026-10-01 續四十六：混合通道壅塞試驗（場景 P）——頻域上限無效、時域遮罩有效
+
+`/home/lindor/pilot_p_20260930/`（`run.sh` 頻域、`run_mask.sh` 時域；各組 `measure_*/analysis.txt`）。場景 P 固定配置：每 branch 一個混合節點
+（好 UE L=22 需求 22、壞 UE L=24 需求 6）＋一個輕節點（2×需求 1）。兩組都讓 12 個 xApp 照跑，只差回傳的控制。
+- **PF（XAPP_MODE=shadow）**：TCP 平均 4.91（總約 78.6）、UDP 4.72；好 UE 滿足率約 0.53、壞 UE 約 0.96。離線模型預測準（74.4／0.847）。
+- **頻域上限（壞 UE 限 0.3 檔）**：TCP 4.42（−10%）、UDP 4.23（−10%）。**原因（shadow 的逐秒 RB＋DU MAC 統計）**：每個 UE 每秒最多約 430 次傳輸
+  （約 2/3 的下行 slot；OAI 短 PUCCH 每 occasion 最多 2 個 ACK 位元，`nr_acknack_scheduling`）。限制壞 UE 後它仍每個 slot 都搶排程，
+  好 UE 每次只拿到 74 RB 並撞到自己的次數上限，壞 UE 少用的 RB 閒置。**頻域上限在這個平台上無法重新分配資源**（舊版 DRL 贏不了 PF 的可能根因）。
+- **逐 slot 模擬器**（`/home/lindor/pf16_run_20260930/slotsim/`，仿 `pf_dl`＋每 UE 每 TDD 週期 5.3 次 ACK 權杖＋slot%16 遮罩）：同時重現兩組實測（誤差約 10%），
+  掃描預測壞 UE 遮掉 9~12/16 時節點 +13%；遮罩樣式與 TDD 週期交互作用，同比例不同樣式效果差很多（均勻 8/16=0x5555 無效）。
+- **時域遮罩**（12 個 xapp_nodeN.c 改為讀 JSON 的 slot_mask；inference `RULE_KIND=mask`）：`0x9292`（留 6/16）TCP 兩次 5.12／5.11（**+4.3%／+4.1%**，
+  好 UE 0.53→約 0.67、壞 UE 0.96→約 0.6），UDP 正常節點約 +9%（節點層級）。實際增益約模型的 1/2.5：模型低估 PF 基準（16.4 vs 實測 17.5）。
+- **規則 bug**：第一版 MCS≤5 條件會因遮罩後壞 UE MCS 回升而震盪（約 25% 沒遮），改成「黏住」後又有新 bug——只加不刪，好 UE MCS 短暫低落時也被加入，
+  兩個 UE 都被遮。受影響：`0x9292` UDP 的 Node11（01:30:48 起）、`0x1111` TCP/UDP 的 Node5/9/11（全程）。只有 Node7 的 `0x1111` 有效：
+  TCP 好 0.75／壞 0.49（節點約 +11%）。`0x9292` TCP 兩次完全沒受影響。另 01:01 有一次 PC2 MT-7/MT-8 同時重啟（平台偶發，量測作廢重跑）。
+- 待辦：修規則（每節點最多遮一個、只遮 MCS 最低者），重跑 `0x1111` TCP/UDP 與 `0x9292` UDP。
+
+## 2026-10-01 續四十七：模擬器重新校準＋候選場景 TM（混合通道壅塞）
+
+- **校準**（MAC 層，混合節點平均，模擬 Mbps）：PF 實測 15.3／模擬 16.4；頻域 0.3 實測 14.0（−8.5%）／模擬 13.4（−18%）；
+  遮罩 0x9292 實測 16.1（+5%）／模擬 18.5（+13%）。方向與排序正確，但遮罩增益高估約 2.5 倍（好 UE 在讓出的 slot 用不到那麼多，
+  推測是 ACK 時機與 slot 位置有關，模擬器只用平均權杖近似）→ 用模擬器排序設計、預測增益 ×0.4 當實際預期。
+- **節點類型**（模擬，0x9292）：M22 +13%、M23 +15%、M18 +15%；N10（好 UE 需求 8、通道好）−20%、N22 −13%（不該遮）；輕節點 0%。
+- **候選場景 TM**（`traffic_scenario.py::scenario_tm_mixed`，`--scenario TM`，analyze_stage 已支援；T/TH 未改動）：正常相位＝T；
+  壅塞相位每 branch 一個主動節點＋一個輕節點，4 個 branch 中 3 個 M 類、1 個 N 類，全部依 phase_index 輪替。每個壅塞相位總需求 100~104。
+  模擬預測壅塞相位 PF 71.9、固定規則（低 MCS 就遮）76.7（+6.7%）、理想（只遮 M 類）78.8（+9.6%）→ 實際約 +2.7%／+4%，大於雜訊（約 0.5%）。
+- 已排程（無人值守）：`/home/lindor/pilot_p_20260930/run_mask2.sh`（修正規則後重跑 0x9292 UDP、0x1111 TCP/UDP，每輪自動核對遮罩）→
+  `/home/lindor/tm_pf_20261001/run.sh`（TM 的 PF 基準 TCP＋UDP，XAPP_MODE=shadow、tag=tm，順便收 PF-shadow 資料）。
+
+## 2026-10-01 續四十八：時域遮罩重跑（規則修正為每節點最多遮一個 UE）
+
+`/home/lindor/pilot_p_20260930/measure_p_mask{9292b_udp,1111b_tcp,1111b_udp}`。與 PF 組（p_pf_tcp 4.91／p_pf_udp 4.72）比較：
+| | TCP 平均 | UDP 平均 | 好 UE 滿足率 | 壞 UE 滿足率 | 平均滿足率 TCP／UDP |
+|---|---|---|---|---|---|
+| PF | 4.91 | 4.72 | 0.53 | 0.91~0.96 | 0.845／0.818 |
+| 0x9292 | 5.11~5.12（+4%，兩次） | 5.11（+8.3%） | 0.65~0.70 | 0.55~0.65 | 0.78~0.79／0.797 |
+| 0x1111 | **5.37（+9.4%）** | **5.30（+12.3%）** | 0.72~0.77 | 0.46~0.56 | 0.759／**0.817** |
+4 個混合節點方向一致。模擬器預測 0x9292 ≥ 0x1111，實測相反（平台數據優先）。**已知污染**：這幾輪的輕負載節點也被遮（閒置 UE 回報 MCS 0 被誤判，
+規則已修正、離線測試 8 項通過，尚未在平台跑）；輕負載 UE 需求只有 1，影響小（0x1111 TCP 的 UE7/8 0.83/0.81 vs PF 0.97/0.94），所以上表增益為低估。
+
+## 2026-10-01 續四十九：5 檔時域遮罩定案（平台實測）＋Critic 預訓練
+
+- **樣式檢驗**（`/home/lindor/pilot_p_20260930/measure_p_mask{ab98,0101}_tcp`，場景 P）。規則又發現一個誤判：流量剛開始時 OAI 鏈路調適從低 MCS 爬升
+  （輕負載 UE 前幾秒 MCS 1~5），被判成壞 UE → 輕負載節點仍被遮。已改為連續 10 秒符合條件才算（RULE_PERSIST_S，離線測試 10 項通過）。
+  因此各樣式一律比「混合節點合計」（不受輕節點誤遮影響；輕節點合計各輪 7.3~8.9、差異小）：
+  | 檔位 | 樣式 | 可用 | TCP 混合節點合計 | 好 UE／壞 UE 合計 | UDP 混合節點合計 |
+  |---|---|---|---|---|---|
+  | 0 | 0x0101 | 2/16 | 71.7（+3.0%） | 67.2／4.5 | — |
+  | 1 | 0x1111 | 4/16 | 77.7（+11.5%） | 65.7／12.0 | 77.3（+13.3%） |
+  | 2 | 0x9292 | 6/16 | 73.2（+5.1%） | 58.6／14.6 | 74.4（+9.0%） |
+  | 3 | 0xab98 | 8/16 | 73.9（+6.2%） | 55.7／18.2 | — |
+  | 4 | 0xFFFF | PF | 69.6 | 46.2／23.4 | 68.3 |
+  （頻域 0.3：TCP 62.2 −10.6%、UDP 60.2 −11.8%。）被限制 UE 的吞吐量隨檔位單調（4.5<12.0<14.6<18.2<23.4）→ 維持
+  `MASK_TIERS=(0x0101,0x1111,0x9292,0xab98,0xFFFF)`，每檔都有平台數據。效果與可用 slot 數不單調（ab98>9292），樣式只能實測決定。
+- **TM 的 PF 基準**（`/home/lindor/tm_pf_20261001/`）：TCP 壅塞送達 74／目標 102、滿足率 0.859（JFI 0.962）；UDP 76／102、0.912（0.970）；
+  正常相位全部送到。同時收到 TM 的 PF-shadow 資料（每節點約 2,650 筆，tag=tm）。
+- **Critic 預訓練**：`pretrain_critic.py` 改為可多個場景標籤訓練、並用時間切分保留集（TM 最後 20%，不參與訓練）評估外推——隨機保留集
+  與訓練集高度相關、會低估誤差。比較（解釋比例）：只用 tm → node1 66%／node5 52%／node11 78%；tm+t+th → 94%／98%／91%。
+  正式用 tm,t,th 訓練 12 個節點（寫入 iab-xapp-model-nodeN），時間外推解釋比例 84.1%（node6）～98.6%（node5）。
+
+## 2026-10-01 續五十：Local DRL v2（時域遮罩）訓練前準備完成
+
+- **冒煙測試**（`/home/lindor/drl_smoke_20261001/`，XAPP_MODE=active、DRL_TRAIN_ENABLED=0、TM 3 相位 TCP）：12 節點皆 DRL 模式、延遲警告合計 1 次、
+  Traceback/ERROR 0、無崩潰；檔位分布 PF 檔 78~82%（符合 PF_INIT_PROB=0.8）；checkpoint mtime 不變。遮罩到達 MAC 在 DRL 路徑是間接驗證
+  （JSON 格式同規則模式，規則模式已用 DU MAC 統計驗證）。
+- **訓練用場景 TMR**（`scenario_tm_random()`）與驅動器／watchdog 的 `tm` 家族；離線 2000 相位：壅塞總需求 88~120（平均 102）、跨主機決定式一致。
+- **端到端訓練試跑**（`/home/lindor/drl_e2e_20261001/`，TMR 驅動器＋watchdog、FL_MODE=none，25 分鐘）：每節點 270~280 步、每輪存檔、Traceback 0、
+  watchdog 無崩潰；Node5 critic_loss ~0.0007、PPO 裁剪 4~36%；檔位分布 PF 檔 80~87%（未塌縮）。**relay（Node1~4）壅塞樣本只有 2~4%、Actor 幾乎每輪跳過**
+  （子節點 MT 為 MCS 28、佇列很少超過 100 KB 門檻）——TM 下 relay 本來就沒什麼空間，論文需說明 relay 策略基本維持 PF；access 節點 5~30% 隨輪替變化。
+- 試跑後：12 個預訓練 checkpoint 從 `/home/lindor/drl_ckpt_pretrained_20261001/` 還原（sha256 一致），冒煙＋試跑的經驗全部刪除（MongoDB 經驗 0 筆）。
+- **正式訓練啟動方式**（Local DRL v2 單獨、FL_MODE=none、TM 家族）：依序重啟（XAPP_MODE=active REWARD_MODE=throughput_only MODEL_ARCH=mlp
+  DRL_TRAIN_ENABLED=1）→ `setup_iperf_servers.sh` → PC2/PC3 `training_scenario_driver.sh --host pcX --epoch $E --scenario-family tm` →
+  PC1 `training_watchdog.sh --epoch $E --reward-mode throughput_only --model-arch mlp --fl-mode none --scenario-family tm`。
+
+## 2026-10-01 續五十一：IAB 系統定義（SYSTEM_SPEC.md D1～D3、D5 拓樸）
+
+- **D1 out-of-band**：依論文庫中最相近的 OpenIAB（Moro et al., arXiv:2305.06048）與 Topcu et al.（OJCOMS 2025）定案。
+- **D2 backhaul 頻寬**：38 PRB 經使用者指正不是合法頻寬。離線模型（`/home/lindor/pf16_run_20260930/bh_model/d2.py`）：relay 51 PRB 時只有 UDP 在 branch 需求 ≥70 才出現 +19～25% 的 relay 層空間，TCP 一律 0%，且需求貼近平台 CPU 上限；改成建議維持 106。
+- **in-band 半雙工（方案 B）離線評估**（`inband.py`、`run_inband2.py`）：PF＋最佳固定切分為基準，逐相位調切分（排程仍是 PF）0～0.5%；聯合上限 TM +9.7～11.6%、T +4.9～7.3%，其中 relay 的切分貢獻 0%，access 的切分貢獻 TM +4.7%、T +1.3%；TM 壅塞相位 PF 吞吐量 78.2→69.0。B 不能讓 relay 有決策，不採用。
+- **relay 也帶 UE 的離線評估**（`relay_ue.py`、`relay_ue2.py`）：4 個 relay 都帶重負載時 donor（約 115 sim Mbps）先飽和、空間 ≈0；1～2 個 relay 帶混合通道 UE 時 relay 層 TCP +1.6～3.4%、UDP +2.7～9.9%，總量 99～112 已貼近 CPU 上限。使用者決定平台拓樸不變，論文第 3 章維持一般樹模型，實驗是其中一個實例（relay 的 agent 沒有競爭，照實揭露）。
+- **D3 拿掉 MT–DU 耦合代理**：三份 compose 的 DU 改 `--backhaul-mt-telnet-port 0`（不重編，已同步 PC2/PC3）；論文第 3 章刪除 Assumption「Backhaul-aware PRB budget」、Proposition（per-node throughput bound）與 Remark，改為 out-of-band 假設＋一般化的可用 PRB 比例 β（out-of-band 下恆為 1），新增兩筆文獻到 `reference.bib`。2026-10-01 以前的 PF 基準是在耦合開啟下量的，需重量。
+
+## 2026-10-01 續五十二：access 節點 F1-U 上行繞過 backhaul（找到並修正）＋relay 直連 UE 承載試驗
+
+- **發現**：閒置 RTT（牆鐘）relay MT（1 跳）75～78 ms、relay 直連 UE 與 access MT（2 跳）148～154 ms、access UE（3 跳）82～83 ms，3 跳比 2 跳快。
+- **根因**：access DU 的 `local_n_address` 是 internal bridge IP、`remote_n_address`＝`192.168.88.1`，compose 又加了 `192.168.88.1 via <bridge gw>`（2026-09 修 SCTP 不對稱路徑時加的），所以 DU 送往 CU 的封包全部經主機乙太網路直送 PC1。計數器驗證：UE2 ping 上行 123 KB，MT5／MT1 隧道 tx +0 KB（rx 正常）。relay DU 用 MT tunnel IP 當 F1 位址＋`from 12.1.1.x lookup 9999`，上行原本就經 relay MT（UE17 測試 MT1 tx +132 KB）。下行三段都有走（UE1 下行 8 MB，MT1／MT5／UE1 計數皆 +~8 MB）。
+- **推算**：每段上行無線約 70 ms 牆鐘（≈28 ms 模擬），每段下行數 ms；RTT 由上行段數主導。
+- **模擬時間換算（×S=0.4）**：relay MT 30～31 ms、relay 直連 UE／access MT 59～62 ms、access UE 修正前 33 ms → 修正後 87～94 ms。
+- **修正**：DU 端把送往 CU 的 UDP 打 fwmark 0x22 → table 222 經同節點 MT 的 bridge IP；MT 端從 bridge 介面進來的封包 → table 223 走 oaitun_ue1（既有 MASQUERADE 改來源為 MT tunnel IP）。CU 接受新來源的 GTP。F1-C 維持乙太網路。網卡名稱依 IP 找（Node6 DU、Node10～12 MT 的 bridge 在 eth1）。修正後 8 個 access 節點 RTT 217～235 ms、0% 掉包、MT 上行計數正確增加；UE1 TCP 下行 24.3 Mbps 牆鐘（未修節點 26.0）。2026-10-01 以前所有 RTT 與 TCP 結果都在繞路下量得。
+- **backhaul 預算確認關閉**：12 個 DU log 都沒有輪詢執行緒啟動訊息；所有 DU 模擬速度精確 0.400。
+- **relay 直連 UE（UE17～24，PC1，profile relay-ue）**：8 個都能附著、0% 掉包；PC1 閒置 86%（無流量時）。單 UE 對照（修正前，L10 TCP／L22 UDP／L22 TCP）：UE17 80.1／17.0／16.7 vs UE9 74.4／16.8／16.5 sim Mbps，差距 ≤8%。
+
+## 2026-10-01 續五十三：relay 直連 UE 全負載時 relay DU 被拖慢（根因：PC1 網卡）→ `-E`＋S=0.3
+
+- **現象**：24 UE 全負載 UDP（TM 壅塞相位 pi=2＋Node1/2 的 relay UE 為 L22 需求 18／L24 需求 6），relay UE 只拿到模型的一半（UE17 5.2 vs 12.35 sim Mbps），access UE 吻合（差 <7%）。只開 Node1 一支分支時 UE17 有 9.9～10.1。
+- **排除**：CCE 失敗每秒 0～3 次（不是 PDCCH）；PUCCH 為每子節點專用資源，每子節點上限 = 每 TDD 週期 2 UL slot × 2 ACK 位元 ≈ 320 tx/牆鐘秒（access DU8 兩 UE 291／320 即頂到）；relay DU1 四個子節點都未達上限卻只用 79% 的 DL slot；資料路徑經 UPF 正確；log 無逾時警告。
+- **根因**：全負載下 relay DU1/DU2 模擬速度掉到 **0.20**（DU3 0.40、DU4 0.376、donor/access 0.40）。rfsim 把 DU 下行波形送給所有子節點，relay DU 忙時送往跨主機 access MT 的 IQ 每條約 0.6 Gbps（一支忙碌分支 PC1 網卡 tx +1.19 Gbps：閒置 0.16 → 1.35）；兩支即達 PC1 USB 2.5G 網卡實際上限約 2.1 Gbps，網卡中斷核心 cpu9 軟中斷 70%、閒置 12%；rfsim 鎖步使 relay DU 變慢。（另：UDP -R 的 iperf server 在 client 被殺後仍送滿原定 300 秒，量「閒置」前必須先重啟 server。）
+- **解法**：所有 softmodem 加 `-E`（3/4 取樣率 46.08 Msps；access 合計 65.2→65.9，吞吐量不受影響）＋S 由 0.4 改 0.3（使用者決定）。結果：全負載所有 DU 精確 0.300、PC1 網卡 1.83 Gbps、cpu9 閒置 37%、三台 CPU 最低閒置 58／74／69%；relay UE 合計 17.7→32.4（模型 33.6）、全部 82.9→98.1（模型 103.2），各 UE 為模型的 92～100%，離線模型對 relay 層的預測可信。只加 `-E`（S=0.4）時 relay DU 0.30～0.33，不足。
+- **影響**：所有以牆鐘量的值換算改用 S=0.3；xApp 1 秒牆鐘週期＝0.3 秒模擬；每筆 state 的 bsr（每牆鐘秒位元組）比 S=0.4 時少 25%，MAX_BSR 未改；Critic 預訓練資料（S=0.4、無 `-E`、有 backhaul 預算、F1-U 繞路）需重收。TCP 全負載測試已重跑（S=0.3＋`-E`，先重啟 iperf server）：24 UE 皆有資料，relay DU 皆 0.300，CPU 最低閒置 56／72／71%；relay UE 合計 32.4（模型 33.8）、access 72.2（78.2）、全部 104.6（112.0）；好通道高需求 UE 低於模型較多（UE8 9.1 vs 12.1、UE9 11.7 vs 15.0），推測為上行修正後 RTT 變長的 TCP 效應。
+
+## 2026-10-01 續五十四：relay 直連 UE（UE17~24）正式併入啟動、量測與訓練工具
+
+- **啟動**：新增 `iab/start_relay_ues.sh`（依序啟動、tunnel 路由、ping 驗證、重新斷言路由／重啟容器最多 5 輪，失敗時印「重試 5 次後仍有 UE 連不通」）；由 `run_local_pc1.sh` Step 2.5 在 13/13 E2 之後呼叫，使 relay DU 上 MT=ue_id 0,1、UE=2,3。`start_iab_server.sh` 開頭的 `down` 加 `--profile relay-ue`。`RELAY_UES=0` 可回到 16 UE。
+- **場景**：`traffic_scenario.py` 的 `NODE_CONFIG` relay 節點加入 UE17~24、iperf port 擴到 5224；新增 `scenario_configs()`（access UE→原場景函數、relay UE→`relay_ue_configs()`），場景執行與 `analyze_stage.py` 共用。relay UE 角色未定義前一律閒置、下行 L=10。回歸：pc2/pc3 在 8 個場景 × 43 個相位共 688 組配置與原函數完全相同。PC1 只有 relay UE 時補印相位狀態 log。A/B/C/D 只控制 access UE。順手修正：有限相位量測原本只有 T/TR/R 在崩潰時中止，TH/TM/TMH/P 只警告，改為一律中止。
+- **量測／分析**：`analyze_stage.py` 原本把 S 寫死 0.4（S 改 0.3 後會換算錯誤），改讀本機速度檔（`ANALYZE_S` 可覆寫）；讀有檔案的主機（含 pc1）；目標 0 的 UE-相位不納入。回歸：以 `ANALYZE_S=0.4` 重算 16 UE PF 的 T、TH，數字與記錄完全一致（T 0.762／0.9314、TH 0.796／0.9394）；10-01 的 TM PF 重算為 0.723（記錄 0.859），因為那次量測用的是修正前的不對稱 TM，該基準本來就判定無效。`precheck_measure.sh` 改為 24 UE、24 個 iperf server，並新增三台 S 一致檢查；`run_stage_measure.sh` 在 PC1 本機同時跑場景與取樣。
+- **訓練**：`training_watchdog.sh` 加 `on_host`（pc1 本機、其他 ssh）與各主機 UE 範圍；UE 重啟偵測、就地修復、同主機多 UE 劣化檢查、最終驗證、iperf server 數、場景驅動器啟停都涵蓋 PC1。
+- **實測**：`start_relay_ues.sh` 8/8 連通；precheck PASS（24/24 UE、24 port、S 三台 0.3）；T 場景 2 相位 TCP 端到端量測三台 SCN/MEAS 皆 exit 0，PC1 CrashGuard 監控 16 個容器，分析自動使用 S=0.3；watchdog 對 UE24 容器重啟在下一輪輪詢偵測、16 秒內就地修復完成。
+
+## 2026-10-01 續五十五：relay 層改進空間（離線掃描＋平台試驗 PU／PB）
+
+- **離線掃描**（`/home/lindor/pf16_run_20260930/bh_model/relay_scan{,2}.py`，單一 branch 承受壓力、其他輕負載、全網需求 ≤100）：來源 A（relay 自己 UE 之間，遮壞 UE）上限 TCP +7.5／UDP +8.7 sim Mbps，需要 access 子節點有流量；來源 B（backhaul 與 relay 自己 UE 的取捨）上限 TCP +12.4／UDP +14.3，只在下游需求超過 relay DU 用 PF 分給該 MT 的份額（約 29 Mbps）時出現。
+- **平台試驗**（`/home/lindor/relay_pilot_20261001/`，S=0.3＋-E，XAPP_MODE=rule、RULE_MAX_MASKED=2、RULE_BAD_MCS=7，遮罩以容器內 /tmp/rule_mask 切換，各 4 相位）。第一次 RULE_BAD_MCS=5 無效：L24 UE 的 MCS 在 3~7 循環，「連續 10 秒 MCS≤5」從未成立（MongoDB 1500 筆決策 0 筆遮罩），改 7 後乾淨重啟重跑。UE18（L24）跑試驗時曾因 OAI UE 端 RRCReject→assertion 崩潰，試驗腳本加入每組量測前修復 24 UE、無效重跑一次。
+- **PU**（relay：L18 需 22＋L24 需 4；Node5/6 各 2×L10 需 12；總需求 86）：PF 與模型幾乎一致（UE17 11.57 vs 11.65）。全網 TCP：PF 75.12／1111 74.90／9292 75.63（持平）；UDP：74.34／76.64（+3.1%）／76.03（+2.3%）。實際只有模型上限約 1/3：relay DU 每個 slot 幾乎只排一個子節點（每子節點約 120~130 次/秒，合計約 1 次/DL slot），兩個 MT 固定佔掉一半 slot，遮壞 UE 只讓出它那一份。模型以 RB 流體分配，高估。
+- **PB**（relay：2×L24 需 8；Node5 2×L10 需 12、Node6 2×L10 需 22；總需求 96）：PF 與模型一致（Node6 UE 16.4/15.0 vs 15.15，受 relay DU 分給 MT6 的 slot 限制）。全網 TCP：PF 73.68／1111 **84.39（+14.5%）**／9292 **83.61（+13.5%）**，Node6 兩個 UE 吃滿 22，relay UE 合計 6.14→2.99／3.67；relay DU 給 MT6 的傳輸次數 126→210 次/秒。UDP：67.02／71.62（+6.9%）／72.14（+7.6%）。TCP 實現了模型上限（+12.4）的約 86%。
+- **結論**：relay 層有價值的決策是 backhaul 與 relay 自己 UE 的取捨（B），且只在下游需求大時才該介入；A 類空間小。E2 回報的子節點順序為附著順序（node1 的 MongoDB 紀錄前兩個 RNTI 為 MCS 28 的 MT）。
+
+### 2026-10-01（續五十六）換拓樸後清空舊資料、啟動整晚 Local DRL v2 流程
+- 使用者授權：拓樸改為 24 UE、state 改為 69 維，舊 checkpoint 與經驗作廢。已刪除 12 個 volume 內的 53 維 `model_nodeN.pt`，並 drop `node{1..12}_pf_shadow`（每節點約 4 萬筆，16 UE 時期的 tm/t/th 資料）；`nodeN_experiences` 本來就是空的。主機備份 `/home/lindor/drl_ckpt_pretrained_20261001/`（舊 53 維）未動。
+- 整晚流程 `/home/lindor/drl_v2_hs_20261001/run.sh`：shadow 乾淨重啟 → hs 家族 PF-shadow 收集 75 分鐘（tag `hs_train`）→ 12 節點 Critic 預訓練（時間保留 20%，備份到 `/home/lindor/drl_ckpt_pretrained_hs_20261001/`）→ PF 基準 HS TCP＋UDP（seed 20260930）→ active 乾淨重啟，FL_MODE=none 單獨訓練＋watchdog（hs 家族）。
+- 使用者改順序（21:29）：中止 PF-shadow 收集，改為先量 PF 基準 HS→G→HSH（各 TCP＋UDP，seed 20260930），再刪除全部 shadow 資料後重收 hs 家族 75 分鐘、預訓練 Critic、active 訓練；流程 `/home/lindor/drl_v2_hs_20261001/run2.sh`。學習曲線每 20 分鐘由 `iab/learning_curve.py` 取樣（凍結 PF 預訓練 Critic 當參考：壅塞樣本 r−V_PF(s)、介入比例、step、熵），寫入 `learning_curve.csv`。
+- D6／D7 定案：HS／HSH 雙軌（G 泛化）；分軌驗收（Stage 3 在 HSH 必須贏、HS 不輸；Stage 2、4 兩軌都必須贏）。寫入 CLAUDE.md §3／§8、SYSTEM_SPEC §8.1／§11。
+- 刪除舊拓樸（16 UE）PF 量測資料：`/home/lindor/pf16_run_20260930/` 除 `bh_model/` 外全部、`/home/lindor/tm_pf_20261001/`、`PF.md` 16 UE 內容（git 歷史可找回）。16 UE PF 摘要：T 壅塞滿足率 0.762、TH 0.796；雜訊 CV 0.4%（續四十五）。
+
+### 2026-10-02（續五十七）Local DRL v2 單獨訓練（HS 軌）與凍結評估
+- 訓練 02:13～09:01（約 6 h 48 min、step≈3,800，FL_MODE=none、hs 家族）；FlexRIC 崩潰 2 次（05:19、08:38），watchdog 完整重啟、保留資料。學習曲線（凍結 PF Critic 估計）20 點中 18 點在 PF 之上，約 2 小時後在 +5～+15% 間震盪；介入 18%→5～7%、熵 0.63→0.25；relay 節點遮 MT 與遮 UE 比例相近（未學會分辨）。詳見 `LOCAL_DRL_V2_DESIGN.md` §9。凍結 checkpoint：`/home/lindor/drl_ckpt_local_v2_hs_frozen_20261002/`。
+- **argmax 評估等於 PF**：`DRL_DETERMINISTIC=1` 時 12 節點所有 UE 一律選全開檔（策略在每 UE 上全開機率仍約 90%，訓練期增益來自隨機的少量遮罩）。該次 HS TCP 實為第二次 PF 量測：壅塞總送達 83 對 PF 基準 89（−6.7%）、滿足率 0.784 對 0.823 → 24 UE／HS 單次量測間差異可達數 %，遠大於 16 UE／T 時期的 CV 0.4%，需重新估雜訊。使用者決定改用隨機採樣（`DRL_DETERMINISTIC=0`、`DRL_TRAIN_ENABLED=0`）重量 HS／G × TCP／UDP。
+- **學習曲線偏差驗證**：學習曲線指標（壅塞樣本 r−V_PF(s) 相對 V_PF）套到純 PF 控制（argmax 評估期間）得 +11.3%、隨機採樣 HS TCP 評估期間 +11.9%（實測總送達 = PF）、訓練後段 +7.3% → 訓練期的 +5～15% 是凍結 PF Critic 的系統性低估，不是策略優於 PF。凍結評估（隨機採樣）HS TCP、UDP 皆與 PF 持平（總送達 89/89、86/86）。
+- 凍結評估（隨機採樣）完成：HS TCP 89/89、HS UDP 86/86、G TCP 98/97、G UDP 見 LocalDRLv2.md；全部持平，HS 未達「須贏 PF」。評估中 relay 直連 UE 崩潰 2 次（UE21、UE23），各重量一次。
+- **第 0 步（動態規則 `RULE_KIND=dyn` 在 HS TCP）第一次無效**：PB 試驗遺留 `/tmp/rule_mask`（內容 ffff，inference 容器掛載主機 /tmp、每 5 秒重讀）蓋過 `RULE_MASK`，規則有判定要遮（離線重播 Node4 遮 238 秒）但送出全開 → 該次實為 PF 重複量測。已刪檔重量。
+- **24 UE／HS TCP 的 PF 雜訊（同為 PF 控制的三次量測）**：壅塞總送達 89／83／86、壅塞滿足率 0.823／0.784／0.748、滿足率 JFI 0.918／0.896／0.860。單次量測間差異約 ±4%（送達）、±5%（滿足率），遠大於 16 UE／T 的 CV 0.4%；比較策略須多次量測或用更長量測。
+- **HS 修正（2026-10-02 14:05）**：①混合節點好 UE 改回 L3/L10（MCS≈28，P／TM 驗證過），原本 L18/22 與壞 UE 只差 0～9 MCS；②每個壅塞相位 2 個混合 branch（第一個一律 M 類、第二個 50% N 類），背景 branch 只剩 0 個；③熱點需求下修（極重 12～18、次重 8～12）、混合好 UE 14～20，壅塞總需求平均維持≈112。HS／HSH 舊 PF 基準作廢。平台驗證：PF 與動態規則在 seed 1001、1002 各量 HS TCP（`/home/lindor/hs_verify_20261002/`）。
+- **HS 第二版驗證未通過、查證原因（15:33）**：規則 seed1001 送達 92 對 PF 98。逐秒狀態：混合節點好 UE（L3）在 PF 下佇列為 0（需求已被滿足），積壓的是壞 UE；4 個 relay 的 MT 佇列幾乎為 0（backhaul 不是瓶頸）。另更正：我先前說「好 UE L3/L10 是 P／TM 驗證過的設定」是記錯——P 實際是好 UE L22 需求 22、壞 UE L24 需求 6（+4%，4 個混合節點）。
+- **動態規則在 PB 有效（15:48）**：PB 4 相位 TCP，規則（dyn）壅塞送達 83 對 PF 74（+12%），只在 relay Node1 遮 269 秒；與 10-01 黏住規則 84.4 一致。
+- **HS 第三版（PB 結構）**：每個壅塞相位一個熱點 branch 採 PB 實測配置（relay 直連 UE L24 需求 6～10，80%；否則 L10 不該遮）、下游極重節點 2×L10 需求 18～24、中等節點 2×L10 需求 10～14，其他 branch 輕負載；混合 access 結構移除。壅塞總需求平均 93.7（PB 96）。HSH 熱點分布 [26%,54%,9%,12%]。驗證：`/home/lindor/hs_verify2_20261002/`。
+- **HS 第三版（PB 結構）平台驗證通過（17:32）**：HS TCP 壅塞總送達 PF 70／69、動態規則 79／78（seed 1001／1002），規則 +12.9%（門檻 5%）。seed 1001 滿足率 0.717→0.809、滿足率 JFI 0.840→0.903；seed 1002 滿足率 0.705→0.715。增益來自熱點 relay 下游 access UE（例 UE7/8 6.3→8.5），被遮的 relay 邊緣 UE 各少 0.1～0.5。三台容器重啟 0。v2.1 準備流程自動接續（`/home/lindor/v21_prep_20261002/`）。
+- 規則資料收集期間 UE16（PC3）18:49 崩潰、路由未恢復約 10 分鐘；Node12 該時段資料改標籤 hs_rule_train_ue16down（不刪除，不參與預訓練）。Node5 在 G 時段有 6 筆 access 層遮罩決策（規則真實行為，保留）。
+- **防止測試 seed 洩漏**：容器的 PF_SHADOW_SCENARIO_TAG 在重啟時固定（hs_rule_train），規則參照量測（seed 20260930）期間的資料也會帶訓練標籤；準備流程在預訓練前把 18:59:02（收集結束）之後的資料改標籤 hs_rule_eval_period，不參與預訓練。
+- **v2.1 預訓練（19:44～19:49）結果**：relay Node1～4「規則遮的 UE＝候選排序」96／91／98／93%；BC 時間保留集決策點一致率 73.8／75.0／57.9／—（Node4 保留段無熱點）；Critic 解釋比例 relay 80～95%、access 69～95%，Node9 −96%。
+  - **決策點 BC 錯誤分析**：Node1 27/27、Node2 13/13、Node3 15/24 的錯誤落在規則開始／解除前後 3 秒內（規則有 3 秒啟動延遲與 5 秒遲滯，當下 state 無法分辨），主要是 (規則遮兩個→預測不遮)；Node3 另有 11 筆 (規則遮一個→預測遮兩個)。屬時序不可辨的上限，非 BC 沒學好。
+  - **Node9 Critic**：保留段 reward 平均 0.039 低於訓練段 0.055，Critic 平均高估（0.066）→ 時間分布偏移；重跑一次解釋比例約 +3%（−96% 為該次隨機初始化較差）。Node9 是 access 節點、無決策點，Critic 不影響 Actor 更新；存檔的 Critic 用全部資料訓練、線上也會更新，不另處理。
+  - 改標籤（19:44:51）到乾淨重啟（約 19:49）之間，容器仍以 hs_rule_train 寫入約 4 分鐘閒置資料（場景已停，非測試 seed 流量），約佔每節點 5%，含在本次預訓練中，影響可忽略。
+- **HS／HSH 新 PF 基準與規則參照（seed 20260930，TCP）**：HS 壅塞送達 PF 70、規則 77（+10.0%）；HSH PF 73、規則 81（+11.0%）。滿足率持平、滿足率 JFI 略低。寫入 `PF.md`。
+- **v2.1 BC 初始模型冒煙量測（21:21，HS TCP，seed 20260930，不訓練、隨機採樣）**：壅塞送達 **81**（PF 70、規則 77），+15.7% 對 PF；滿足率 0.781、滿足率 JFI 0.860。介入集中在熱點 relay（Node2／4 約 28～32% 的秒數），access 節點 5～9%（標籤平滑 0.1 造成的探索雜訊）。BC 初始化確實重現規則的增益 → **可以開始 Local DRL v2.1 訓練**。checkpoint：`/home/lindor/drl_ckpt_v21_bc_20261002/`。
+- **v2.1 單獨訓練啟動（21:41，`/home/lindor/v21_train_20261002/`）**：HS 軌（hs 訓練家族、FL_MODE=none），從 BC checkpoint 開始。舊 `nodeN_experiences`（v2 訓練＋冒煙測試 seed 資料）改名 `nodeN_experiences_archive_localdrl_v2` 封存，訓練從空集合開始。新增訓練暫停開關（主機 `/tmp/drl_pause`：不跑訓練回合、不寫 RL 經驗），學習曲線改為每 2 小時暫停並實測 HS TCP（seed 20260930），checkpoint 備份到 `/home/lindor/drl_ckpt_v21_train_20261002/h{2,4,...}`，結果寫 `learning_curve.md`。HSH 軌尚未訓練，不量 HSH。
+- **v2.1 訓練兩個修正（22:20～22:50）**：①`training_pipeline._PROJECTION` 漏讀 `macro_action`，21:58 起所有訓練回合讀到 0 筆有效經驗（未學習；離線測試直接餵經驗、沒走這條讀取路徑）；②Actor 批次原本從隨機 128 筆經驗中篩決策點，決策點只佔 3～7%，多數輪次 <8 筆而跳過（v2 學不起來的原因之一）→ 改為 Actor 批次只從全部讀到的經驗中的決策點抽（最多 128 筆），Critic 批次不變；實測 relay 每批 103～124 筆、每步都更新。兩者皆熱修進 12 個 inference 容器（docker cp＋restart，保留環境變數與 checkpoint）並重建映像。期間收的 BC 策略經驗保留使用。
+- **v2.1 第三個修正：非決策點漂移（23:05～23:45）**：Actor 只在決策點以 RL 更新，但共用網路使非決策點的輸出跟著漂移（訓練約 30 分鐘後 Node5 介入 553 次、僅 14 次在 starved 狀態，63% 遮的是 MCS 與最好 UE 相差 <5 的 UE；Node2 573 次僅 13 次在 starved）。修正：①決策點＝有可行遮罩動作且（好通道 UE 積壓 或 已有 UE 被遮），非決策點一律不介入、不存 behavior_logp；②遮罩動作只在被遮候選 MCS ≤ 最好 UE − 10 時有效（`DRL_MACRO_MIN_GAP`）。暫停訓練、把 22:50 起的經驗改名封存 `nodeN_experiences_archive_v21_pregate`，用新程式重做 BC／Critic 預訓練（relay 決策點保留集一致率 67～78%），checkpoint 備份 `/home/lindor/drl_ckpt_v21_bc_gate_20261002/`，23:45 恢復訓練（經驗從空開始）。
+- **正式評估排程（02:30）**：`/home/lindor/v21_eval_20261003/run.sh` 等第 6 小時學習曲線實測後自動判斷（HS 送達 ≥77、不比 h2/h4 低超過 4、relay 熵 >0.05），通過則停訓練、凍結 checkpoint（`/home/lindor/drl_ckpt_v21_final_20261003/`）並量 DRL HS TCP×2、G TCP×1，再量 PF HS TCP×1（使用者：開發階段只量 TCP）；不通過則停在 CRITERIA_FAIL 等檢查。
+- 正式評估條件的熵門檻由 0.05 放寬為 0.02（03:40；Node1 熵 0.069 持續下降，評估採隨機採樣、低熵本身不代表失敗，真正判準是實測吞吐量）。
+
+### 2026-10-03（續五十八）Local DRL v2.1 單獨訓練（HS 軌）與正式凍結評估（TCP）
+- 訓練：10-02 23:28～10-03 05:15（閘門版，relay 約 2,430 步）；FlexRIC 崩潰 2 次（01:04、04:28）、UE 崩潰數次，watchdog 皆自動恢復、保留資料。學習曲線（HS TCP 壅塞送達，PF 70）：BC 起點 81 → 2 h 81 → 4 h 79 → 6 h 80，訓練維持 BC 水準、未再提升；relay 在決策點約 90% 介入、以「兩個邊緣 UE 都重遮」為主；熵 0.09～0.25。
+- 正式評估（seed 20260930，`DRL_TRAIN_ENABLED=0 DRL_DETERMINISTIC=0`，`/home/lindor/v21_eval_20261003/`）：HS TCP 壅塞總送達 DRL 80／80 對 PF 70／69（**+15.1%**）；壅塞滿足率 0.762 對 0.784（−2.8%）、滿足率 JFI 0.848 對 0.899（−5.6%）、壅塞 RTT 83.9 對 71.5 ms（+17%）。動態規則參照 77。G TCP：96 對 97、滿足率 0.867 對 0.876（不傷害）。寫入 `experiment_results/LocalDRLv2.md`（舊 v2 評估移至附錄）。
+- 判讀：吞吐量明顯贏 PF；滿足率與 RTT 沒有贏（增益集中在熱點 relay 下游高需求 UE，被遮的 relay 邊緣 UE 吃虧、佇列變長）。依 CLAUDE.md §3 驗收規則（吞吐量與滿足率都要贏）尚未完全達標；與規則相當，RL 訓練未超越 BC。
+- 更正：10-03 06:28 回報「RTT 比 PF 低約 12%」比較對象錯誤（用了舊版 HS 的 PF RTT 87.0）；同條件 PF 為 71.1／72.0 ms，DRL RTT 較高。
+
+### 2026-10-03（續五十九）access 層決策試驗（場景 PA）
+- 目的：論文定位改為「Local DRL 用文獻既有方法、貢獻在 Global FL」後，access 節點也必須有決策可學（HS 第三版只有 relay 有）。新增固定試驗場景 PA（`RELAY_PILOT_CFGS["PA"]`）：Node5／9＝M 類（好 UE L22 需求 22＋壞 UE L24 需求 6）、Node7／11＝N 類（好 UE L22 需求 8＋壞 UE L24 需求 6），其他 access UE 輕負載、relay UE 閒置。`/home/lindor/access_pilot_20261003/`，XAPP_MODE=rule、RULE_KIND=mask、每節點最多遮 1 個、MCS≤7 且落差≥3 持續 10 秒；PF＝遮罩 ffff；PF→遮→PF→遮，各 4 相位 TCP，4 組皆有效、容器重啟 0。
+- 結果（模擬 Mbps，節點合計，兩輪）：M 類 PF 17.4／16.7 → 遮 0x1111 19.5／18.7（+12.0%、+11.9%），第二輪 +12.8%、+13.6%；N 類 PF 14.3／13.5 → 遮 10.7／11.2（−25.2%、−17.1%），第二輪 −23.2%、−20.8%。PF 兩輪節點合計差 <1%。4 個混合節點合計：PF 61.9／62.0、全遮 −3.0%／−2.6%、只遮 M（M 取遮罩組＋N 取 PF 組）+6.6%／+7.3%。輕節點從未被遮。
+- 可觀測狀態（PF 下中位數）：L22 好 UE MCS 8、L24 壞 UE MCS 3（M 與 N 相同）；好 UE RLC 佇列 M 類 1.5～2.0 MB、N 類 7～12 KB → 該不該遮只能靠佇列分辨，不能只看 MCS。現行動態規則與 v2.1 閘門要求好 UE MCS≥20、落差≥10（依 relay 的 MT 調的），在 access 層永遠不成立，是 access 節點「沒有決策」的部分原因。
+- 結論：access 層存在依狀態而定的決策（M 該遮、N 不該遮），固定的「看到壞 UE 就遮」規則在 N 類吃虧。下一步：HS 第四版加入 access M／N 節點並在平台驗證。
+
+### 2026-10-03（續六十）HS 第四版（PB 熱點＋混合 access 節點）平台驗證
+- 場景：每個壅塞相位＝第三版的 PB 熱點 branch（逐值相同）＋另一個 branch 的一個混合 access 節點（M 類 60%：好 UE L22 需求 20～24＋壞 UE L24 需求 5～7；N 類 40%：好 UE 需求 7～9）。壅塞總需求平均 94→115（同 G）。
+- 動態規則加 access 判定（`RULE_DYN_GAP`，預設 0＝原行為）：只認通道最好（與節點最高 MCS 差 ≤2）的積壓 UE（MCS≥`RULE_DYN_GOOD_MCS`=6）、壞 UE 須低 ≥4。用已記錄狀態重播：relay 遮罩決策與舊規則幾乎相同；PA 的 M 類會遮、N 類 0.5%、輕節點 0。
+- 快速版量測（使用者決定）：`--congested-only`（`CONGESTED_ONLY=1`，只跑 5 個壅塞相位、log 印對應後的 phase_index）；PF＝規則模式＋/tmp/rule_mask=ffff（不重啟）。`/home/lindor/hs4_verify_20261003/`（逐相位節點分析 `node_phase.py`）。
+- 結果（HS TCP 壅塞相位）：seed 1001 規則 87 對 PF 82（+6.1%）、滿足率 0.790 對 0.761、JFI 0.887 對 0.878；seed 1002 88 對 81（+8.6%）、0.775 對 0.744、0.859 對 0.857 → 平均 +7.3%，通過（門檻 5%）。增益小於第三版（+12.9%），總需求接近 donor 上限。RTT 規則 87.6／78.4 對 PF 75.4／73.4。
+- 節點層級：熱點 branch 10 個相位中 8 個規則明顯較高（例 56.2→69.9）；relay 實際只遮相位的 40～55%（3 秒啟動、5 秒遲滯）。混合節點：兩個 seed 恰好只抽到 1 個 M 類相位（10 個中；離線 4000 相位 M 類比例 0.60，seed 20260930 為 6/10，屬抽樣運氣），該相位 Node12 15.6→21.2（+36%）；N 類規則多數不遮，但有 3 個相位誤遮 8～15 秒。
+
+### 2026-10-03（續六十一）α-fair reward 的遮罩強度掃描（場景 SW1／SW2）
+- 目的：v3 reward＝子樹 α-fair 效用；α=0 學成「全力遮」、α=1 學成 PF，要找最佳遮罩隨狀態改變的 α。`/home/lindor/sigma_sweep_20261003/`（`analyze_sweep.py`）：SW1＝relay 邊緣 UE 需求 4＋access 好 UE 需求 22；SW2＝relay 邊緣 UE 10＋access 好 UE 14（其餘同 PB＋一個混合 access 節點）；RULE_KIND=mask 固定遮罩 ffff／ab98／9292／1111／0101 各 4 相位 TCP，10 組皆有效。
+- 各 α 的最佳遮罩（括號＝相對 PF 的子樹效用增益）：α=0：relay SW1 9292(+4.8%)／SW2 0101(+10.6%)、access SW1 1111(+13.7%)／SW2 9292(+5.4%)；α=0.3：relay 9292(+1.7%)／ab98(+4.2%)、access 1111(+5.2%)／ab98(+0.7%)；α=0.4：relay 9292(+0.9%)／ab98(+3.1%)、access 1111(+3.1%)／PF；α=0.5：relay 9292(+0.2%)／ab98(+2.1%)、access ab98(+1.6%)／PF；α≥0.6 relay SW1 與 access SW2 皆 PF；α=1 全部 PF。
+- 8 個相關 UE 合計（模擬 Mbps）／平均滿足率：SW1 PF 75.8／0.780、固定 0x1111 77.7／0.657、α=0.3～0.4 最佳 81.0／0.716、α=0.5 79.9／0.727；SW2 PF 73.8／0.694、固定 0x1111 76.5／0.641、α=0 最佳 80.7／0.678、α=0.3 79.2／0.699、α=0.4～0.5 78.5／0.712。依狀態選強度的策略在吞吐量與滿足率都勝過固定 0x1111（規則式）；滿足率 SW2 略勝 PF、SW1 低於 PF（relay 邊緣 UE 需求 4 在 PF 下已大半滿足）。
+- 單次量測，α=0.5 的增益（0～2%）接近雜訊；α=0.3～0.4 兩層最佳強度都隨需求改變且增益較大。
+
+### 2026-10-03（續六十二）v3 冒煙測試與推論延遲修正
+- 參照基準（HS TCP、seed 20260930、只跑壅塞相位）：PF 壅塞送達 82／112、滿足率 0.718、JFI 0.831；動態規則 86（+4.9%）、0.764、0.871。v2.1 checkpoint 改名 model_nodeN.v21.pt、經驗改名 nodeN_experiences_archive_v21_train。
+- v3 冒煙測試（14:42～14:57，α=0.5 暫定、從零開始）：設定生效、relay 子樹 reward 對齊正常、Actor 有更新、無程式錯誤；初始策略 85.4% 全開、MT 被遮 2.7%（符合設計）。資料改名 nodeN_experiences_smoke_v3、model_nodeN.smoke_v3.pt。策略診斷工具漏算 S slot 7（把全開歸到輕遮），已修正。
+- 推論延遲：有訓練 15 分鐘 >5 ms 120 次、ZMQ 逾時 175 次（約 1.6% 決策退回 PF）；暫停訓練對照 47／81 次（約 0.75%）。根因：訓練每次梯度更新都持有 _model_lock，訓練執行緒放鎖後立即再取得，推論被擋住整輪（離線基準：3 輪×30 次更新期間推論只搶到 1 次、360 ms）。修正：影子模型訓練（複本上訓練、只在複製與換回權重時短暫持鎖，訓練期間若 FL 熱重載則本輪作廢）＋訓練執行緒 nice 15（`TRAIN_THREAD_NICE`）。離線基準改善為推論中位數 0.4 ms、最大 3.4 ms。平台驗證待訓練前檢查。
+
+### 2026-10-03（續六十三）遮罩位置敏感度分析（場景 SW3，快速版）
+- SW3＝relay 邊緣 UE 需求 10＋access 好 UE 需求 22；RULE_KIND=mask 固定遮罩，各 2 相位 TCP（使用者要求縮短，量 5 組即停，未量 0x9292／0xab98／0x2411）。`/home/lindor/mask_pos_20261003/`（`analyze_pos.py`）。
+- 同為 4 個 DL slot（不含 S）的不同位置，子樹合計（模擬 Mbps）：
+
+  | 遮罩 | 允許 DL slot | relay | access |
+  |---|---|---|---|
+  | PF | 全部 | 58.3 | 16.9 |
+  | 0x1111 | 0,4,12,16 | 57.8 | 19.0（+12.8%） |
+  | 0x0821 | 0,5,11,16 | 58.6 | 17.3（+2.5%） |
+  | 0x9044 | 2,6,12,15 | 59.4 | 18.4（+8.9%） |
+  | 0x3c00 | 10～13 連續 | 60.1 | 16.7（−1%） |
+
+- 結論：access 層位置影響大（同強度 −1%～+12.8%；集中連續無效、0x1111 最好，與 0x0821 只差兩個 slot 各錯一格就差 10%，推測與 HARQ-ACK 時序有關、未驗證）；relay 層差距 ≤3%（可能在雜訊內）。「只看強度」不足，手挑的 0x1111 不能用公式檔位取代。
+- 延遲對照（重啟前統計）：有訓練 15 分鐘 >5 ms 120、ZMQ 逾時 175；暫停訓練 47／81。
+
+### 2026-10-03（續六十四）HARQ-ACK 群組推導、遮罩選單 acktier、延遲修正平台驗證、程式檢查
+- **ACK 規則（讀 OAI 程式）**：`nr_acknack_scheduling` 對 DL slot n 依序試 k1＝6～13（`set_dl_DataToUL_ACK`：min_rxtxtime=6 起 8 個），放進第一個未滿 2 位元（短 PUCCH、無 CSI 時 `dai_c==2` 即滿）的上行時機；上行時機＝slot 7、8、9、17、18、19（`is_ul_slot` 含有上行符號的 S slot）。推得兩個 ACK 群組：A＝DL 14,15,16,17(S),0,1,2,3→時機 7,8,9；B＝4,5,6,7(S),10,11,12,13→17,18,19；每 UE 每群最多 6 個 ACK（每 frame 12 次，對應實測約 2/3 下行 slot）。
+- **逐 slot 模擬**（`/home/lindor/mask_pos_20261003/sim/acksim.py`，精確 k1 規則＋PF＋遮罩，壞 UE 需求校準到 PF 下好／壞≈0.69／0.31）：集中連續 0x3c00 −1.4%（實測 −1%），三個 A／B 各 2 的平衡樣式皆 +17.1%（實測 +12.8%／+8.9%／+2.5%，差異未定論：單次 2 相位雜訊或模擬未含 CSI／TCP）。
+- **選單改為 acktier（21 檔，`DRL_MASK_TIERS` 預設）**：強度 k＝2～13 個 DL slot 的 A／B 平衡、不含 S slot 樣式，同強度依最小間距排序；k＝3,5,6 各 3 種、k＝4 為實測最好的 0x1111、0x9044＋規則 1 種、其餘 1 種，加全開。產生器 `/home/lindor/mask_pos_20261003/gen_menu.py`。曾試「間距最平均」當排序，會偏好實測最差的 0x0821，故改用實測補強。使用者考量：選單要有說服力，但不再做更多位置實驗（方案 B）。
+- **延遲修正平台驗證**（`/home/lindor/v3_latfix_20261003/`，v3 主動＋訓練 15 分鐘，dl14 選單）：影子模型與 nice=15 生效；落在自己訓練期間的 >5 ms 由 60／120 降到 9／98；ZMQ 逾時 175→147（暫停訓練 81），剩餘差距歸因訓練模式的 MongoDB 讀寫與 CPU 共用，列為平台限制。報告中的「MT 100% 被遮」是策略診斷工具已改 acktier 對照、容器仍跑 dl14 的錯配，以 dl14 重算為全開 85.4%、MT 2.8%。資料改名 *_latfix_v3。每輪更新次數 30→15（使用者同意；Node2 PPO 裁剪 53～67%）。
+- **程式檢查**（端到端離線測試）：21 檔、0 個非法遮罩；初始 MT 全開 0.968／UE 0.799；單一 UE 直接全開不記 logp；暖身 20 步時第 21 步起才更新 Actor；影子模型交換權重一致、MT 偏置可學。state／reward／logp 的時序與定義一致。注意：MT 依附著順序標記；舊選單經驗不可混用。
+- `LOCAL_DRL_V2_DESIGN.md` 重寫：正文為 v3（含「為什麼用遮罩」「遮罩怎麼產生」），v2／v2.1 移至附錄 A 原文保留。
+
+### 2026-10-03（續六十五）v3 單獨訓練第一次嘗試：停損（17:01～18:44）
+- 設定：α=0.4、acktier 21 檔、γ=0.5、每輪 15 次更新、Critic 暖身 600 步（約 17:44 結束）、影子模型訓練、HS 第四版 hs 家族、`FL_MODE=none`，從零開始。`/home/lindor/v3_train_20261003/`。
+- 策略診斷（壞通道子節點有遮比例，20／40／60／80 分鐘）：relay 該遮 21→20→19→14%、relay 不該遮 20→21→18→17%、access M 20→24→16→12%、access N 19→19→17→13%；MT 3%。Actor 學到「全部少遮」，沒有分化；PPO 裁剪 9～29%、熵 0.56～0.78（健康）。
+- 90 分鐘實測（HS TCP、seed 20260930、只跑壅塞相位）：壅塞送達 81（PF 82、規則 86）、滿足率 0.712、JFI 0.830、RTT 84.8 → 觸發停損（低於 PF、兩層未分化），停止訓練、資料保留（/tmp/drl_pause）。
+- 診斷（訓練資料，α=0.4 子樹 reward，排除遮到 MT）：relay 該遮 不遮 37.17（n=663）／輕遮 37.35／重遮 37.49（差 ≤0.9%，在誤差內）；access M 不遮 12.34（n=993）／輕遮 11.44（−7%）／重遮 11.27（−9%）；與 α 掃描（固定遮罩維持整個 110 秒相位，access M 用 0x1111 +3.1%）方向相反。推論：探索時每秒重新抽遮罩，被遮 UE 的損失立即發生、好 UE 的 TCP 來不及爬升吃到讓出的 slot，以秒為單位的 reward 看不到遮罩的長期好處；γ=0.5 只涵蓋約 2 秒。改進方向：動作持續（action repeat，每 K 秒才重選、reward 取 K 秒平均）。
+
+### 2026-10-03（續六十六）停損原因驗證：遮罩切換速度 vs 組合式動作
+- **切換速度驗證**（`/home/lindor/hold_test_20261003/`，SW3 固定配置、規則模式 RULE_KIND=mask、新增 `RULE_MASK_REFRESH_S`=0.5 讓遮罩檔每 0.5 秒重讀；toggler 寫 /tmp/rule_mask，各 2 相位 TCP；`analyze_hold.py` 以逐秒 pf_shadow 文件算「這一秒套用的遮罩 → 下一秒子樹 α=0.4 效用」）：
+
+  | | access Node9 遮／不遮 | relay Node1 子樹 遮／不遮 |
+  |---|---|---|
+  | 每秒隨機換（flicker） | 12.42（n=38）／12.32（n=188），+0.8%±2.3% | 39.00（n=88）／37.05（n=116），**+5.3%**±1.5% |
+  | 維持 5 秒交替（hold5） | 12.56（n=112）／12.30（n=110），+2.1% | 36.85（n=112）／37.37（n=110），−1.4%±1.4% |
+
+  結論：relay 在每秒切換下仍有明顯正訊號 →「換太快」不是 relay 學不起來的主因；access 在維持 5 秒時略好（+2.1% 對 +0.8%）但兩組都只有約 4 分鐘、證據弱；relay 在 hold5 反而略負，原因未明。附帶：規則需連續 10 秒判定壞 UE，flicker 時判定常中斷，access 實際被遮只有 17% 的秒數。
+- **組合式動作**（v3 訓練資料，relay 該遮狀態、未遮 MT）：兩個邊緣 UE 都不遮 37.58（n=622）、只遮 1 個 37.67（n=283）、兩個都遮但非都重遮 37.05（n=22）、**兩個都重遮（≤6 slot）38.82（n=12，+3.3%）**。只遮一個沒有效果（另一個邊緣 UE 吃掉讓出的 slot），有效的是兩個同時重遮；v3 每個子節點獨立抽遮罩，兩個同時重遮的機率約 1%，Actor 幾乎收不到正訊號。規則驗證的 +5.3% 也是兩個同時遮 0x1111。→ 主因判定為動作空間的分解方式（每子節點獨立），修正方向：讓同節點子節點的遮罩一起決定。
+
+### 2026-10-03（續六十七）v3.1：兩段式動作（使用者選方案 A）
+- 動作改為 `DRL_ACTION_SPACE=factored`：節點先選一個遮罩強度（21 檔共用），再對每個子節點決定是否套用（`ActorNetworkFactored`、`factored_logp_entropy`；經驗多存 `factored_action`）。初始化：全開 0.6、非 MT 套用 0.5、MT 套用 logit −3.5（約 0.03）。「動作持續 5 秒」證據不足，先不加。
+- 離線測試：初始兩個邊緣 UE 同時重遮 6.4%（per_ue 1.5%）、MT 被遮 2.1%、完全不遮 69.5%；推論與訓練 logp 差 0；合成 reward（只有兩個同時重遮給分）訓練 300 步後 6.4%→17.1%（per_ue 1.5%→2.2%）。
+- compose 預設改為 factored；策略診斷新增「relay 該遮時兩個邊緣 UE 同時被遮」比例。v3 第一版（per_ue）的經驗與 checkpoint 改名 *_v3_perue 保留。設計文件 §5 改寫。
+
+### 2026-10-04（續六十八）v3.1 停損與持續時間驗證；v3.2 定案（α=0.2、6 檔選單）
+- v3.1（兩段式動作）訓練 22:58～00:41：暖身後 60 分鐘診斷曾見 relay 該遮 24%／不遮 16%，80 分鐘回到 14%／14%；90 分鐘實測壅塞送達 81（PF 82），停損。v3.1 資料：relay 該遮「兩個都重遮」reward 相對不遮 α=0.4 +2.8%、α=0.2 +7.0%、α=0 +12.3%；access M「只遮壞 UE」α=0 −0.8%、「好 UE 也被遮」−52%。Critic 解釋比例 0.82～0.89（正常）；各 relay「兩個都重遮」的 advantage 樣本只有 7～22 筆，正負不一。
+- **持續時間驗證**（`/home/lindor/hold2_test_20261004/`，SW3，規則模式，toggler 維持 10／20 秒交替，各 3 相位；`analyze_win.py`、`relay_break.py`）：
+  - access Node9（遮 0x1111）：維持 20 秒（實際套用 100%）α=0 +15.5%、α=0.2 +8.2%、α=0.4 +2.8%（每時窗訊雜比約 1.9）；維持 10 秒只有 67% 時間真的有遮（規則要連續 10 秒判定壞 UE），效果稀釋。好 UE 在遮罩開始後第 1 秒即由約 11 升到 16，**沒有 TCP 爬升延遲** → 動作持續不必要。
+  - relay Node1：維持 20 秒時子樹總吞吐量 62.9→62.4（−0.8%）：邊緣 UE −3.3、Node6 +5.6、Node5 −2.6（MT 從未被遮）；每秒切換時的 +5.3% 是 MT backlog 在遮罩第 1 秒集中送出的暫態。relay 的好處依狀態而定（HS 第四版規則驗證熱點 branch 8／10 相位增加）。
+  - 分析程式曾有時區錯誤（子節點時間戳少轉 UTC），已修正。
+- **v3.2 定案（使用者同意）**：α=0.2；選單縮為 6 檔 `0x0101,0x1111,0x9044,0x9292,0xab98,0xffff`（實測有效或位置敏感度排名前列，原因：21 檔中有效的只有少數，隨機探索多數浪費）；不加動作持續；Stage 1.5 訓練 3 小時當 FL 對照組（不以贏 PF 為停損，只在明顯異常時停），訓練完停在 Stage 2 之前。compose 補上 `DRL_MASK_TIERS` 傳遞（v3／v3.1 一直用程式預設 acktier，與當時設計一致）；策略診斷改從容器的 drl_agent 讀選單。system model 只抽象定義 $\mathcal{M}$，6 檔列在實驗設定、篩選依據放附錄。
+
+### 2026-10-04（續六十九）v3.2 未學會的診斷；v3.3（動作持續＋只用壅塞相位訓練）；Stage 2 FL 設定修正
+- **v3.2 訓練**（`/home/lindor/v32_train_20261004/`，01:46 起，α=0.2、6 檔、兩段式、暖身 600 步至約 02:29）：策略機率（`iab/policy_prob.py`）
+  暖身後 13～30 分鐘：relay「兩個邊緣 UE 都遮」該遮 6.2%／不該遮 6.2%、access「只遮壞 UE」M 6.3%／N 6.9%（初始都約 10%）；
+  MT 被遮 1.2→0.7%、access 好 UE 被遮 20→11.7%。學到「別遮好 UE／MT」，但「該遮」與「不該遮」完全沒分化，四類一起往下。
+- **診斷**（`/home/lindor/v32_diag_20261004/`，`adv.py`＝局部基線、`cadv_inner.py`＝各節點目前 Critic 的實際 advantage，70 分鐘資料）：
+  | 類別／動作 | Critic advantage（σ 單位） | n |
+  |---|---|---|
+  | relay 該遮：不遮／遮 1 個／兩個都遮 | +0.354／+0.432／+0.519 | 572／141／59 |
+  | access M：不遮／只遮壞 UE／好 UE 被遮 | +0.314／+0.315／−0.616 | 802／114／173 |
+  | relay 不該遮、access N 各動作 | −0.08～−0.01 | |
+  access M「只遮壞」與「不遮」**完全相同**：每秒重抽遮罩時，遮罩的好處在 1 秒的 reward 裡量不到（同一動作維持 20 秒的平台實測為 α=0.2 +8.2%，續六十八）；
+  relay 方向正確但僅 +0.17σ、每 relay 每小時十餘筆。另一半訓練時間是正常相位（最佳動作恆為不介入），決策狀態只佔各節點 2～7% 的時間。
+  （續六十八「好 UE 第 1 秒即升高 → 動作持續不必要」的推論被訓練資料推翻：瞬時有反應，但每秒切換下的淨效果為 0。）
+- **v3.2 第 90 分鐘實測**（HS TCP、seed 20260930、只跑壅塞相位）：壅塞送達 84（PF 82 → +2.4%；規則 86 → −2.3%）、滿足率 0.761、滿足率 JFI 0.872、RTT 82.2（v3／v3.1 同時點皆 81）。策略沒有依狀態分化，增益推測來自「少遮好 UE／MT、整體少遮」；不符合學習判定條件 ①②，改 v3.3。
+- **v3.3**（Local 端，Stage 1.5～4 共用）：①動作持續 `DRL_ACTION_HOLD=5`（每 5 個控制週期才重抽，經驗逐秒寫、訓練時 `merge_action_holds()` 併成決策經驗：
+  reward＝5 秒平均、s′＝下一個決策當下；action repeat，DQN 以來的標準做法）；②訓練場景家族 `hsc`／`hshc`（hs／hsh 只跑壅塞相位，`--congested-only`）；
+  ③Stage 1.5 也開 Global xApp（state 的 `fairness_bias` 與 Stage 2 相同；watchdog 在 `--fl-mode none` 時也帶起 global-xapp）。
+  映像已重建；v3.2 的 checkpoint／經驗改名 `.v32.pt`／`_v32` 保留。`/home/lindor/v33_train_20261004/run.sh`（v3.2 第 90 分鐘實測後自動接手）。
+- **Stage 2 程式檢查（拓樸／Local DRL 改版後）**：`flower-supernode-nodeN`／`flower-superlink` 原本只拿到 `REWARD_MODE`／`MODEL_ARCH`——
+  會用程式預設 21 檔選單建出不同形狀的 `tier_head`（聚合失敗）、用 α=0.5 算 reward；compose 已補齊 DRL 設定。其餘（12 節點 FedAvg、
+  num-examples＝有競爭的決策經驗數、廣播保留 train_steps）不需改。Stage 2 流程 `/home/lindor/s2_avgfl_20261004/run.sh`（同 Stage 1.5 腳本，只差 FL_MODE=avg，
+  實測時停 flower-scheduler）；設計補在 `STAGE2_DESIGN.md` §4.4。
+
+### 2026-10-04（續七十）v3.3 停止：一步 TD 的 Critic 自舉偏差；v3.4（3 步回報）
+- **v3.3 訓練**（`/home/lindor/v33_train_20261004/`，03:41 起；04:32 UE19／UE20 修不好 → watchdog 完整重啟、資料保留，損失約 10 分鐘）：
+  暖身後策略機率 relay 該遮／不該遮 9.3%／9.9%、access M／N 7.2%／8.0%、好 UE 被遮 20→14.7%；
+  **90 分鐘實測**（Actor 只學了約 25 分鐘）：壅塞送達 82（PF 82，+0.0%；規則 86）、滿足率 0.706、滿足率 JFI 0.826、RTT 84.4。
+- **離線對照**（`/home/lindor/pool_test_20261004/`，v3.3 資料每節點約 1000 個決策；獨立容器 cpuset 8-11、nice 19；同樣 Critic 600＋Actor 1500 步）：
+  | 目標 | 訓練資料 | relay 該遮／不該遮 | access M／N |
+  |---|---|---|---|
+  | 一步 TD | 12 節點合併 | 7.9%／8.7%（錯向） | 7.2%／8.1% |
+  | 一步 TD | 各節點自己 | 10.3%／11.8%（錯向） | 7.1%／9.7% |
+  | 3 步回報 | 合併 | **10.1%／9.2%** | 7.3%／7.3% |
+  | 3 步回報 | 各節點自己 | **10.7%／8.5%** | 7.3%／9.5% |
+  （初始皆 10%）合併資料也錯向 → 不只是資料量問題。
+- **原因（TD 拆解，`run2.out`；實際後續 reward，`next_inner.py`／`next_tier.py`）**：relay 該遮「兩個都遮」立即 reward 48.2 對不遮 44.5（+8.3%），
+  Critic 給遮罩後狀態的 V(s') 卻低 8.1（γ=0.5 → −4.1），蓋掉好處；實際下一個決策只低 1.3、再下一個持平，三步和 133.2 對 130.7（+1.9%）。
+  依強度（三步和，相對不遮 130.8）：0x9044 142.2（+8.7%，n=9）、0x9292 138.9（+6.2%）、0xab98 138.8（+6.1%）、0x1111 127.4、0x0101 121.8。
+  Critic 把「MT 佇列長」當「需求高」的代理（需求不可觀測），佇列被消化後誤判需求下降 → 部分可觀測下的自舉偏差。
+  access M「只遮壞 UE」實際三步和 41.3 對 42.0（無好處；0x1111 +3%，n=13），好 UE 被遮 −17%。
+- **v3.4**：`DRL_NSTEP=3`（`attach_nstep_returns()`：前 3 個決策用實際 reward、第 3 步後才自舉，γ^3=1/8；間隔 >9 秒截斷），compose（inference／supernode）
+  補傳 `DRL_NSTEP`、映像重建。Stage 1.5 從零重跑（`/home/lindor/v34_train_20261004/`，05:46 起），v3.3 資料改名 `.v33.pt`／`_v33` 保留；
+  Stage 2 腳本同步改為 v3.4（封存名 `s15_v34`、啟動時比對 `DRL_NSTEP`／`DRL_ACTION_HOLD`）。
+
+### 2026-10-04（續七十一）v3.4 結果；access 學不會的原因；v3.5（apply_first）直接進 Stage 2
+- **v3.4 Stage 1.5**（`/home/lindor/v34_train_20261004/`，05:57～09:10，3 步回報）：90 分鐘實測 83（PF 82，+1.2%）、滿足率 0.749、JFI 0.869、RTT 80.8。
+  180 分鐘策略機率（`policy_prob.py`，最近 125 分鐘狀態）：relay 該遮 **12.6%**／不該遮 7.7%（初始 10%）、access M 5.4%／N 8.6%、MT 0.9%、好 UE 13.1%。
+  relay 學會依狀態分化；access 沒學會。09:06 FlexRIC 崩潰、watchdog 完整重啟中，09:10 run.sh 暫停實測時把 watchdog 殺掉，PC3／relay UE 沒起來，
+  180 分鐘實測只量到 8 UE（43，無效）；以 `remeasure.sh` 凍結模型重做。Stage 2 腳本已修正：watchdog 完整重啟中不暫停。
+- **access 診斷（`/home/lindor/access_check_20261004/`，以場景真值重建每個相位的混合節點與 M／N 類，`truth.py`；與 07:40 後的 driver log 逐相位比對一致）**：
+  M 類「只遮壞 UE」3 步回報相對不遮：0x9292 +4.8%±2.1、0x9044 +3.9%±2.2、0x0101 +6.0%±2.9、0x1111 −3.1%、0xab98 −1.9%（各 11～23 筆）；
+  **好 UE 被遮 −22%（151 筆）**；N 類只遮壞約 0（0x1111 −25%）。離線訓練（`check.py`）合併 12 節點 M 4.6%／N 5.6%、合併 8 個 access 3.4%／4.1%、
+  各節點自己 5.1%／5.7%、平台實際模型 4.4%／5.7% → **合併資料（FL 的上限）也學不會，不是資料量問題**。
+  原因：兩段式（node_on）的「開遮罩」是節點層級共用機率，開了之後每個子節點各 50% 被套用，access 有一半機會遮到好 UE（−22%），蓋過遮壞 UE 的 +4～5%，
+  Actor 學成整個不開，探索也跟著消失；relay 兩個直連 UE 都是邊緣 UE（遮哪個都對）、MT 有偏置保護，所以 relay 不受影響。
+- **v3.5：`DRL_FACTORED_MODE=apply_first`**：拿掉節點層級「全開」選項；每個子節點自己 Bernoulli 決定是否被遮（非 MT 初始 0.3、MT 加偏置 −3.5），
+  至少一個被遮時才在 5 檔非全開強度中選一檔；log π＝Σ log π(套用)＋[有套用]·log π(強度|非全開)（離線檢查：全部動作機率總和 1、取樣頻率與模型機率一致）。
+  初始 relay 兩個 UE 都遮約 9%、access 只遮壞 21%、不遮任何子節點 49%。離線（行為策略以初始策略近似、PPO 每步限制在 ±20% 內，只能看方向）：
+  合併 12 節點 access M 18.0%／N 17.8%（node_on 7.4%／7.6%：不再塌成不遮）、relay 6.8%／6.2%。（離線對照的各節點自己訓練部分被重做量測的 clean_env 中斷。）
+- 使用者要求今天完成 Stage 2：v3.5 直接進 Stage 2（avg FL，`/home/lindor/s2_avgfl_20261004/run.sh`，等重做量測結束後自動開始），
+  Stage 1.5（同方法、FL_MODE=none）之後重跑作對照。compose（inference／supernode／superlink）補傳 `DRL_FACTORED_MODE`；`policy_prob.py` 支援 apply_first。
+
+### 2026-10-04（續七十二）v3.5 Stage 2 未學到；離線驗證；改用 DQN（v4，α=0）
+- **v3.5 Stage 2**（apply_first＋avg FL，α=0.2，`/home/lindor/s2_avgfl_20261004/`，11:09 起；12:03 relay UE23／24 修不好 → watchdog 完整重啟）：
+  FedAvg 確認有效（各節點 Critic 權重距離 0.06～0.15，純 Local 約 18.6；聚合權重 relay 39%／access 61%）。
+  90 分鐘：策略機率 relay 該遮 9.0%／不該遮 8.4%、access M 20.4%／N 21.5%、好 UE 30.8%（全在初始值），實測 82（=PF）、滿足率 0.717、RTT 92.0；
+  2 小時：relay 6.8%／8.6%（反向）、access 20.6%／21.6%。判定沒學到，停止（資料改名 `_s2_v35`）。v3.4 第 180 分重做實測：84（PF 82）、滿足率 0.735。
+- **訊號（場景真值、3 步回報，v3.4＋v3.5 資料）**：α=0.2：relay 該遮兩個都遮 +3.9%±1.7、access M 只遮壞 +3.9%±1.0；
+  **α=0：relay +7.3%±2.0（不該遮 +1.4%±1.5）、access M +7.0%±1.2（N −0.2%±3.6）、好 UE 被遮 −26%**。兩層都有依狀態而定的明確訊號，α=0 約加倍。
+  使用者確認 Stage 1.5～4 只看吞吐量、滿足率留給 Stage 5（CLAUDE.md 驗收規則已改）→ 採 α=0。
+- **PPO 離線學習測試不可靠**：每輪把舊資料當成目前策略（行為 logp 重算）時，α=0 合併 relay 13.2%／5.2% 分化、access 塌成 0；
+  改用真實行為 logp（ε=2）時 relay 與 access 全部塌成 0（有無 5% 探索下限皆同，`DRL_APPLY_FLOOR` 已實作、預設關閉）。共用 reward 下逐子節點信用分配雜訊大，結論隨測法翻轉。
+- **DQN 可行性（`qcheck2.py`，v3.4＋v3.5 約 3.8 萬決策、12 節點合併、時間切分保留 25%）**：Q(s,a) 迴歸 3 步回報，保留集 R²=0.888；
+  argmax（動作集不含遮 MT）：relay 該遮選兩個 UE 都遮 68%（不該遮 35%）、access M 只遮壞 84%（N 33%；N 遮好 UE 62% 為資料少處的高估，線上 ε 探索會修正）。
+  含遮 MT 的動作集時 argmax 75～94% 選遮 MT（資料 <1%，離線外插高估）→ 動作集排除 MT（遮 backhaul 違背 relay 目的）。
+- **v4（`DRL_ACTION_SPACE=dqn`）**：QNetwork（state 69＋每子節點是否被遮 16＋強度 one-hot 6 → 128→128→1，輸出×50）；候選動作＝不遮＋非 MT 子節點任意非空子集×5 檔；
+  ε-greedy（暖身 600 步內 greedy＝不遮、ε=0.3；之後 argmax Q，ε 線性降到 0.05／1500 步）；Double DQN、Polyak τ=0.01（critic 欄位存目標網路，FL 一起平均）；
+  沿用動作持續 5 秒、3 步回報、α=0、hsc 訓練。Stage 2（avg FL）於 13:3x 以 `/home/lindor/s2_dqn_20261004/run.sh` 重跑；Stage 1.5 對照之後跑。
